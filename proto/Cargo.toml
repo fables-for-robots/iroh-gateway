@@ -7,10 +7,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 ciborium.workspace = true
+hex.workspace = true
+iroh.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
+iroh = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
 tokio.workspace = true

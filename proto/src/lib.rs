@@ -2,6 +2,8 @@
 
 pub mod control;
 pub mod frame;
+pub mod key;
+pub mod transport;
 
 pub const ALPN: &[u8] = b"iroh-gateway/0";
 pub const DEFAULT_IROH_PORT: u16 = 7842;
