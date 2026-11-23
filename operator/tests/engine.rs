@@ -238,8 +238,11 @@ fn sockets_in(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether `edge` is connected with exactly `ports` bound.
+/// Whether `edge` is connected with exactly `ports` bound. The engine reports ports in
+/// ascending order, whatever order the test's free ports came in.
 fn serving(f: &Facts, edge: &str, ports: &[u16]) -> bool {
+    let mut ports = ports.to_vec();
+    ports.sort_unstable();
     let want: Vec<ListenerState> = ports
         .iter()
         .map(|&p| ListenerState {
