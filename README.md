@@ -93,7 +93,7 @@ On a real deployment the edge runs on the public machine with `--iroh-listen <pu
 | | `--operator <EndpointId>` (`IROH_GATEWAY_EDGE_OPERATOR`) | required |
 | | `--iroh-listen <addr>` (`IROH_GATEWAY_EDGE_IROH_LISTEN`) | `0.0.0.0:7842` |
 | | `--public-bind <ip>` (`IROH_GATEWAY_EDGE_PUBLIC_BIND`) | `::` |
-| | `--max-connections <n>` (`IROH_GATEWAY_EDGE_MAX_CONNECTIONS`), 1 to 65536 | `10000` |
+| | `--max-connections <n>` (`IROH_GATEWAY_EDGE_MAX_CONNECTIONS`), 1 to 65536; about 400 KiB per connection in the worst case | `2048` |
 | | `--tunnel-grace <duration>` (`IROH_GATEWAY_EDGE_TUNNEL_GRACE`), for example `5s` | `5s` |
 | | `--relay <disabled\|n0\|URL>` (`IROH_GATEWAY_EDGE_RELAY`) | `disabled` |
 

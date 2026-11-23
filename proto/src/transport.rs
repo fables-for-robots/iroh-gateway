@@ -14,11 +14,29 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// iroh's maximum per-path idle timeout; larger values are clamped with a warning.
 pub const PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_TUNNEL_STREAMS: u32 = 65_536;
+/// How much the peer may send on one stream before we read it, on both roles. Worst-case
+/// receive memory is about this times the number of open streams.
+pub const STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
+/// How much one edge may send across all streams before the operator reads it.
+pub const OPERATOR_RECEIVE_WINDOW: u32 = 256 * 1024 * 1024;
 
 /// `incoming_bidi_streams` is how many streams the peer may have open towards us.
-pub fn transport_config(incoming_bidi_streams: u32) -> QuicTransportConfig {
-    QuicTransportConfig::builder()
+///
+/// Only `Role::Operator` caps the connection-level receive window: it bounds what one
+/// (possibly compromised) edge can make the operator buffer, and a full window stalls only that
+/// edge's own link. `Role::Edge` deliberately keeps noq's unbounded connection window: there
+/// every stream is a visitor, and a connection-level cap would let a few hundred slow-reading
+/// visitors stall every other visitor. The edge's bound is the per-stream window times its
+/// connection cap instead.
+pub fn transport_config(incoming_bidi_streams: u32, role: Role) -> QuicTransportConfig {
+    let builder = QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(VarInt::from_u32(incoming_bidi_streams))
+        .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW));
+    let builder = match role {
+        Role::Edge => builder,
+        Role::Operator => builder.receive_window(VarInt::from_u32(OPERATOR_RECEIVE_WINDOW)),
+    };
+    builder
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .keep_alive_interval(KEEP_ALIVE)
         .max_idle_timeout(Some(
@@ -91,7 +109,7 @@ pub fn endpoint_builder(
 ) -> Builder {
     let builder = Builder::new(presets::Minimal)
         .secret_key(key)
-        .transport_config(transport_config(incoming_bidi_streams))
+        .transport_config(transport_config(incoming_bidi_streams, role))
         .portmapper_config(PortmapperConfig::Disabled)
         .clear_address_lookup();
     match (relay, role) {
@@ -150,6 +168,74 @@ mod tests {
         for bad in ["", "N0 ", "relay.example.com", "ftp://x"] {
             assert!(bad.parse::<Relay>().is_err(), "{bad:?}");
         }
+    }
+
+    /// Writes to `send` until a write makes no progress for 500 ms; returns the bytes accepted.
+    async fn accepted_while_unread(send: &mut iroh::endpoint::SendStream) -> usize {
+        let chunk = vec![7u8; 16 << 10];
+        let mut total = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(500), send.write(&chunk)).await {
+                Ok(Ok(n)) => total += n,
+                Ok(Err(e)) => panic!("write failed after {total} bytes: {e}"),
+                Err(_) => return total,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unread_stream_holds_about_one_stream_window() {
+        let edge = endpoint_builder(SecretKey::generate(), 4, &Relay::Disabled, Role::Edge)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let operator = endpoint_builder(SecretKey::generate(), 4, &Relay::Disabled, Role::Operator)
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let addr = EndpointAddr::new(edge.id()).with_ip_addr(edge.bound_sockets()[0]);
+        let accept = async { edge.accept().await.unwrap().await.unwrap() };
+        let (to_edge, to_operator) = tokio::join!(operator.connect(addr, ALPN), accept);
+        let to_edge = to_edge.unwrap();
+
+        // Each receiver accepts the stream and then never reads from it.
+        let range = 128 << 10..=1 << 20;
+        for (opener, acceptor) in [(&to_edge, &to_operator), (&to_operator, &to_edge)] {
+            let (mut send, _recv) = opener.open_bi().await.unwrap();
+            send.write_all(b"x").await.unwrap();
+            let (_far_send, _far_recv) = acceptor.accept_bi().await.unwrap();
+            let accepted = accepted_while_unread(&mut send).await;
+            assert!(range.contains(&accepted), "{accepted} bytes accepted");
+        }
+    }
+
+    /// The built config has no getters; its `Debug` output is the only way to read it back.
+    #[test]
+    fn transport_config_values() {
+        let edge = format!("{:?}", transport_config(4, Role::Edge));
+        let operator = format!("{:?}", transport_config(MAX_TUNNEL_STREAMS, Role::Operator));
+        for (cfg, streams) in [(&edge, 4), (&operator, MAX_TUNNEL_STREAMS)] {
+            for field in [
+                format!("max_concurrent_bidi_streams: {streams},"),
+                "max_concurrent_uni_streams: 0,".to_string(),
+                "max_idle_timeout: Some(20000),".to_string(),
+                format!("stream_receive_window: {STREAM_RECEIVE_WINDOW},"),
+                "keep_alive_interval: Some(5s),".to_string(),
+                "default_path_max_idle_timeout: Some(15s),".to_string(),
+                "default_path_keep_alive_interval: Some(5s),".to_string(),
+            ] {
+                assert!(cfg.contains(&field), "{field} missing in {cfg}");
+            }
+        }
+        let unbounded = format!("receive_window: {},", VarInt::MAX);
+        assert!(edge.contains(&unbounded), "{edge}");
+        let bounded = format!("receive_window: {OPERATOR_RECEIVE_WINDOW},");
+        assert!(operator.contains(&bounded), "{operator}");
     }
 
     #[tokio::test]

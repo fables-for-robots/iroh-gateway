@@ -52,11 +52,11 @@ enum Command {
         /// Address the public listeners bind to.
         #[arg(long, env = "IROH_GATEWAY_EDGE_PUBLIC_BIND", default_value = "::")]
         public_bind: IpAddr,
-        /// Maximum number of simultaneous visitor connections.
+        /// Maximum number of simultaneous visitor connections; each may hold about 400 KiB.
         #[arg(
             long,
             env = "IROH_GATEWAY_EDGE_MAX_CONNECTIONS",
-            default_value_t = 10_000,
+            default_value_t = 2048,
             value_parser = clap::value_parser!(u32).range(1..=65_536)
         )]
         max_connections: u32,
