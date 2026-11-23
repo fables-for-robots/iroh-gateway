@@ -124,6 +124,8 @@ impl Envtest {
     /// The ports are picked free but released before the processes bind them, so another test
     /// can take one in between; a start that fails that way is tried again on new ports.
     pub async fn start() -> Self {
+        // As the operator's main does, before any client is built.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let assets = assets();
         let mut attempt = 1;
         loop {

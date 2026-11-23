@@ -88,6 +88,10 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Before any TLS client is built: ring is the only provider compiled in; installing it
+    // explicitly does not leave the choice to rustls's feature detection. Already installed is
+    // fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
