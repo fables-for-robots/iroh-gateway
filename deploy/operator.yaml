@@ -51,12 +51,15 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
+          # Sizing: in the worst case one edge can make the operator hold about
+          # 4096 streams x 192 KiB + 64 MiB = 830 MiB. One edge fits this limit; raise it by
+          # about that much for each further edge.
           resources:
             requests:
               cpu: 50m
-              memory: 64Mi
+              memory: 128Mi
             limits:
-              memory: 256Mi
+              memory: 1Gi
           volumeMounts:
             # The default --runtime-dir. The volume's root belongs to root; the operator keeps
             # HAProxy's configuration and sockets in a private directory it creates inside it.

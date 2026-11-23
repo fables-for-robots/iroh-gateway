@@ -13,12 +13,15 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// iroh's maximum per-path idle timeout; larger values are clamped with a warning.
 pub const PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
-pub const MAX_TUNNEL_STREAMS: u32 = 65_536;
+/// How many visitor streams one edge may have open towards the operator. With up to three
+/// 64 KiB copy buffers per stream and [`OPERATOR_RECEIVE_WINDOW`], one edge can make the operator
+/// hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB in the worst case.
+pub const MAX_TUNNEL_STREAMS: u32 = 4_096;
 /// How much the peer may send on one stream before we read it, on both roles. Worst-case
 /// receive memory is about this times the number of open streams.
 pub const STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 /// How much one edge may send across all streams before the operator reads it.
-pub const OPERATOR_RECEIVE_WINDOW: u32 = 256 * 1024 * 1024;
+pub const OPERATOR_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
 
 /// `incoming_bidi_streams` is how many streams the peer may have open towards us.
 ///

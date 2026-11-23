@@ -247,7 +247,7 @@ fn run_rejects_bad_relay() {
 #[test]
 fn run_rejects_out_of_range_max_connections() {
     let operator = SecretKey::generate().public().to_string();
-    for n in ["0", "65537"] {
+    for n in ["0", "4097"] {
         let out = edge(&["run", "--operator", &operator, "--max-connections", n]);
         assert!(!out.status.success(), "{n}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("max-connections"));

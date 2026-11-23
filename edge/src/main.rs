@@ -57,7 +57,7 @@ enum Command {
             long,
             env = "IROH_GATEWAY_EDGE_MAX_CONNECTIONS",
             default_value_t = 2048,
-            value_parser = clap::value_parser!(u32).range(1..=65_536)
+            value_parser = clap::value_parser!(u32).range(1..=4096)
         )]
         max_connections: u32,
         /// How long listeners stay open without a tunnel, e.g. "5s".

@@ -39,6 +39,7 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
         "global\n\
          \x20   log stdout format raw local0\n\
          \x20   stats socket {dir}/stats.sock mode 600 level admin expose-fd listeners\n\
+         \x20   maxconn 8192\n\
          \x20   hard-stop-after 5m\n\
          \n\
          defaults\n\
