@@ -13,7 +13,7 @@ use iroh::endpoint::{Builder, Connection, Incoming, VarInt};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gateway_proto::transport::{Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{ALPN, CLOSE_REPLACED, CLOSE_SHUTDOWN, CLOSE_UNAUTHORIZED};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::Sleep;
 use tracing::{debug, error, info, warn};
@@ -76,7 +76,9 @@ impl Edge {
         let (listeners, accepted) = ListenerSet::new(opts.public_bind, opts.max_connections);
         let (apply_tx, apply_rx) = mpsc::channel(APPLY_QUEUE);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (running, running_rx) = watch::channel(());
         let supervisor = Supervisor {
+            _running: running,
             endpoint,
             operator: opts.operator,
             grace: opts.tunnel_grace,
@@ -95,6 +97,7 @@ impl Edge {
             endpoint_id,
             iroh_addr,
             shutdown: shutdown_tx,
+            running: running_rx,
             task,
         })
     }
@@ -105,10 +108,19 @@ pub struct EdgeHandle {
     endpoint_id: EndpointId,
     iroh_addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
+    /// Closed once the supervisor is gone, however it ended.
+    running: watch::Receiver<()>,
     task: JoinHandle<()>,
 }
 
 impl EdgeHandle {
+    /// Resolves once the edge has stopped. Before [`EdgeHandle::shutdown`] that happens only
+    /// when it stops on its own: its endpoint closed or its task panicked.
+    pub async fn stopped(&self) {
+        let mut running = self.running.clone();
+        while running.changed().await.is_ok() {}
+    }
+
     pub fn endpoint_id(&self) -> EndpointId {
         self.endpoint_id
     }
@@ -126,6 +138,8 @@ impl EdgeHandle {
 
 /// Owns the listeners, the visitor queue and the current session.
 struct Supervisor {
+    /// Dropped with the supervisor, which tells [`EdgeHandle::stopped`].
+    _running: watch::Sender<()>,
     endpoint: Endpoint,
     operator: EndpointId,
     grace: Duration,

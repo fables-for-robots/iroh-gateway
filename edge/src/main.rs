@@ -4,13 +4,13 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use iroh::EndpointId;
 use iroh_gateway_edge::{Edge, EdgeOptions};
 use iroh_gateway_proto::key::load_or_generate;
 use iroh_gateway_proto::transport::Relay;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -121,7 +121,13 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
             info!(id = %edge.endpoint_id(), "serving; waiting for SIGINT or SIGTERM");
-            shutdown_signal().await?;
+            tokio::select! {
+                r = shutdown_signal() => r?,
+                () = edge.stopped() => {
+                    error!("the edge stopped on its own; exiting");
+                    bail!("the edge stopped on its own");
+                }
+            }
             info!("shutting down");
             edge.shutdown().await;
         }

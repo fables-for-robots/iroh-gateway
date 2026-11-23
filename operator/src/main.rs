@@ -4,14 +4,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use iroh_gateway_operator::staticcfg;
 use iroh_gateway_operator::tunnel::{EdgeLink, LinkOptions, StaticConnector, bind_endpoint};
 use iroh_gateway_proto::control::ListenerKey;
 use iroh_gateway_proto::key::load_or_generate;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio::task::JoinSet;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -70,7 +71,8 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
     info!(id = %key.public(), "operator started");
 
     let mut links = Vec::new();
-    let mut watchers = Vec::new();
+    // Each ends when its link's task ends, which before shutdown it never does on its own.
+    let mut watchers = JoinSet::new();
     // The senders live until shutdown; the links keep the last desired set anyway.
     let mut desired_senders = Vec::new();
     for edge in cfg.edges {
@@ -105,7 +107,7 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
         );
         let mut state = link.state();
         let id = edge.endpoint_id;
-        watchers.push(tokio::spawn(async move {
+        watchers.spawn(async move {
             while state.changed().await.is_ok() {
                 let s = state.borrow_and_update().clone();
                 let listeners: Vec<String> = s
@@ -125,19 +127,25 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
                     "edge state"
                 );
             }
-        }));
+            id
+        });
         desired_senders.push(tx);
         links.push(link);
     }
 
-    shutdown_signal().await?;
+    tokio::select! {
+        r = shutdown_signal() => r?,
+        Some(ended) = watchers.join_next() => {
+            let edge = ended.map_or_else(|e| e.to_string(), |id| id.fmt_short().to_string());
+            error!(%edge, "the link to an edge stopped on its own; exiting");
+            bail!("the link to edge {edge} stopped on its own");
+        }
+    }
     info!("shutting down");
     for link in links {
         link.shutdown().await;
     }
-    for w in watchers {
-        w.abort();
-    }
+    watchers.abort_all();
     drop(desired_senders);
     endpoint.close().await;
     Ok(())

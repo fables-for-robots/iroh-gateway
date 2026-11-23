@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{
+    ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream, VarInt,
+};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gateway_proto::control::{
     BindState, Config, Listener, ListenerKey, MAX_STREAM_HEADER_LEN, Status, StreamHeader,
@@ -19,8 +21,8 @@ use iroh_gateway_proto::splice::splice;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{
-    ALPN, CLOSE_CONTROL_ENDED, CLOSE_SHUTDOWN, RESET_BACKEND_UNAVAILABLE, RESET_BAD_HEADER,
-    RESET_UNKNOWN_LISTENER,
+    ALPN, CLOSE_CONTROL_ENDED, CLOSE_REPLACED, CLOSE_SHUTDOWN, CLOSE_UNAUTHORIZED,
+    RESET_BACKEND_UNAVAILABLE, RESET_BAD_HEADER, RESET_UNKNOWN_LISTENER,
 };
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -224,6 +226,27 @@ impl<C: Connector> Link<C> {
         info!("link stopped");
     }
 
+    /// Logs at warn what the operator must do about a close by the edge that it cannot get past
+    /// by redialing; false, logging nothing, for any other close.
+    fn explain_close(&self, closed: &ConnectionError) -> bool {
+        let ConnectionError::ApplicationClosed(close) = closed else {
+            return false;
+        };
+        if close.error_code == VarInt::from_u32(CLOSE_UNAUTHORIZED) {
+            warn!(
+                "the edge does not accept this operator's key: start the edge with \
+                 --operator {}",
+                self.endpoint.id()
+            );
+            true
+        } else if close.error_code == VarInt::from_u32(CLOSE_REPLACED) {
+            warn!("another operator with the same key connected to the edge and replaced this one");
+            true
+        } else {
+            false
+        }
+    }
+
     /// One dial attempt; None when it failed.
     async fn dial(&self) -> Option<Connection> {
         let target = self.target().await?;
@@ -233,7 +256,17 @@ impl<C: Connector> Link<C> {
                 Some(conn)
             }
             Ok(Err(e)) => {
-                info!("dial failed: {e:#}");
+                let closed = match &e {
+                    ConnectError::Connecting {
+                        source: ConnectingError::ConnectionError { source, .. },
+                        ..
+                    }
+                    | ConnectError::Connection { source, .. } => Some(source),
+                    _ => None,
+                };
+                if !closed.is_some_and(|c| self.explain_close(c)) {
+                    info!("dial failed: {e:#}");
+                }
                 None
             }
             Err(_) => {
@@ -279,6 +312,8 @@ impl<C: Connector> Link<C> {
         };
         match &end {
             None => conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"shutdown"),
+            // Seen as a lost connection or as a failed control stream, whichever came first.
+            Some(_) if conn.close_reason().is_some_and(|c| self.explain_close(&c)) => {}
             Some(SessionError::Lost(e)) => info!("connection lost: {e}"),
             Some(SessionError::Control(e)) => {
                 warn!("control stream failed: {e:#}");
