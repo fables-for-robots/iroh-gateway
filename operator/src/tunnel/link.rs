@@ -11,8 +11,10 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-use iroh_gateway_proto::control::{BindState, Config, Listener, ListenerKey, Status, StreamHeader};
-use iroh_gateway_proto::frame::{FrameError, read_frame, write_frame};
+use iroh_gateway_proto::control::{
+    BindState, Config, Listener, ListenerKey, MAX_STREAM_HEADER_LEN, Status, StreamHeader,
+};
+use iroh_gateway_proto::frame::{FrameError, read_frame, read_frame_max, write_frame};
 use iroh_gateway_proto::splice::splice;
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{
@@ -503,7 +505,12 @@ async fn serve_stream<C: Connector>(
     connector: Arc<C>,
     connect_timeout: Duration,
 ) {
-    let header = match timeout(HEADER_TIMEOUT, read_frame::<_, StreamHeader>(&mut recv)).await {
+    let header = match timeout(
+        HEADER_TIMEOUT,
+        read_frame_max::<_, StreamHeader>(&mut recv, MAX_STREAM_HEADER_LEN),
+    )
+    .await
+    {
         Ok(Ok(Some(header))) => header,
         Ok(Ok(None)) => {
             return refuse(send, recv, RESET_BAD_HEADER, "stream ended before a header");

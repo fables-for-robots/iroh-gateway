@@ -58,6 +58,10 @@ pub struct Status {
     pub version: String,
 }
 
+/// Upper bound on the encoded body of a `StreamHeader` frame; a reader may refuse any longer
+/// length before reading or allocating for it.
+pub const MAX_STREAM_HEADER_LEN: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamHeader {
     pub listener_id: u32,
@@ -68,6 +72,21 @@ pub struct StreamHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn largest_stream_header_fits_its_cap() {
+        let widest: SocketAddr = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535"
+            .parse()
+            .unwrap();
+        let header = StreamHeader {
+            listener_id: u32::MAX,
+            visitor: widest,
+            local: widest,
+        };
+        let mut body = Vec::new();
+        ciborium::into_writer(&header, &mut body).unwrap();
+        assert!(body.len() <= MAX_STREAM_HEADER_LEN, "{} bytes", body.len());
+    }
 
     #[test]
     fn listener_key_drops_id() {

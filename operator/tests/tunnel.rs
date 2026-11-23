@@ -325,6 +325,36 @@ async fn garbage_header_resets_stream_only() {
 }
 
 #[tokio::test]
+async fn oversized_header_prefix_resets_stream_only() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let fake = FakeEdge::bind().await;
+    let (link, _desired, _endpoint) = fake.link(&[(p, echo)], &[p]).await;
+    let mut s = fake.accept().await;
+    let cfg = s.read_config().await;
+    s.reply(&cfg).await;
+
+    // A 64 KiB length prefix and nothing after it.
+    let (mut send, mut recv) = s.conn.open_bi().await.unwrap();
+    send.write_all(&[0, 1, 0, 0]).await.unwrap();
+    let opened = Instant::now();
+    assert_eq!(reset_code(&mut recv).await, u64::from(RESET_BAD_HEADER));
+    // Well under the 5 s header limit: refused on the prefix, not waited on.
+    let waited = opened.elapsed();
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    let stopped = timeout(STEP, send.stopped()).await.unwrap().unwrap();
+    assert_eq!(
+        stopped.map(|c| c.into_inner()),
+        Some(u64::from(RESET_BAD_HEADER))
+    );
+
+    let (send, recv) = s.open(cfg.listeners[0].id).await;
+    assert_eq!(stream_roundtrip(send, recv, b"ping").await, b"ping");
+    assert!(s.conn.close_reason().is_none());
+    link.shutdown().await;
+}
+
+#[tokio::test]
 async fn missing_header_resets_stream_after_timeout() {
     let echo = echo_server().await;
     let p = free_tcp_port();

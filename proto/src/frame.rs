@@ -40,6 +40,16 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    read_frame_max(r, MAX_FRAME_LEN).await
+}
+
+/// [`read_frame`] with a lower limit: a length above `max_len` is refused as `TooLarge` before
+/// anything is allocated for the body.
+pub async fn read_frame_max<R, T>(r: &mut R, max_len: usize) -> Result<Option<T>, FrameError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
     let mut len_buf = [0u8; 4];
     let mut filled = 0;
     while filled < len_buf.len() {
@@ -53,7 +63,7 @@ where
         filled += n;
     }
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
+    if len > max_len {
         return Err(FrameError::TooLarge(len));
     }
     let mut body = vec![0u8; len];
@@ -135,6 +145,28 @@ mod tests {
         let bytes = (MAX_FRAME_LEN as u32 + 1).to_be_bytes();
         let err = read_frame::<_, Config>(&mut &bytes[..]).await.unwrap_err();
         assert!(matches!(err, FrameError::TooLarge(n) if n == MAX_FRAME_LEN + 1));
+    }
+
+    #[tokio::test]
+    async fn read_frame_max_refuses_a_length_over_its_cap() {
+        let cfg = Config {
+            generation: 1,
+            listeners: vec![],
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &cfg).await.unwrap();
+        let len = buf.len() - 4;
+
+        let got: Option<Config> = read_frame_max(&mut &buf[..], len).await.unwrap();
+        assert_eq!(got, Some(cfg.clone()));
+        let got: Option<Config> = read_frame_max(&mut &buf[..], len + 1).await.unwrap();
+        assert_eq!(got, Some(cfg));
+
+        // Only the prefix is present: the refusal must not wait for a body.
+        let err = read_frame_max::<_, Config>(&mut &buf[..4], len - 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FrameError::TooLarge(n) if n == len), "{err}");
     }
 
     #[tokio::test]
