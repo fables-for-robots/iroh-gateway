@@ -459,6 +459,19 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ipv4_visitor_on_dual_stack_listener_is_ipv4() {
+        let p = free_port();
+        let (mut set, mut rx) = ListenerSet::new("::".parse().unwrap(), 10);
+        let st = set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await;
+        assert_eq!(st.listeners[0].state, BindState::Bound);
+        let c = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+        let a = rx.recv().await.unwrap();
+        assert_eq!(a.visitor, c.local_addr().unwrap());
+        assert!(a.visitor.is_ipv4(), "{}", a.visitor);
+        assert_eq!(a.local, SocketAddr::from(([127, 0, 0, 1], p)));
+    }
+
     #[test]
     fn visitor_address_is_canonical() {
         let mapped: SocketAddr = "[::ffff:192.0.2.7]:4000".parse().unwrap();

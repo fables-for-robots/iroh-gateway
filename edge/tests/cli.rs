@@ -22,12 +22,21 @@ use common::{FakeOperator, STEP, free_tcp_port, free_udp_port, tcp_cfg};
 
 const BIN: &str = env!("CARGO_BIN_EXE_iroh-gateway-edge");
 
+/// The binary with a clean environment for it: no `RUST_LOG` and no `IROH_GATEWAY_*` variable
+/// of the shell running the tests, which would act as flags.
+fn bin() -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env_remove("RUST_LOG");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("IROH_GATEWAY_") {
+            cmd.env_remove(name);
+        }
+    }
+    cmd
+}
+
 fn edge(args: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(args)
-        .env_remove("RUST_LOG")
-        .output()
-        .unwrap()
+    bin().args(args).output().unwrap()
 }
 
 fn id_of(key_file: &Path) -> String {
@@ -111,13 +120,12 @@ fn line_with(lines: &mpsc::Receiver<String>, needle: &str) -> String {
 
 /// `run` with a fresh key, a random operator and loopback addresses.
 fn run_command(dir: &Path, extra: &[&str]) -> Command {
-    let mut cmd = Command::new(BIN);
+    let mut cmd = bin();
     cmd.args(["run", "--key-file", dir.join("e.key").to_str().unwrap()])
         .args(["--operator", &SecretKey::generate().public().to_string()])
         .args(["--iroh-listen", &format!("127.0.0.1:{}", free_udp_port())])
         .args(["--public-bind", "127.0.0.1"])
-        .args(extra)
-        .env_remove("RUST_LOG");
+        .args(extra);
     cmd
 }
 
@@ -225,12 +233,11 @@ fn run_rejects_bad_relay() {
     let key = dir.path().join("e.key");
     let operator = SecretKey::generate().public().to_string();
     let out = output_within_10s(
-        Command::new(BIN)
+        bin()
             .args(["run", "--key-file", key.to_str().unwrap()])
             .args(["--operator", &operator, "--relay", "nonsense"])
             .args(["--iroh-listen", &format!("127.0.0.1:{}", free_udp_port())])
-            .args(["--public-bind", "127.0.0.1"])
-            .env_remove("RUST_LOG"),
+            .args(["--public-bind", "127.0.0.1"]),
     );
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -255,12 +262,11 @@ async fn run_serves_the_pinned_operator() {
     let operator_key = SecretKey::generate();
     let iroh_port = free_udp_port();
     let mut child = Running(
-        Command::new(BIN)
+        bin()
             .args(["run", "--key-file", key.to_str().unwrap()])
             .args(["--operator", &operator_key.public().to_string()])
             .args(["--iroh-listen", &format!("127.0.0.1:{iroh_port}")])
             .args(["--public-bind", "127.0.0.1"])
-            .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

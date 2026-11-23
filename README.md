@@ -126,7 +126,7 @@ A relative `key_file` is taken relative to the directory of the configuration fi
 
 ## Running in production
 
-- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection). Both binaries raise their soft open-file limit to the hard limit at start and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
+- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection). Both binaries raise their soft open-file limit to the hard limit at start (on macOS to at most 10240) and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
 - **Ports below 1024.** Listening on a public port below 1024 needs `CAP_NET_BIND_SERVICE` or root on the edge.
 - **The iroh port.** The edge's iroh UDP port (`--iroh-listen`, default 7842) must be reachable from the operator for a direct connection.
 
@@ -136,13 +136,13 @@ The visitor address a backend sees is only as trustworthy as the edge. It is for
 
 ## Relay mode
 
-Relay mode is off by default (`disabled`): the operator reaches the edge at the `address` you give, and nothing else is contacted. Turn it on when the operator cannot reach the edge directly, for example when the edge has no stable address. Both sides must use the same value (`--relay` on the edge, `relay` in the operator config).
+Relay mode is off by default (`disabled`): the operator reaches the edge at the `address` you give, and nothing else is contacted, except that a DNS name in `address` is resolved through the operator's normal system resolver. Turn it on when the operator cannot reach the edge directly, for example when the edge has no stable address. Both sides must use the same value (`--relay` on the edge, `relay` in the operator config).
 
 A relay learns the home IP, the edge's IP, and the size and timing of the relayed traffic. With `n0` it also sees address lookups from home. A relay cannot read or alter the traffic: it is encrypted end to end between the two keys.
 
 ## Known limitations
 
-- **Addresses exchanged in direct mode.** iroh's QUIC NAT traversal cannot be switched off in iroh 1.5: even with relay mode disabled, each side tells the other its local interface addresses and sends probe packets to the addresses it is told. Port mapping (UPnP/NAT-PMP/PCP) is disabled. Mitigation: start the edge with `--iroh-listen <public-ip>:7842` instead of `0.0.0.0:7842`, since only a wildcard bind advertises every interface.
+- **Addresses exchanged in direct mode.** iroh's QUIC NAT traversal cannot be switched off in iroh 1.5: even with relay mode disabled, each side tells the other its local interface addresses and sends probe packets to the addresses it is told. Port mapping (UPnP/NAT-PMP/PCP) is disabled. Mitigation, for the edge only: start the edge with `--iroh-listen <public-ip>:7842` instead of `0.0.0.0:7842`, since only a wildcard bind advertises every interface. This limits only what the edge advertises: the operator binds wildcard sockets and still advertises its own interface addresses (its LAN addresses, for example) to the edge.
 - **Stalled visitors are cut after 5 minutes.** If a visitor accepts no data for 300 seconds while data is waiting for it, the connection is aborted. Idle connections with nothing pending are not affected.
 - **Half-closed connections are cut after 5 minutes of silence.** Once one side has finished sending, the connection is aborted if the other side sends nothing for 300 seconds.
 - **TCP only.** UDP listeners are reported as a bind error in this version.

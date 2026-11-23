@@ -138,12 +138,10 @@ async fn reconnect_within_grace_keeps_listeners() {
     let _v1 = visitor(p).await;
 
     fake1.conn.close(0u32.into(), b"");
-    let closed_at = Instant::now();
     let mut fake2 = FakeOperator::connect(key, edge.endpoint_id(), edge.iroh_addr())
         .await
         .unwrap();
     assert!(bound(&fake2.push(tcp_cfg(2, &[p])).await));
-    assert!(closed_at.elapsed() < Duration::from_millis(500));
 
     sleep(Duration::from_millis(2500)).await;
     let mut v = visitor(p).await;

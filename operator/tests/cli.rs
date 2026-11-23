@@ -22,12 +22,21 @@ use common::{echo_server, edge_options, free_tcp_port};
 
 const BIN: &str = env!("CARGO_BIN_EXE_iroh-gateway-operator");
 
+/// The binary with a clean environment for it: no `RUST_LOG` and no `IROH_GATEWAY_*` variable
+/// of the shell running the tests, which would act as flags.
+fn bin() -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env_remove("RUST_LOG");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("IROH_GATEWAY_") {
+            cmd.env_remove(name);
+        }
+    }
+    cmd
+}
+
 fn operator(args: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(args)
-        .env_remove("RUST_LOG")
-        .output()
-        .unwrap()
+    bin().args(args).output().unwrap()
 }
 
 /// Kills the child when dropped, so a failed test leaves no process behind.
@@ -117,9 +126,8 @@ fn static_raises_the_open_file_limit() {
         ),
     )
     .unwrap();
-    let mut cmd = Command::new(BIN);
-    cmd.args(["static", "--config", cfg.to_str().unwrap()])
-        .env_remove("RUST_LOG");
+    let mut cmd = bin();
+    cmd.args(["static", "--config", cfg.to_str().unwrap()]);
     let hard = hard_nofile_at_most(4096);
     let (_child, lines) = spawn_with_nofile(cmd, 256, hard);
     line_with(&lines, &format!("open file limit is {hard}"));
@@ -208,9 +216,8 @@ async fn static_forwards_to_target() {
     )
     .unwrap();
     let mut child = Running(
-        Command::new(BIN)
+        bin()
             .args(["static", "--config", cfg.to_str().unwrap()])
-            .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
