@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::poll_fn;
 use std::path::PathBuf;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::task::Poll;
@@ -35,7 +35,7 @@ pub struct EngineOptions {
     pub supervisor: SupervisorOptions,
     /// The operator's relay mode, which every link dials with.
     pub relay: Relay,
-    /// After a reload that failed with its outcome unknown, how long until [`Engine::changed`]
+    /// After a reload that failed with its outcome unknown, how long until [`Engine::next_event`]
     /// asks for another pass.
     pub retry: Duration,
 }
@@ -51,6 +51,15 @@ impl EngineOptions {
     }
 }
 
+/// What [`Engine::next_event`] resolves with.
+#[derive(Debug)]
+pub enum EngineEvent {
+    /// A link's state changed, or another pass is due after a failed reload.
+    Changed,
+    /// HAProxy ended on its own.
+    HaproxyExited(ExitStatus),
+}
+
 /// HAProxy and the links to the edges, driven by renders.
 pub struct Engine {
     endpoint: Endpoint,
@@ -62,7 +71,7 @@ pub struct Engine {
     links: BTreeMap<ObjRef, Running>,
     /// Plans no link can be made for, with the state that says why.
     unreachable: BTreeMap<ObjRef, EdgeState>,
-    /// When [`Engine::changed`] asks for another pass after a failed reload.
+    /// When [`Engine::next_event`] asks for another pass after a failed reload.
     retry_at: Option<Instant>,
 }
 
@@ -161,45 +170,51 @@ impl Engine {
         }
     }
 
-    /// Resolves when any link's state changed since the last call, or when a pass is due again
-    /// after a failed reload. Cancel-safe: a change is not lost when the future is dropped.
-    pub async fn changed(&mut self) {
+    /// Resolves with `Changed` when any link's state changed since the last `Changed` was returned
+    /// or when a retry is due, and with `HaproxyExited` if HAProxy ends on its own.
+    ///
+    /// HAProxy's exit is checked first: once it has ended, every later call returns
+    /// `HaproxyExited` again at once, with the same status. Cancel-safe: dropping the future loses
+    /// neither a change nor the exit.
+    pub async fn next_event(&mut self) -> EngineEvent {
         let retry_at = self.retry_at;
-        let mut waits: Vec<Pin<Box<dyn Future<Output = ()> + Send + '_>>> = self
-            .links
-            .values_mut()
-            // A closed channel would resolve at once, every time; its link has ended.
-            .filter(|link| link.state.has_changed().is_ok())
-            .map(|link| {
-                Box::pin(async {
-                    let _ = link.state.changed().await;
-                }) as Pin<Box<dyn Future<Output = ()> + Send + '_>>
-            })
-            .collect();
-        if let Some(at) = retry_at {
-            waits.push(Box::pin(sleep_until(at)));
-        }
-        poll_fn(|cx| {
-            if waits.iter_mut().any(|w| w.as_mut().poll(cx).is_ready()) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
+        let event = {
+            let mut exited = pin!(self.supervisor.exited());
+            let mut waits: Vec<Pin<Box<dyn Future<Output = ()> + Send + '_>>> = self
+                .links
+                .values_mut()
+                // A closed channel would resolve at once, every time; its link has ended.
+                .filter(|link| link.state.has_changed().is_ok())
+                .map(|link| {
+                    Box::pin(async {
+                        let _ = link.state.changed().await;
+                    }) as Pin<Box<dyn Future<Output = ()> + Send + '_>>
+                })
+                .collect();
+            if let Some(at) = retry_at {
+                waits.push(Box::pin(sleep_until(at)));
             }
-        })
-        .await;
-        drop(waits);
-        // The caller reads the facts next, which include every state up to now.
-        for link in self.links.values_mut() {
-            link.state.mark_unchanged();
+            poll_fn(|cx| {
+                if let Poll::Ready(status) = exited.as_mut().poll(cx) {
+                    Poll::Ready(EngineEvent::HaproxyExited(status))
+                } else if waits.iter_mut().any(|w| w.as_mut().poll(cx).is_ready()) {
+                    Poll::Ready(EngineEvent::Changed)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        };
+        if let EngineEvent::Changed = event {
+            // The caller reads the facts next, which include every state up to now.
+            for link in self.links.values_mut() {
+                link.state.mark_unchanged();
+            }
+            if self.retry_at.is_some_and(|at| at <= Instant::now()) {
+                self.retry_at = None;
+            }
         }
-        if self.retry_at.is_some_and(|at| at <= Instant::now()) {
-            self.retry_at = None;
-        }
-    }
-
-    /// Resolves if HAProxy ends on its own.
-    pub async fn haproxy_exited(&mut self) -> ExitStatus {
-        self.supervisor.exited().await
+        event
     }
 
     /// The HAProxy master's process id.

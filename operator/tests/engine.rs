@@ -4,6 +4,7 @@
 #[allow(dead_code)]
 mod common;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use std::time::Duration;
 use common::*;
 use iroh::{EndpointId, SecretKey};
 use iroh_gateway_edge::{Edge, EdgeHandle};
-use iroh_gateway_operator::engine::{Engine, EngineOptions};
+use iroh_gateway_operator::engine::{Engine, EngineEvent, EngineOptions};
 use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::{Rendered, port_id, render};
 use iroh_gateway_operator::model::{
@@ -22,10 +23,11 @@ use iroh_gateway_operator::status::Facts;
 use iroh_gateway_operator::tunnel::{ListenerState, bind_endpoint};
 use iroh_gateway_proto::transport::Relay;
 use nix::errno::Errno;
-use nix::sys::signal::kill;
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tempfile::TempDir;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const NS: &str = "ns";
@@ -50,6 +52,8 @@ fn key(name: &str) -> ObjRef {
 struct World {
     dir: TempDir,
     echo: SocketAddr,
+    /// Gateways whose listeners go to a backend of their own instead of `echo`.
+    backends: HashMap<&'static str, SocketAddr>,
     operator_key: SecretKey,
 }
 
@@ -75,11 +79,22 @@ impl World {
         Self {
             dir: short_dir(),
             echo: echo_server().await,
+            backends: HashMap::new(),
             operator_key: SecretKey::generate(),
         }
     }
 
-    fn listener(&self, port: u16) -> ListenerModel {
+    /// A world in which each named gateway has a backend that writes the given tag first.
+    async fn with_tagged(tags: &[(&'static str, &'static [u8])]) -> Self {
+        let mut w = Self::new().await;
+        for &(gateway, tag) in tags {
+            w.backends.insert(gateway, tagged_echo(tag).await);
+        }
+        w
+    }
+
+    fn listener(&self, gateway: &str, port: u16) -> ListenerModel {
+        let backend = self.backends.get(gateway).copied().unwrap_or(self.echo);
         ListenerModel {
             name: format!("l{port}"),
             port,
@@ -92,7 +107,7 @@ impl World {
             backends: vec![Backend {
                 service: key("echo"),
                 ip: "127.0.0.1".parse().unwrap(),
-                port: self.echo.port(),
+                port: backend.port(),
                 weight: 1,
             }],
         }
@@ -108,7 +123,7 @@ impl World {
                     key: key(name),
                     generation: 1,
                     accepted: Ok(()),
-                    listeners: ports.iter().map(|&p| self.listener(p)).collect(),
+                    listeners: ports.iter().map(|&p| self.listener(name, p)).collect(),
                     edges: edges
                         .iter()
                         .filter(|e| e.gateway == name)
@@ -177,6 +192,47 @@ impl World {
     }
 }
 
+/// Writes `tag` on each connection, then echoes it until EOF.
+async fn tagged_echo(tag: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                if stream.write_all(tag).await.is_err() {
+                    return;
+                }
+                let (mut rd, mut wr) = stream.split();
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                let _ = wr.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Connects to `port` and returns the tag the backend behind it writes first.
+async fn tag_on(port: u16) -> Vec<u8> {
+    let mut v = visitor(port).await;
+    let mut tag = [0u8; 1];
+    timeout(STEP, v.read_exact(&mut tag))
+        .await
+        .expect("no tag in time")
+        .unwrap();
+    tag.to_vec()
+}
+
+/// Waits for the next event and checks that it is `Changed`.
+async fn changed(engine: &mut Engine) {
+    match engine.next_event().await {
+        EngineEvent::Changed => {}
+        EngineEvent::HaproxyExited(status) => panic!("haproxy exited: {status}"),
+    }
+}
+
 /// The Unix sockets left in `dir` and `dir/s`.
 fn sockets_in(dir: &Path) -> Vec<PathBuf> {
     [dir.to_path_buf(), dir.join("s")]
@@ -202,7 +258,7 @@ fn serving(f: &Facts, edge: &str, ports: &[u16]) -> bool {
         .is_some_and(|s| s.connected && s.listeners == want)
 }
 
-/// Waits, through `changed()`, until the facts satisfy `pred`; panics after [`STEP`].
+/// Waits, through `next_event()`, until the facts satisfy `pred`; panics after [`STEP`].
 async fn wait_facts(engine: &mut Engine, pred: impl Fn(&Facts) -> bool) -> Facts {
     let deadline = Instant::now() + STEP;
     loop {
@@ -210,7 +266,7 @@ async fn wait_facts(engine: &mut Engine, pred: impl Fn(&Facts) -> bool) -> Facts
         if pred(&facts) {
             return facts;
         }
-        if timeout_at(deadline, engine.changed()).await.is_err() {
+        if timeout_at(deadline, changed(engine)).await.is_err() {
             panic!("facts not reached within {STEP:?}; last: {facts:?}");
         }
     }
@@ -439,17 +495,17 @@ async fn changed_resolves_on_link_state_change() {
     wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
     // Nothing changes while the link is up and nothing is applied.
     assert!(
-        timeout(Duration::from_millis(500), engine.changed())
+        timeout(Duration::from_millis(500), changed(&mut engine))
             .await
             .is_err(),
-        "changed() resolved without a change: {:?}",
+        "next_event() resolved without a change: {:?}",
         engine.facts()
     );
 
     edge.shutdown().await;
-    timeout(STEP, engine.changed())
+    timeout(STEP, changed(&mut engine))
         .await
-        .expect("changed() did not resolve after the edge stopped");
+        .expect("next_event() did not resolve after the edge stopped");
     wait_facts(&mut engine, |f| {
         f.edges
             .get(&key("e"))
@@ -468,17 +524,17 @@ async fn changed_is_cancel_safe() {
         .start(w.plan(&[("gw", &[p])], &[at("e", "gw", &edge)]))
         .await;
     wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
-    // A change that happens while no `changed()` is being awaited, after one was dropped.
+    // A change that happens while no `next_event()` is being awaited, after one was dropped.
     assert!(
-        timeout(Duration::from_millis(100), engine.changed())
+        timeout(Duration::from_millis(100), changed(&mut engine))
             .await
             .is_err()
     );
     edge.shutdown().await;
     sleep(Duration::from_millis(300)).await;
-    timeout(Duration::from_millis(100), engine.changed())
+    timeout(Duration::from_millis(100), changed(&mut engine))
         .await
-        .expect("a change made while no changed() was awaited was lost");
+        .expect("a change made while no next_event() was awaited was lost");
     engine.shutdown().await;
 }
 
@@ -542,7 +598,7 @@ async fn failed_reload_is_retried() {
     assert!(engine.facts().haproxy.is_err());
 
     let failed_at = Instant::now();
-    timeout(STEP, engine.changed())
+    timeout(STEP, changed(&mut engine))
         .await
         .expect("no retry after a failed reload");
     let waited = failed_at.elapsed();
@@ -553,7 +609,7 @@ async fn failed_reload_is_retried() {
     assert_eq!(engine.facts().haproxy, Ok(()));
     assert!(w.socket("gw", q).exists());
     // Succeeded: no retry is pending any more.
-    assert!(timeout(RETRY * 3, engine.changed()).await.is_err());
+    assert!(timeout(RETRY * 3, changed(&mut engine)).await.is_err());
     engine.shutdown().await;
 }
 
@@ -566,7 +622,7 @@ async fn invalid_configuration_is_not_retried() {
     bad.haproxy_cfg = INVALID_CFG.into();
     engine.apply(bad).await;
     assert!(engine.facts().haproxy.is_err());
-    assert!(timeout(RETRY * 3, engine.changed()).await.is_err());
+    assert!(timeout(RETRY * 3, changed(&mut engine)).await.is_err());
     // The last good configuration still serves.
     assert!(w.socket("gw", p).exists());
     engine.shutdown().await;
@@ -596,6 +652,89 @@ async fn unreachable_edge_is_reported_not_linked() {
     let why = state.last_error.as_deref().unwrap();
     assert!(why.contains("cannot be reached"), "{why}");
     echoes_on(p1, b"p1").await;
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn haproxy_exit_is_an_event_while_links_are_watched() {
+    let w = World::new().await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let mut engine = w
+        .start(w.plan(&[("gw", &[p])], &[at("e", "gw", &edge)]))
+        .await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+
+    // Killed while `next_event()` waits, with a link to watch as well.
+    let pid = Pid::from_raw(engine.haproxy_pid() as i32);
+    let killer = tokio::spawn(async move {
+        sleep(Duration::from_millis(200)).await;
+        kill(pid, Signal::SIGKILL).unwrap();
+    });
+    let status = match timeout(STEP, engine.next_event()).await {
+        Ok(EngineEvent::HaproxyExited(status)) => status,
+        Ok(EngineEvent::Changed) => {
+            panic!("Changed instead of HaproxyExited: {:?}", engine.facts())
+        }
+        Err(_) => panic!("next_event() did not resolve after haproxy was killed"),
+    };
+    killer.await.unwrap();
+    assert!(!status.success());
+    // And again at once, with the same status.
+    match timeout(Duration::from_millis(100), engine.next_event()).await {
+        Ok(EngineEvent::HaproxyExited(again)) => assert_eq!(again, status),
+        other => panic!("not HaproxyExited again: {other:?}"),
+    }
+    engine.shutdown().await;
+    assert_eq!(sockets_in(w.dir.path()), Vec::<PathBuf>::new());
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn moving_an_edge_to_another_gateway_reaches_its_backend() {
+    let w = World::with_tagged(&[("gw1", b"A"), ("gw2", b"B")]).await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let gateways: &[(&str, &[u16])] = &[("gw1", &[p]), ("gw2", &[p])];
+    let mut engine = w.start(w.plan(gateways, &[at("e", "gw1", &edge)])).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(tag_on(p).await, b"A");
+
+    engine
+        .apply(w.plan(gateways, &[at("e", "gw2", &edge)]))
+        .await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(tag_on(p).await, b"B");
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_apply_that_moves_an_edge_closes_its_port() {
+    let w = World::with_tagged(&[("gw1", b"A"), ("gw2", b"B")]).await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let gateways: &[(&str, &[u16])] = &[("gw1", &[p]), ("gw2", &[p])];
+    let mut engine = w.start(w.plan(gateways, &[at("e", "gw1", &edge)])).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(tag_on(p).await, b"A");
+
+    // The same port, but of another gateway: not a port the old and the new plan share.
+    let mut bad = w.plan(gateways, &[at("e", "gw2", &edge)]);
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    assert!(engine.facts().haproxy.is_err());
+    refused(p).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[])).await;
+
+    engine
+        .apply(w.plan(gateways, &[at("e", "gw2", &edge)]))
+        .await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(tag_on(p).await, b"B");
     engine.shutdown().await;
     edge.shutdown().await;
 }
