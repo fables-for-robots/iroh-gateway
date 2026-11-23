@@ -6,7 +6,10 @@ use iroh::EndpointId;
 use kube::ResourceExt;
 
 use super::generation;
-use super::{EdgeModel, GatewayAddress, GatewayModel, ObjRef, Reject, Settings, Snapshot};
+use super::{
+    EdgeModel, GatewayAddress, GatewayModel, MAX_GATEWAY_ADDRESSES, ObjRef, Reject, Settings,
+    Snapshot,
+};
 use crate::crd::Edge;
 use crate::staticcfg::check_address;
 use iroh_gateway_proto::transport::Relay;
@@ -64,7 +67,7 @@ fn edge(e: &Edge, settings: &Settings, gateways: &[GatewayModel]) -> EdgeModel {
         .then(|| ObjRef::new(&key.namespace, &spec.gateway_ref.name));
     let public_addresses = public_addresses(e);
 
-    let accepted = (|| {
+    let accepted = (|| -> Result<(), Reject> {
         if !settings.gateway_namespaces.contains(&key.namespace) {
             return Err(Reject::new(
                 "NamespaceNotAllowed",
@@ -93,12 +96,29 @@ fn edge(e: &Edge, settings: &Settings, gateways: &[GatewayModel]) -> EdgeModel {
                     "without an address, publicAddresses must say where visitors connect",
                 ));
             }
-            Some(a) => {
-                if let Err(err) = check_address(a) {
-                    return Err(Reject::new("InvalidAddress", err.to_string()));
-                }
+            _ => {}
+        }
+        if let Some(bad) = spec
+            .public_addresses
+            .iter()
+            .find(|a| GatewayAddress::parse(a).is_none())
+        {
+            return Err(Reject::new(
+                "InvalidPublicAddress",
+                format!(
+                    "publicAddresses entry {bad:?} is neither an IP address nor a DNS name \
+                     (without a port)"
+                ),
+            ));
+        }
+        if let Some(a) = &spec.address {
+            check_address(a).map_err(|err| Reject::new("InvalidAddress", err.to_string()))?;
+            if address_host(a).is_none() {
+                return Err(Reject::new(
+                    "InvalidAddress",
+                    format!("address {a:?}: the host is not a valid DNS name"),
+                ));
             }
-            None => {}
         }
         let gw = gateway
             .as_ref()
@@ -132,29 +152,37 @@ fn edge(e: &Edge, settings: &Settings, gateways: &[GatewayModel]) -> EdgeModel {
     }
 }
 
-/// `spec.publicAddresses`, or the host of `address`.
+/// `spec.publicAddresses` normalised, or the normalised host of `address`; the entries that are
+/// valid only (an edge with an invalid one is not accepted).
 fn public_addresses(e: &Edge) -> Vec<GatewayAddress> {
     if !e.spec.public_addresses.is_empty() {
         return e
             .spec
             .public_addresses
             .iter()
-            .map(|a| GatewayAddress::classify(a))
+            .filter_map(|a| GatewayAddress::parse(a))
             .collect();
     }
-    let Some(address) = e.spec.address.as_deref() else {
-        return Vec::new();
-    };
-    if let Ok(sock) = address.parse::<std::net::SocketAddr>() {
-        return vec![GatewayAddress::classify(&sock.ip().to_string())];
-    }
-    match address.rsplit_once(':') {
-        Some((host, _)) if check_address(address).is_ok() => vec![GatewayAddress::classify(host)],
-        _ => Vec::new(),
-    }
+    e.spec
+        .address
+        .as_deref()
+        .filter(|a| check_address(a).is_ok())
+        .and_then(address_host)
+        .into_iter()
+        .collect()
 }
 
-/// Record on each gateway the accepted edges that serve it and their public addresses.
+/// The host of an `address` that passed [`check_address`], normalised; `None` when it cannot be.
+fn address_host(address: &str) -> Option<GatewayAddress> {
+    if let Ok(sock) = address.parse::<std::net::SocketAddr>() {
+        return GatewayAddress::parse(&sock.ip().to_string());
+    }
+    let (host, _) = address.rsplit_once(':')?;
+    GatewayAddress::parse(host)
+}
+
+/// Record on each gateway the accepted edges that serve it and their public addresses, at most
+/// [`MAX_GATEWAY_ADDRESSES`] of them.
 pub(super) fn bind(gateways: &mut [GatewayModel], edges: &[EdgeModel]) {
     for gw in gateways {
         let mine: Vec<&EdgeModel> = edges
@@ -166,7 +194,8 @@ pub(super) fn bind(gateways: &mut [GatewayModel], edges: &[EdgeModel]) {
             .iter()
             .flat_map(|e| e.public_addresses.iter().cloned())
             .collect();
-        gw.addresses = addresses.into_iter().collect();
+        gw.addresses_dropped = addresses.len().saturating_sub(MAX_GATEWAY_ADDRESSES);
+        gw.addresses = addresses.into_iter().take(MAX_GATEWAY_ADDRESSES).collect();
     }
 }
 
@@ -276,6 +305,11 @@ mod tests {
                 settings(&["infra"]),
             ),
             (
+                "InvalidPublicAddress",
+                good("e", 1).public("198.51.100.1:443"),
+                settings(&["infra"]),
+            ),
+            (
                 "GatewayNotFound",
                 good("e", 1).gateway("absent"),
                 settings(&["infra"]),
@@ -322,6 +356,14 @@ mod tests {
             (
                 "NoPublicAddress",
                 edge("infra", "e", 1).no_address().gateway("absent"),
+                &relay,
+            ),
+            (
+                "InvalidPublicAddress",
+                edge("infra", "e", 1)
+                    .no_address()
+                    .gateway("absent")
+                    .public("bad_name"),
                 &relay,
             ),
             (
@@ -437,6 +479,165 @@ mod tests {
     fn ipv6_address_host_has_no_brackets() {
         let m = run(vec![good("e", 1).address("[2001:db8::1]:7842")]);
         assert_eq!(m.gateways[0].addresses, [ip("2001:db8::1")]);
+    }
+
+    fn host(v: &str) -> GatewayAddress {
+        GatewayAddress {
+            kind: AddressKind::Hostname,
+            value: v.into(),
+        }
+    }
+
+    #[test]
+    fn public_addresses_are_normalised() {
+        let m = run(vec![
+            good("e", 1)
+                .public("198.51.100.1")
+                .public("2001:DB8:0:0::1")
+                .public("::ffff:192.0.2.1")
+                .public("Edge.Example.COM.")
+                .public("xn--bcher-kva.example"),
+        ]);
+        assert_eq!(reason(&m.edges[0]), "Ok");
+        assert_eq!(
+            m.gateways[0].addresses,
+            [
+                ip("198.51.100.1"),
+                ip("2001:db8::1"),
+                ip("::ffff:192.0.2.1"),
+                host("edge.example.com"),
+                host("xn--bcher-kva.example"),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_public_addresses_are_refused() {
+        let long_label = format!("{}.example.com", "a".repeat(64));
+        let long_name = format!("{}.{}", "a".repeat(63), "b.".repeat(100));
+        assert!(long_name.trim_end_matches('.').len() > 253);
+        for bad in [
+            "203.0.113.7:8080",
+            "edge.example.com:8080",
+            "[2001:db8::1]",
+            "[2001:db8::1]:443",
+            "under_score.example.com",
+            "-lead.example.com",
+            "trail-.example.com",
+            "a..b",
+            "",
+            ".",
+            "edge.example.com..",
+            "exa mple.com",
+            "*.example.com",
+            "fe80::1%en0",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            let m = run(vec![good("e", 1).public("198.51.100.1").public(bad)]);
+            assert_eq!(reason(&m.edges[0]), "InvalidPublicAddress", "{bad:?}");
+            assert!(m.gateways[0].addresses.is_empty(), "{bad:?}");
+            assert!(m.gateways[0].edges.is_empty(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn longest_valid_names_are_kept() {
+        // 253 characters, one label of 63; the trailing dot does not count.
+        let name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(name.len(), 253);
+        let m = run(vec![good("e", 1).public(&format!("{name}."))]);
+        assert_eq!(reason(&m.edges[0]), "Ok");
+        assert_eq!(m.gateways[0].addresses, [host(&name)]);
+
+        let m = run(vec![good("e", 1).public(&format!("{name}x"))]);
+        assert_eq!(reason(&m.edges[0]), "InvalidPublicAddress");
+    }
+
+    #[test]
+    fn address_host_is_normalised() {
+        let m = run(vec![good("e", 1).address("Edge.Example.COM.:7842")]);
+        assert_eq!(reason(&m.edges[0]), "Ok");
+        assert_eq!(m.gateways[0].addresses, [host("edge.example.com")]);
+        // The address is dialled as written.
+        assert_eq!(
+            m.edges[0].address.as_deref(),
+            Some("Edge.Example.COM.:7842")
+        );
+
+        let m = run(vec![good("e", 1).address("[2001:DB8::0:1]:7842")]);
+        assert_eq!(m.gateways[0].addresses, [ip("2001:db8::1")]);
+    }
+
+    #[test]
+    fn invalid_public_address_is_checked_after_no_public_address() {
+        let relay = relay_settings();
+        let plain = settings(&["infra"]);
+        let cases: Vec<(&str, crate::crd::Edge, &Settings)> = vec![
+            (
+                "NoAddress",
+                edge("infra", "e", 1)
+                    .no_address()
+                    .gateway("public")
+                    .public("x:1"),
+                &plain,
+            ),
+            (
+                "InvalidPublicAddress",
+                edge("infra", "e", 1)
+                    .no_address()
+                    .gateway("absent")
+                    .public("x:1"),
+                &relay,
+            ),
+            (
+                "InvalidPublicAddress",
+                good("e", 1).address("203.0.113.7").public("x:1"),
+                &plain,
+            ),
+            (
+                "InvalidPublicAddress",
+                good("e", 1).gateway("absent").public("x:1"),
+                &plain,
+            ),
+        ];
+        for (want, e, settings) in cases {
+            let m = build(&snap(vec![e]), settings);
+            assert_eq!(reason(&m.edges[0]), want);
+        }
+    }
+
+    #[test]
+    fn a_gateway_lists_at_most_16_addresses() {
+        let edges: Vec<crate::crd::Edge> = (1..=17u8)
+            .map(|n| good(&format!("e{n:02}"), n).address(&format!("203.0.113.{n}:7842")))
+            .collect();
+        let m = run(edges);
+        let gw = &m.gateways[0];
+        assert_eq!(gw.edges.len(), 17);
+        assert_eq!(gw.addresses.len(), 16);
+        assert_eq!(gw.addresses_dropped, 1);
+        // The first 16 after sorting: "203.0.113.9" sorts last and is left out.
+        assert!(
+            !gw.addresses.contains(&ip("203.0.113.9")),
+            "{:?}",
+            gw.addresses
+        );
+        let mut sorted = gw.addresses.clone();
+        sorted.sort();
+        assert_eq!(sorted, gw.addresses);
+
+        let m = run((1..=16u8)
+            .map(|n| good(&format!("e{n:02}"), n).address(&format!("203.0.113.{n}:7842")))
+            .collect());
+        assert_eq!(m.gateways[0].addresses.len(), 16);
+        assert_eq!(m.gateways[0].addresses_dropped, 0);
     }
 
     #[test]

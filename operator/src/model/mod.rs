@@ -114,7 +114,10 @@ pub struct GatewayModel {
     pub listeners: Vec<ListenerModel>,
     /// Accepted edges bound to this gateway.
     pub edges: Vec<ObjRef>,
+    /// The first [`MAX_GATEWAY_ADDRESSES`] of the edges' public addresses, sorted.
     pub addresses: Vec<GatewayAddress>,
+    /// How many more addresses the edges have than `addresses` lists.
+    pub addresses_dropped: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -129,18 +132,33 @@ pub struct GatewayAddress {
     pub value: String,
 }
 
+/// The most addresses a Gateway's status may list.
+pub const MAX_GATEWAY_ADDRESSES: usize = 16;
+
 impl GatewayAddress {
-    /// An IP address if `value` parses as one, otherwise a host name.
-    pub(crate) fn classify(value: &str) -> Self {
-        let kind = if value.parse::<IpAddr>().is_ok() {
-            AddressKind::IpAddress
-        } else {
-            AddressKind::Hostname
-        };
-        Self {
-            kind,
-            value: value.to_owned(),
+    /// An IP address in its canonical text form, or a host name in lower case with one trailing
+    /// dot removed: at most 253 characters in labels of 1 to 63 characters of `[a-z0-9-]`, none
+    /// starting or ending with `-`. `None` for anything else, a port included.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            return Some(Self {
+                kind: AddressKind::IpAddress,
+                value: ip.to_string(),
+            });
         }
+        let name = value.to_ascii_lowercase();
+        let name = name.strip_suffix('.').unwrap_or(&name);
+        let label_ok = |l: &str| {
+            (1..=63).contains(&l.len())
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        };
+        (name.len() <= 253 && name.split('.').all(label_ok)).then(|| Self {
+            kind: AddressKind::Hostname,
+            value: name.to_owned(),
+        })
     }
 }
 
@@ -184,6 +202,8 @@ pub struct EdgeModel {
     pub address: Option<String>,
     /// The gateway the edge names, in the edge's namespace, whether or not it exists.
     pub gateway: Option<ObjRef>,
+    /// Normalised by [`GatewayAddress::parse`]: the valid entries of `publicAddresses`, or the
+    /// host of `address` when there are none.
     pub public_addresses: Vec<GatewayAddress>,
 }
 

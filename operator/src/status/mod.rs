@@ -11,7 +11,8 @@ use iroh_gateway_proto::control::Protocol;
 
 use crate::crd::EdgeListenerStatus;
 use crate::model::{
-    EdgeModel, GatewayAddress, GatewayModel, ListenerModel, Model, ObjRef, ParentKey, Reject,
+    EdgeModel, GatewayAddress, GatewayModel, ListenerModel, MAX_GATEWAY_ADDRESSES, Model, ObjRef,
+    ParentKey, Reject,
 };
 use crate::tunnel::{EdgeState, ListenerState};
 
@@ -259,6 +260,7 @@ fn gateway_status(g: &GatewayModel, facts: &Facts) -> GatewayStatusOut {
     } else {
         cond("Programmed", true, "Programmed", "")
     };
+    let (accepted, programmed) = note_dropped_addresses(g.addresses_dropped, accepted, programmed);
 
     let mut listeners: Vec<ListenerStatusOut> = g
         .listeners
@@ -274,6 +276,33 @@ fn gateway_status(g: &GatewayModel, facts: &Facts) -> GatewayStatusOut {
         addresses: g.addresses.clone(),
         listeners,
     }
+}
+
+/// When the Gateway lists fewer addresses than its edges have, says so in `Programmed`'s message
+/// when it is True, otherwise in `Accepted`'s.
+fn note_dropped_addresses(
+    dropped: usize,
+    mut accepted: Cond,
+    mut programmed: Cond,
+) -> (Cond, Cond) {
+    if dropped > 0 {
+        let verb = if dropped == 1 { "is" } else { "are" };
+        let note = format!(
+            "{dropped} of the edges' addresses {verb} not listed: a Gateway lists at most \
+             {MAX_GATEWAY_ADDRESSES}"
+        );
+        let target = if programmed.status {
+            &mut programmed
+        } else {
+            &mut accepted
+        };
+        target.message = if target.message.is_empty() {
+            note
+        } else {
+            format!("{}; {note}", target.message)
+        };
+    }
+    (accepted, programmed)
 }
 
 fn listener_status(
@@ -455,6 +484,7 @@ mod tests {
             listeners,
             edges: edges.iter().map(|e| ObjRef::new("ns", *e)).collect(),
             addresses: vec![],
+            addresses_dropped: 0,
         }
     }
 
@@ -581,9 +611,49 @@ mod tests {
     }
 
     #[test]
+    fn dropped_addresses_are_counted_in_programmed_or_accepted() {
+        let mut gw = gateway(vec![listener("a", 80, true)], &["e"]);
+        gw.addresses_dropped = 3;
+        let m = model(gw, vec![edge("e", Ok(()))]);
+        // Programmed is True: its message says it.
+        let d = compute(&m, &facts(vec![("e", up(vec![bound(80, Ok(()))]))]));
+        let g = &d.gateways[0];
+        let p = get(&g.conditions, "Programmed");
+        check(p, true, "Programmed");
+        assert!(
+            p.message
+                .contains("3 of the edges' addresses are not listed"),
+            "{}",
+            p.message
+        );
+        assert_eq!(get(&g.conditions, "Accepted").message, "");
+        // Programmed is False: the Accepted message says it.
+        let d = compute(&m, &facts(vec![("e", down(Some("boom")))]));
+        let g = &d.gateways[0];
+        let p = get(&g.conditions, "Programmed");
+        check(p, false, "Pending");
+        assert!(!p.message.contains("not listed"), "{}", p.message);
+        let a = get(&g.conditions, "Accepted");
+        check(a, true, "Accepted");
+        assert!(
+            a.message
+                .contains("3 of the edges' addresses are not listed"),
+            "{}",
+            a.message
+        );
+        // Nothing dropped, nothing said.
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e"]),
+            vec![edge("e", Ok(()))],
+        );
+        let d = compute(&m, &facts(vec![("e", up(vec![bound(80, Ok(()))]))]));
+        assert_eq!(get(&d.gateways[0].conditions, "Programmed").message, "");
+    }
+
+    #[test]
     fn disconnected_edge_keeps_addresses_and_is_pending() {
         let mut gw = gateway(vec![listener("a", 80, true)], &["e"]);
-        gw.addresses = vec![GatewayAddress::classify("203.0.113.7")];
+        gw.addresses = vec![GatewayAddress::parse("203.0.113.7").unwrap()];
         let m = model(gw, vec![edge("e", Ok(()))]);
         let d = compute(&m, &facts(vec![("e", down(Some("dial timed out")))]));
         let g = &d.gateways[0];
@@ -591,7 +661,10 @@ mod tests {
         check(p, false, "Pending");
         assert!(p.message.contains("ns/e"), "{}", p.message);
         assert!(p.message.contains("dial timed out"), "{}", p.message);
-        assert_eq!(g.addresses, vec![GatewayAddress::classify("203.0.113.7")]);
+        assert_eq!(
+            g.addresses,
+            vec![GatewayAddress::parse("203.0.113.7").unwrap()]
+        );
         let e = &d.edges[0];
         let c = get(&e.conditions, "Connected");
         check(c, false, "NotConnected");

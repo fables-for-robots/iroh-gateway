@@ -1,6 +1,8 @@
 //! A throwaway Kubernetes API server: `etcd` and `kube-apiserver` from `KUBEBUILDER_ASSETS`
-//! (see `scripts/envtest-assets`), on free loopback ports, with the operator's CRDs installed.
-//! Both processes are killed when the [`Envtest`] is dropped, including when a test panics.
+//! (see `scripts/envtest-assets`), on free loopback ports, with the `Edge` CRD and the upstream
+//! Gateway API CRDs installed, so that the API server validates what the operator writes as a
+//! real cluster would. Both processes are killed when the [`Envtest`] is dropped, including when
+//! a test panics.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomRe
 use kube::api::{ListParams, PostParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config, CustomResourceExt, Resource};
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -27,6 +30,14 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const TOKEN: &str = "envtest-token";
 /// How often a start that lost one of its ports to another test is tried.
 const START_ATTEMPTS: u32 = 5;
+/// The upstream manifest `scripts/envtest-assets` downloads beside the binaries.
+const GATEWAY_API_MANIFEST: &str = "gateway-api-v1.7.0-standard-install.yaml";
+/// The CRDs of that manifest the operator uses.
+const GATEWAY_API_CRDS: [&str; 3] = [
+    "gatewayclasses.gateway.networking.k8s.io",
+    "gateways.gateway.networking.k8s.io",
+    "tcproutes.gateway.networking.k8s.io",
+];
 
 /// A process that ended during start, with its log, and whether it found its port taken.
 struct Exited {
@@ -61,6 +72,38 @@ fn assets() -> PathBuf {
     dir
 }
 
+/// The Gateway API CRDs the operator uses, from the upstream manifest in `assets` or one of the
+/// directories above it.
+fn gateway_api_crds(assets: &Path) -> Vec<CustomResourceDefinition> {
+    let Some(path) = assets
+        .ancestors()
+        .map(|d| d.join(GATEWAY_API_MANIFEST))
+        .find(|p| p.is_file())
+    else {
+        panic!(
+            "no {GATEWAY_API_MANIFEST} in {} or above it; run scripts/envtest-assets",
+            assets.display()
+        );
+    };
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut crds = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(&text) {
+        let value = serde_json::Value::deserialize(document)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let name = value["metadata"]["name"].as_str().unwrap_or_default();
+        if value["kind"] == "CustomResourceDefinition" && GATEWAY_API_CRDS.contains(&name) {
+            crds.push(serde_json::from_value(value).unwrap());
+        }
+    }
+    assert_eq!(
+        crds.len(),
+        GATEWAY_API_CRDS.len(),
+        "{} lacks some of {GATEWAY_API_CRDS:?}",
+        path.display()
+    );
+    crds
+}
+
 /// A log file in `dir` for a child's stdout and stderr.
 fn log_file(dir: &Path, name: &str) -> (Stdio, Stdio) {
     let file = File::create(dir.join(name)).unwrap();
@@ -76,7 +119,7 @@ fn tail(dir: &Path, name: &str) -> String {
 
 impl Envtest {
     /// Starts the API server, waits until it serves, and installs the `Edge` CRD and the
-    /// Gateway API CRDs from the crate's types.
+    /// upstream Gateway API CRDs.
     ///
     /// The ports are picked free but released before the processes bind them, so another test
     /// can take one in between; a start that fails that way is tried again on new ports.
@@ -86,7 +129,7 @@ impl Envtest {
         loop {
             match Self::try_start(&assets).await {
                 Ok(mut env) => {
-                    env.install_crds().await;
+                    env.install_crds(gateway_api_crds(&assets)).await;
                     return env;
                 }
                 Err(Exited {
@@ -244,17 +287,8 @@ impl Envtest {
         }
     }
 
-    async fn install_crds(&mut self) {
+    async fn install_crds(&mut self, gateway_api: Vec<CustomResourceDefinition>) {
         let crds: Api<CustomResourceDefinition> = Api::all(self.client.clone());
-        let mut gateway_api = [GatewayClass::crd(), Gateway::crd(), TcpRoute::crd()];
-        for crd in &mut gateway_api {
-            // The API server insists on this for groups under k8s.io; the upstream manifests
-            // carry it, the generated CRDs do not.
-            crd.metadata.annotations.get_or_insert_default().insert(
-                "api-approved.kubernetes.io".into(),
-                "https://github.com/kubernetes-sigs/gateway-api/pull/3328".into(),
-            );
-        }
         for crd in std::iter::once(Edge::crd()).chain(gateway_api) {
             let name = crd.metadata.name.clone().unwrap();
             if let Err(e) = crds.create(&PostParams::default(), &crd).await {

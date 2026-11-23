@@ -200,6 +200,7 @@ mod tests {
             listeners,
             edges: Vec::new(),
             addresses: Vec::new(),
+            addresses_dropped: 0,
         }
     }
 

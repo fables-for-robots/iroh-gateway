@@ -574,8 +574,8 @@ mod tests {
             generation: 3,
             conditions: vec![cond("Accepted", true, "Accepted")],
             addresses: vec![
-                GatewayAddress::classify("203.0.113.7"),
-                GatewayAddress::classify("edge.example.com"),
+                GatewayAddress::parse("203.0.113.7").unwrap(),
+                GatewayAddress::parse("edge.example.com").unwrap(),
             ],
             listeners: vec![ListenerStatusOut {
                 name: "db".into(),

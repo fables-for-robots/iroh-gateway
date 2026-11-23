@@ -702,6 +702,7 @@ async fn rendered_config_passes_haproxy_validation() {
             listeners,
             edges: Vec::new(),
             addresses: Vec::new(),
+            addresses_dropped: 0,
         }
     }
 

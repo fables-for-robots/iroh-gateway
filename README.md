@@ -354,7 +354,7 @@ Every condition below is also visible with `kubectl describe`. A False condition
 | | `Programmed` | False with `Invalid` (the listener, its Gateway, or HAProxy is at fault) or `Pending` (no edge is ready; the message names edges that cannot bind the port). |
 | `TCPRoute`, per parent | `Accepted` | False with `NoMatchingParent` (no listener matches `sectionName` and `port`), `NotAllowedByListeners` (no usable listener admits routes from the route's namespace) or `UnsupportedValue` (more than one rule, or another `TCPRoute` already holds the listener). |
 | | `ResolvedRefs` | False with `InvalidKind` (the backend is not a core `Service`), `RefNotPermitted` (the Service is in another namespace), `BackendNotFound` (no such Service, an `ExternalName` Service, no cluster IP, or no TCP port with that number) or `UnsupportedValue` (the backend has no valid port). |
-| `Edge` | `Accepted` | False with `NamespaceNotAllowed`, `InvalidEndpointId`, `NoAddress` (`address` is required while the operator uses no relay), `NoPublicAddress` (no `address` and no `publicAddresses`), `InvalidAddress`, `GatewayNotFound` (no `Gateway` of ours with `gatewayRef.name` in the same namespace), `GatewayNotAccepted`, or `DuplicateEndpointId` (an older `Edge` has the same id). |
+| `Edge` | `Accepted` | False with `NamespaceNotAllowed`, `InvalidEndpointId`, `NoAddress` (`address` is required while the operator uses no relay), `NoPublicAddress` (no `address` and no `publicAddresses`), `InvalidPublicAddress` (an entry of `publicAddresses` is neither an IP address nor a DNS name; a port is not allowed), `InvalidAddress`, `GatewayNotFound` (no `Gateway` of ours with `gatewayRef.name` in the same namespace), `GatewayNotAccepted`, or `DuplicateEndpointId` (an older `Edge` has the same id). |
 | | `Connected` | False with `NotConnected`; the message says why, for example that the link has not started yet or the last connection error. An edge that is not accepted is never connected. |
 | | `Programmed` | False with `NotConnected` or `BindFailed` (the edge could not open a port; the message names the port and the error). |
 
@@ -368,7 +368,7 @@ Every condition below is also visible with `kubectl describe`. A False condition
 - A backend must be a core `Service` with a cluster IP, in the same namespace as the `TCPRoute`. There is no `ReferenceGrant` support, `ExternalName` and headless Services do not work, and the operator sends to the Service's cluster IP.
 - Each listener has at most one `TCPRoute` with at most one rule. If several routes name a listener, the oldest wins and the others are not accepted.
 - A port opens on the edges only when a listener is accepted, has no conflict, and has a `TCPRoute` attached whose backend resolved. A `Gateway` with no route opens nothing (it is `Programmed` once an edge is connected); deleting the last route closes the port.
-- A `Gateway` cannot ask for addresses; they come from the edges' `publicAddresses`, or from the host in their `address`.
+- A `Gateway` cannot ask for addresses; they come from the edges' `publicAddresses`, or from the host in their `address`. A DNS name is published in lower case without a trailing dot. A `Gateway` lists at most 16 addresses, the first 16 in sorted order; when there are more, its `Programmed` message (when True) or its `Accepted` message says how many are not listed.
 
 ## Running in production
 

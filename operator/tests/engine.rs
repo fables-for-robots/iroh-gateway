@@ -122,6 +122,7 @@ impl World {
                         .map(|e| key(e.name))
                         .collect(),
                     addresses: vec![],
+                    addresses_dropped: 0,
                 })
                 .collect(),
             edges: edges

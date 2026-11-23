@@ -1,15 +1,34 @@
 #!/usr/bin/env bash
-# Downloads kube-apiserver and etcd for this platform into target/envtest/ (once) and prints
-# the directory that holds them, for KUBEBUILDER_ASSETS:
+# Downloads kube-apiserver and etcd for this platform into target/envtest/ (once), and the
+# Gateway API v1.7.0 standard manifest next to them (once, checked against its SHA-256), and
+# prints the directory that holds the binaries, for KUBEBUILDER_ASSETS:
 #
 #   KUBEBUILDER_ASSETS=$(scripts/envtest-assets) cargo test -p iroh-gateway-operator \
 #       --test cluster -- --ignored
 #
-# Needs setup-envtest on PATH (the dev shell has it). Prints nothing else on stdout.
+# The cluster tests install the Gateway API CRDs from that manifest, which they find in
+# target/envtest/. Needs setup-envtest and curl on PATH (the dev shell has setup-envtest).
+# Prints nothing else on stdout.
 set -euo pipefail
+
+gateway_api_url=https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
+gateway_api_sha256=4e2602c4cbe1afbc394d86f4ac6522e1a5263b01133bba1e40a6d1a549e753a1
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin_dir="$root/target/envtest"
 mkdir -p "$bin_dir"
+
+manifest="$bin_dir/gateway-api-v1.7.0-standard-install.yaml"
+if [ ! -f "$manifest" ]; then
+  partial="$manifest.partial"
+  curl -fsSL --retry 3 -o "$partial" "$gateway_api_url"
+  if ! echo "$gateway_api_sha256  $partial" | shasum -a 256 -c - >/dev/null; then
+    rm -f "$partial"
+    echo "the Gateway API manifest from $gateway_api_url does not have the expected SHA-256" >&2
+    exit 1
+  fi
+  mv "$partial" "$manifest"
+fi
+
 setup-envtest use -p path --bin-dir "$bin_dir"
 echo

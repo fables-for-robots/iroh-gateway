@@ -572,7 +572,12 @@ async fn foreign_route_parent_status_is_left_alone() {
     let routes = api::<TcpRoute>(&env.client, NS);
     let foreign = json!({
         "controllerName": OTHER_CONTROLLER,
-        "parentRef": { "name": "elsewhere" },
+        // As the API server stores it: the upstream schema fills in group and kind.
+        "parentRef": {
+            "group": "gateway.networking.k8s.io",
+            "kind": "Gateway",
+            "name": "elsewhere",
+        },
         "conditions": [{
             "type": "Accepted", "status": "False", "reason": "NotMine", "message": "theirs",
             "observedGeneration": 1, "lastTransitionTime": "2026-01-01T00:00:00Z",
@@ -659,6 +664,112 @@ async fn status_is_not_rewritten_when_nothing_changed() {
     assert_eq!(versions().await, before);
     operator.stop().await;
     edge.shutdown().await;
+}
+
+/// An Edge object `name` in `NS` with a fresh endpoint id; `spec` is merged into its spec.
+async fn edge_with(client: &Client, name: &str, spec: Value) {
+    let mut object = json!({
+        "apiVersion": "gateway.fables-for-robots.ch/v1alpha1",
+        "kind": "Edge",
+        "metadata": { "name": name, "namespace": NS },
+        "spec": {
+            "endpointId": SecretKey::generate().public().to_string(),
+            "gatewayRef": { "name": "public" },
+        },
+    });
+    for (k, v) in spec.as_object().unwrap() {
+        object["spec"][k] = v.clone();
+    }
+    create::<Edge>(&api(client, NS), object).await;
+}
+
+/// The Gateway's addresses as (type, value), once it has status from us.
+async fn gateway_addresses(client: &Client) -> Result<Vec<(String, String)>, String> {
+    let gw: Gateway = get(client, NS, "public").await;
+    let status = gw.status.unwrap_or_default();
+    has(
+        &status.conditions.unwrap_or_default(),
+        &[("Accepted", "True")],
+    )?;
+    Ok(status
+        .addresses
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.r#type.unwrap_or_default(), a.value))
+        .collect())
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn mixed_case_and_trailing_dot_addresses_do_not_break_status() {
+    let env = Envtest::start().await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    env.namespace(NS).await;
+    class(&env.client).await;
+    gateway(&env.client, NS, free_tcp_port()).await;
+    // Nothing listens there: the link only fails to connect, on loopback.
+    let nowhere = free_tcp_port();
+    edge_with(
+        &env.client,
+        "e1",
+        json!({ "address": format!("Edge.Example.COM.:{nowhere}") }),
+    )
+    .await;
+    let addresses = eventually("the Gateway's addresses", || async {
+        match gateway_addresses(&env.client).await? {
+            a if a.is_empty() => Err("no addresses yet".to_owned()),
+            a => Ok(a),
+        }
+    })
+    .await;
+    assert_eq!(
+        addresses,
+        [("Hostname".to_owned(), "edge.example.com".to_owned())]
+    );
+    operator.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn seventeen_edges_give_sixteen_addresses() {
+    let env = Envtest::start().await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    env.namespace(NS).await;
+    class(&env.client).await;
+    gateway(&env.client, NS, free_tcp_port()).await;
+    let nowhere = free_tcp_port();
+    for n in 1..=17 {
+        // Published only, never dialled; the links dial loopback, where nothing answers.
+        edge_with(
+            &env.client,
+            &format!("e{n:02}"),
+            json!({
+                "address": format!("127.0.0.1:{nowhere}"),
+                "publicAddresses": [format!("198.51.100.{n}")],
+            }),
+        )
+        .await;
+    }
+    let addresses = eventually("16 addresses", || async {
+        match gateway_addresses(&env.client).await? {
+            a if a.len() == 16 => Ok(a),
+            a => Err(format!("{} addresses", a.len())),
+        }
+    })
+    .await;
+    assert!(addresses.iter().all(|(t, _)| t == "IPAddress"));
+    // The first 16 after sorting: "198.51.100.9" sorts last.
+    assert!(!addresses.iter().any(|(_, v)| v == "198.51.100.9"));
+    let gw: Gateway = get(&env.client, NS, "public").await;
+    let conditions = gw.status.unwrap().conditions.unwrap();
+    let accepted = condition(&conditions, "Accepted").unwrap();
+    assert!(
+        accepted
+            .message
+            .contains("1 of the edges' addresses is not listed"),
+        "{accepted:?}"
+    );
+    operator.stop().await;
 }
 
 /// Kills the child when dropped, so a failed test leaves no process behind.

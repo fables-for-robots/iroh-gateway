@@ -75,6 +75,7 @@ fn gateway(gw: &gateway_api::gateways::v1::Gateway, settings: &Settings) -> Gate
         listeners,
         edges: Vec::new(),
         addresses: Vec::new(),
+        addresses_dropped: 0,
     }
 }
 
