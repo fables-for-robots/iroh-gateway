@@ -88,8 +88,20 @@ pub struct Supervisor {
     pid: u32,
     /// Set once the master has been reaped.
     status: Option<ExitStatus>,
-    /// The configuration the running workers were loaded with.
-    current: String,
+    /// The configuration the running workers were loaded with; `None` while that is not known,
+    /// after a reload whose outcome was lost (timed out, broken off, or cancelled).
+    current: Option<String>,
+    /// The last configuration HAProxy confirmed loading; written back to `haproxy.cfg` when a
+    /// reload fails.
+    loaded: String,
+}
+
+/// Why [`Supervisor::reload`] got no reply.
+enum ReloadError {
+    /// Connecting to the master socket failed: nothing was sent.
+    Connect(io::Error),
+    /// Failed after connecting: the request may have reached the master.
+    Exchange(io::Error),
 }
 
 impl Supervisor {
@@ -166,7 +178,8 @@ impl Supervisor {
             child,
             pid,
             status: None,
-            current: cfg.to_owned(),
+            current: Some(cfg.to_owned()),
+            loaded: cfg.to_owned(),
         };
         if let Err(e) = sup.wait_ready().await {
             sup.stop().await;
@@ -182,32 +195,52 @@ impl Supervisor {
     }
 
     /// Makes `cfg` the running configuration. Not re-entrant: one call at a time.
+    ///
+    /// Cancelling it, a timeout, or a broken connection during the reload leaves the running
+    /// configuration unknown; the next call then reloads whatever text it is given.
     pub async fn apply(&mut self, cfg: &str) -> Result<Applied, ApplyError> {
-        if cfg == self.current {
+        if self.current.as_deref() == Some(cfg) {
             return Ok(Applied::Unchanged);
         }
         validate(&self.opts, cfg).await?;
+        // Unknown from here until the master's reply says otherwise, so that a cancelled call
+        // leaves it unknown.
+        let previous = self.current.take();
         let dir = &self.opts.runtime_dir;
         if let Err(e) = tokio::fs::rename(dir.join(CFG_NEW), dir.join(CFG)).await {
             let _ = tokio::fs::remove_file(dir.join(CFG_NEW)).await;
+            self.current = previous;
             return Err(e.into());
         }
-        let failure = match timeout(self.opts.reload_timeout, self.reload()).await {
+        // Whether the master certainly did not load `cfg`: then `previous` still runs.
+        let (failure, not_loaded) = match timeout(self.opts.reload_timeout, self.reload()).await {
             Ok(Ok(reply)) if reply.starts_with("Success=1") => {
-                self.current = cfg.to_owned();
+                self.current = Some(cfg.to_owned());
+                self.loaded = cfg.to_owned();
                 info!("haproxy reloaded");
                 return Ok(Applied::Reloaded);
             }
-            Ok(Ok(reply)) => ApplyError::ReloadFailed(reply),
-            Ok(Err(e)) => ApplyError::Io(e),
-            Err(_) => ApplyError::ReloadFailed(format!(
-                "timed out: no complete reply to reload within {:?}",
-                self.opts.reload_timeout
-            )),
+            Ok(Ok(reply)) => {
+                // A complete reply; anything but `Success=0` is not one we understand.
+                let definite = reply.starts_with("Success=0");
+                (ApplyError::ReloadFailed(reply), definite)
+            }
+            Ok(Err(ReloadError::Connect(e))) => (ApplyError::Io(e), true),
+            Ok(Err(ReloadError::Exchange(e))) => (ApplyError::Io(e), false),
+            Err(_) => (
+                ApplyError::ReloadFailed(format!(
+                    "timed out: no complete reply to reload within {:?}",
+                    self.opts.reload_timeout
+                )),
+                false,
+            ),
         };
+        if not_loaded {
+            self.current = previous;
+        }
         warn!(error = %failure, "haproxy reload failed; restoring the previous configuration");
         let path = dir.join(CFG);
-        if let Err(e) = tokio::fs::write(&path, &self.current).await {
+        if let Err(e) = tokio::fs::write(&path, &self.loaded).await {
             return Err(ApplyError::Io(io::Error::new(
                 e.kind(),
                 format!(
@@ -285,11 +318,17 @@ impl Supervisor {
     }
 
     /// Sends `reload` to the master and reads its reply to the end.
-    async fn reload(&self) -> io::Result<String> {
-        let mut s = UnixStream::connect(self.opts.runtime_dir.join(MASTER_SOCK)).await?;
-        s.write_all(b"reload\n").await?;
+    async fn reload(&self) -> Result<String, ReloadError> {
+        let mut s = UnixStream::connect(self.opts.runtime_dir.join(MASTER_SOCK))
+            .await
+            .map_err(ReloadError::Connect)?;
         let mut reply = Vec::new();
-        s.read_to_end(&mut reply).await?;
+        async {
+            s.write_all(b"reload\n").await?;
+            s.read_to_end(&mut reply).await
+        }
+        .await
+        .map_err(ReloadError::Exchange)?;
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 

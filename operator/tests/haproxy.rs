@@ -3,6 +3,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use iroh_gateway_operator::haproxy::{
@@ -311,14 +313,9 @@ async fn failed_reload_restores_the_previous_config() {
     let good = cfg(&dir, &[("a.sock", echo)]);
     let mut sup = Supervisor::start(opts(&dir), &good).await.unwrap();
 
-    // `haproxy -c` does not bind, so a socket in a missing directory passes the check and
-    // fails only when the new worker starts.
-    let missing = dir.path().join("missing");
-    let bad = format!(
-        "{good}\nfrontend broken\n    bind unix@{}/x.sock accept-proxy mode 600\n    default_backend b0\n",
-        missing.display()
-    );
-    match sup.apply(&bad).await {
+    // `haproxy -c` does not bind, so this passes the check and fails only when the new worker
+    // starts.
+    match sup.apply(&fails_to_load(&dir, &good)).await {
         Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("Success=0"), "{m}"),
         other => panic!("expected ReloadFailed, got {other:?}"),
     }
@@ -329,7 +326,86 @@ async fn failed_reload_restores_the_previous_config() {
     let mut s = visit(&dir, "a.sock").await;
     echoes(&mut s, b"hi").await;
     drop(s);
+    sup.shutdown().await;
+}
+
+/// A configuration that passes `haproxy -c` but fails to load: a socket in a missing directory.
+fn fails_to_load(dir: &TempDir, good: &str) -> String {
+    format!(
+        "{good}\nfrontend broken\n    bind unix@{}/missing/x.sock accept-proxy mode 600\n    default_backend b0\n",
+        dir.path().display()
+    )
+}
+
+#[tokio::test]
+async fn definite_reload_failure_keeps_unchanged_working() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let good = cfg(&dir, &[("a.sock", echo)]);
+    let mut sup = Supervisor::start(opts(&dir), &good).await.unwrap();
+    match sup.apply(&fails_to_load(&dir, &good)).await {
+        Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("Success=0"), "{m}"),
+        other => panic!("expected ReloadFailed, got {other:?}"),
+    }
+    let before = worker_pids(&dir).await;
+    // `Success=0` says the old worker kept serving, so the old text is known to run.
     assert_eq!(sup.apply(&good).await.unwrap(), Applied::Unchanged);
+    assert_eq!(worker_pids(&dir).await, before, "no new worker");
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn apply_after_a_cancelled_apply_reloads_again() {
+    let a = echo_backend(b"A").await;
+    let b = echo_backend(b"B").await;
+    let dir = short_dir();
+    let old = cfg(&dir, &[("a.sock", a)]);
+    let new = cfg(&dir, &[("a.sock", b)]);
+    let mut o = opts(&dir);
+    // A reload sent while the master re-executes can go unanswered; keep such attempts short.
+    o.reload_timeout = Duration::from_secs(2);
+    let mut sup = Supervisor::start(o, &old).await.unwrap();
+
+    // Drive `apply(new)` until the new text is on disk, which happens just before the reload
+    // request, then drop it while the reload is in flight.
+    let cfg_path = dir.path().join("haproxy.cfg");
+    {
+        let fut = sup.apply(&new);
+        tokio::pin!(fut);
+        let deadline = Instant::now() + STEP;
+        loop {
+            tokio::select! {
+                r = &mut fut => panic!("apply finished before it could be cancelled: {r:?}"),
+                _ = sleep(Duration::from_millis(1)) => {}
+            }
+            if std::fs::read_to_string(&cfg_path).unwrap() == new {
+                break;
+            }
+            assert!(Instant::now() < deadline, "new text never reached the disk");
+        }
+    }
+
+    // The cancelled reload may still be under way: while the master re-executes, its socket
+    // refuses connections or leaves a request unanswered. Such attempts fail and are retried,
+    // as the engine would; none may claim `Unchanged`.
+    let deadline = Instant::now() + 3 * STEP;
+    loop {
+        match sup.apply(&old).await {
+            Ok(Applied::Reloaded) => break,
+            Ok(Applied::Unchanged) => panic!("old text claimed to run after a cancelled reload"),
+            Err(e) => {
+                assert!(Instant::now() < deadline, "apply(old) kept failing: {e}");
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    let mut conn = visit(&dir, "a.sock").await;
+    assert_eq!(read_exact(&mut conn, 1).await, b"A");
+    drop(conn);
+    assert_eq!(sup.apply(&new).await.unwrap(), Applied::Reloaded);
+    let mut conn = visit(&dir, "a.sock").await;
+    assert_eq!(read_exact(&mut conn, 1).await, b"B");
+    drop(conn);
     sup.shutdown().await;
 }
 
@@ -496,16 +572,13 @@ async fn start_times_out_when_the_master_never_answers() {
     gone(&[fake_pid(&dir).await]).await;
 }
 
-#[tokio::test]
-async fn reload_without_a_reply_times_out_and_restores() {
-    let dir = short_dir();
-    let mut o = opts(&dir);
-    o.haproxy_bin = fake_haproxy(&dir);
-    o.reload_timeout = Duration::from_millis(500);
-    // Plays the master once the fake has started: answers the readiness probe, and takes
-    // `reload` without ever replying.
+/// Plays the master for the fake once it has started: answers the readiness probe, and takes
+/// each `reload` without ever replying. The counter is the number of `reload` requests.
+fn fake_master(dir: &TempDir) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let master = dir.path().join("master.sock");
     let marker = dir.path().join("haproxy.cfg.pid");
+    let reloads = Arc::new(AtomicUsize::new(0));
+    let counter = reloads.clone();
     let server = tokio::spawn(async move {
         while !marker.exists() {
             sleep(Duration::from_millis(5)).await;
@@ -523,12 +596,23 @@ async fn reload_without_a_reply_times_out_and_restores() {
                 line.push(b[0]);
             }
             if line == b"reload" {
+                counter.fetch_add(1, Ordering::SeqCst);
                 held.push(s);
             } else {
                 s.write_all(b"Name: fake\n").await.unwrap();
             }
         }
     });
+    (server, reloads)
+}
+
+#[tokio::test]
+async fn reload_without_a_reply_times_out_and_restores() {
+    let dir = short_dir();
+    let mut o = opts(&dir);
+    o.haproxy_bin = fake_haproxy(&dir);
+    o.reload_timeout = Duration::from_millis(500);
+    let (server, reloads) = fake_master(&dir);
     let mut sup = Supervisor::start(o, "global\n").await.unwrap();
     let pid = fake_pid(&dir).await;
     let started = Instant::now();
@@ -537,10 +621,36 @@ async fn reload_without_a_reply_times_out_and_restores() {
         other => panic!("expected ReloadFailed, got {other:?}"),
     }
     assert!(started.elapsed() >= Duration::from_millis(500));
+    assert_eq!(reloads.load(Ordering::SeqCst), 1);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
         "global\n"
     );
+    server.abort();
+    sup.shutdown().await;
+    gone(&[pid]).await;
+}
+
+#[tokio::test]
+async fn apply_after_a_timed_out_reload_reloads_again() {
+    let dir = short_dir();
+    let mut o = opts(&dir);
+    o.haproxy_bin = fake_haproxy(&dir);
+    o.reload_timeout = Duration::from_millis(300);
+    let (server, reloads) = fake_master(&dir);
+    let old = "global\n";
+    let mut sup = Supervisor::start(o, old).await.unwrap();
+    let pid = fake_pid(&dir).await;
+    match sup.apply("global\n    maxconn 10\n").await {
+        Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
+        other => panic!("expected ReloadFailed, got {other:?}"),
+    }
+    // The timed-out reload may still take effect, so the old text is no longer known to run.
+    match sup.apply(old).await {
+        Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
+        other => panic!("expected another reload attempt, got {other:?}"),
+    }
+    assert_eq!(reloads.load(Ordering::SeqCst), 2);
     server.abort();
     sup.shutdown().await;
     gone(&[pid]).await;
