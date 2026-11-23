@@ -136,6 +136,7 @@ What this step does and does not do:
 - The images are not published yet. `deploy/operator.yaml` names `ghcr.io/fables-for-robots/iroh-gateway-operator:0.1.0`, which does not exist until the packaging step is done. Build the images yourself and load them into your cluster (see below).
 - No health endpoint, no metrics, no NetworkPolicy. The operator pod must be able to send UDP to the edges and TCP to the backend Services.
 - Everything the manifests create lives in the namespace `iroh-gateway`.
+- Long-lived connections. A configuration change anywhere (any serving listener's route or backends, in any namespace) reloads HAProxy. Connections that are still open 30 minutes after a reload, or after 50 further reloads, are closed, and a connection idle for an hour is closed. This is a known limit of this step for long-lived TCP such as SSH or database sessions.
 - Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The manifest's limit of 1 GiB fits one edge; raise it by about that much for each further edge.
 
 ### Prerequisites
