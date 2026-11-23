@@ -144,7 +144,7 @@ fn attachments(
 }
 
 /// The key of a `parentRef` to a Gateway, defaults filled in; `None` for other kinds.
-fn parent_key(parent: &TcpRouteParentRefs, route_ns: &str) -> Option<ParentKey> {
+pub(crate) fn parent_key(parent: &TcpRouteParentRefs, route_ns: &str) -> Option<ParentKey> {
     let group = parent.group.as_deref().unwrap_or(ROUTE_GROUP);
     let kind = parent.kind.as_deref().unwrap_or(GATEWAY_KIND);
     if group != ROUTE_GROUP || kind != GATEWAY_KIND {

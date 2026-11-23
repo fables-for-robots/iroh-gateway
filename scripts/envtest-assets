@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Downloads kube-apiserver and etcd for this platform into target/envtest/ (once) and prints
+# the directory that holds them, for KUBEBUILDER_ASSETS:
+#
+#   KUBEBUILDER_ASSETS=$(scripts/envtest-assets) cargo test -p iroh-gateway-operator \
+#       --test cluster -- --ignored
+#
+# Needs setup-envtest on PATH (the dev shell has it). Prints nothing else on stdout.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bin_dir="$root/target/envtest"
+mkdir -p "$bin_dir"
+setup-envtest use -p path --bin-dir "$bin_dir"
+echo

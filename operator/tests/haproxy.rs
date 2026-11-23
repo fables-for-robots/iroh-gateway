@@ -1,12 +1,16 @@
 //! The HAProxy supervisor against a real `haproxy` binary on PATH.
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use common::short_dir;
 use iroh_gateway_operator::haproxy::{
     Applied, ApplyError, MAX_RUNTIME_DIR_LEN, Supervisor, SupervisorOptions,
 };
@@ -23,14 +27,6 @@ use tokio::time::{Instant, sleep, timeout};
 const STEP: Duration = Duration::from_secs(10);
 const VISITOR: &str = "198.51.100.9:50000";
 const LOCAL: &str = "203.0.113.7:443";
-
-/// A runtime directory short enough for Unix socket paths on macOS.
-fn short_dir() -> TempDir {
-    tempfile::Builder::new()
-        .prefix("igw")
-        .tempdir_in("/tmp")
-        .unwrap()
-}
 
 fn opts(dir: &TempDir) -> SupervisorOptions {
     SupervisorOptions {

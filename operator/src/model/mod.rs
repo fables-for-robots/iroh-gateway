@@ -5,7 +5,7 @@
 
 mod edges;
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 mod gateways;
 mod routes;
 
@@ -21,6 +21,8 @@ use k8s_openapi::api::core::v1::{Namespace, Service};
 use kube::ResourceExt;
 
 use crate::crd::Edge;
+
+pub(crate) use routes::parent_key;
 
 /// A namespaced object, by name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -36,14 +36,6 @@ const INVALID_CFG: &str = "this is not an haproxy configuration\n";
 /// The retry interval the engines in these tests use.
 const RETRY: Duration = Duration::from_millis(300);
 
-/// A runtime directory short enough for Unix socket paths on macOS.
-fn short_dir() -> TempDir {
-    tempfile::Builder::new()
-        .prefix("igw")
-        .tempdir_in("/tmp")
-        .unwrap()
-}
-
 fn key(name: &str) -> ObjRef {
     ObjRef::new(NS, name)
 }

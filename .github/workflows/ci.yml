@@ -41,6 +41,18 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # The operator's cluster tests run a real kube-apiserver and etcd, which
+      # setup-envtest downloads into target/envtest/.
+      - name: Cluster tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          assets="$(scripts/envtest-assets)"
+          test -n "$assets"
+          KUBEBUILDER_ASSETS="$assets" cargo test -p iroh-gateway-operator --test cluster -- --ignored
+
       - name: CRD manifest is up to date
         shell: bash
         run: |

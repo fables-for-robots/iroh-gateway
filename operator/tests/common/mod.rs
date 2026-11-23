@@ -1,5 +1,7 @@
 //! Harness for operator link tests: a real edge on loopback, a link to it, and a fake edge.
 
+pub mod envtest;
+
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +27,14 @@ use tokio::time::{sleep, timeout};
 
 /// Upper bound for any single step that should complete promptly on loopback.
 pub const STEP: Duration = Duration::from_secs(10);
+
+/// A runtime directory short enough for Unix socket paths on macOS.
+pub fn short_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("igw")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
 
 pub fn free_tcp_port() -> u16 {
     let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

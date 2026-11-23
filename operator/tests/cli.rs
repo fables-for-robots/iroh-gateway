@@ -255,3 +255,50 @@ async fn static_forwards_to_target() {
     assert!(status.success(), "{status:?}");
     edge.shutdown().await;
 }
+
+/// `run` with no in-cluster configuration and a kubeconfig path that does not exist.
+fn run_without_cluster(args: &[&str]) -> Output {
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = bin();
+    cmd.env_remove("POD_NAMESPACE")
+        .env_remove("KUBERNETES_SERVICE_HOST")
+        .env_remove("KUBERNETES_SERVICE_PORT")
+        .env("HOME", home.path())
+        .env("KUBECONFIG", home.path().join("missing"))
+        .arg("run")
+        .args(args);
+    cmd.output().unwrap()
+}
+
+#[test]
+fn run_without_a_cluster_configuration_fails() {
+    let out = run_without_cluster(&["--namespace", "iroh-gateway"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no Kubernetes configuration"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn run_refuses_an_empty_gateway_namespace_list() {
+    for list in ["", "a,,b"] {
+        let out = run_without_cluster(&["--namespace", "ns", "--gateway-namespaces", list]);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--gateway-namespaces"), "stderr: {stderr}");
+        assert!(
+            !stderr.contains("Kubernetes configuration"),
+            "stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn run_needs_a_namespace() {
+    let out = run_without_cluster(&[]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--namespace"), "stderr: {stderr}");
+}
