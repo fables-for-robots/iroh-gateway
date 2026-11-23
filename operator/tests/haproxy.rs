@@ -655,3 +655,72 @@ async fn apply_after_a_timed_out_reload_reloads_again() {
     sup.shutdown().await;
     gone(&[pid]).await;
 }
+
+#[tokio::test]
+async fn rendered_config_passes_haproxy_validation() {
+    use iroh_gateway_operator::haproxy::render::render;
+    use iroh_gateway_operator::model::{Backend, GatewayModel, ListenerModel, Model, ObjRef};
+
+    fn listener(port: u16, backends: Vec<Backend>) -> ListenerModel {
+        ListenerModel {
+            name: format!("l{port}"),
+            port,
+            protocol: "TCP".into(),
+            accepted: Ok(()),
+            conflicted: None,
+            resolved_refs: Ok(()),
+            supported_kinds: vec!["TCPRoute".into()],
+            attached_routes: 1,
+            backends,
+        }
+    }
+    fn backend(ip: &str, port: u16, weight: u32) -> Backend {
+        Backend {
+            service: ObjRef::new("apps", "svc"),
+            ip: ip.parse().unwrap(),
+            port,
+            weight,
+        }
+    }
+    fn gateway(ns: &str, name: &str, listeners: Vec<ListenerModel>) -> GatewayModel {
+        GatewayModel {
+            key: ObjRef::new(ns, name),
+            generation: 1,
+            accepted: Ok(()),
+            listeners,
+            edges: Vec::new(),
+            addresses: Vec::new(),
+        }
+    }
+
+    let model = Model {
+        classes: Vec::new(),
+        gateways: vec![
+            gateway(
+                "a",
+                "x",
+                vec![
+                    listener(
+                        80,
+                        vec![backend("10.0.0.1", 80, 3), backend("10.0.0.2", 80, 1)],
+                    ),
+                    listener(443, vec![backend("10.0.0.1", 443, 1)]),
+                ],
+            ),
+            gateway(
+                "b",
+                "y",
+                vec![listener(5432, vec![backend("fd00::12", 5432, 1)])],
+            ),
+        ],
+        edges: Vec::new(),
+        routes: Vec::new(),
+    };
+    let dir = short_dir();
+    let rendered = render(&model, dir.path());
+    assert!(rendered.haproxy_cfg.contains("[fd00::12]:5432"));
+    let sup = Supervisor::start(opts(&dir), &rendered.haproxy_cfg)
+        .await
+        .unwrap();
+    sup.shutdown().await;
+}
