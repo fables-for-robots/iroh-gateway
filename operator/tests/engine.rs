@@ -742,6 +742,80 @@ async fn failed_apply_that_changes_a_kept_ports_backend_closes_it() {
     edge.shutdown().await;
 }
 
+/// A stand-in for `haproxy` in `dir` that runs the real one, but makes `haproxy -c` take a
+/// second while the file `<dir>/slow` exists.
+fn slow_check_haproxy(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("slow-haproxy");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = \"-c\" ] && [ -e {} ] && sleep 1\nexec haproxy \"$@\"\n",
+            dir.join("slow").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Whether a visitor on `port` is cut off instead of reaching a backend.
+async fn cut_off(port: u16) -> bool {
+    let Ok(mut v) = TcpStream::connect(("127.0.0.1", port)).await else {
+        return true;
+    };
+    let mut tag = [0u8; 1];
+    matches!(
+        timeout(STEP, v.read(&mut tag))
+            .await
+            .expect("no answer in time"),
+        Err(_) | Ok(0)
+    )
+}
+
+#[tokio::test]
+async fn ports_that_change_are_cut_while_haproxy_reloads() {
+    let w = World::with_tagged(&[("gw", b"A")]).await;
+    let other = tagged_echo(b"B").await;
+    let tools = short_dir();
+    let edge = w.edge().await;
+    let (p, q) = (free_tcp_port(), free_tcp_port());
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let mut opts = w.options();
+    opts.supervisor.haproxy_bin = slow_check_haproxy(tools.path());
+    let edges = [at("e", "gw", &edge)];
+    let mut engine = Engine::start(endpoint, opts, w.plan(&[("gw", &[p, q])], &edges))
+        .await
+        .unwrap();
+    wait_facts(&mut engine, |f| serving(f, "e", &[p, q])).await;
+    assert_eq!(tag_on(q).await, b"A");
+
+    // q gets another backend; p stays as it is.
+    let mut model = w.model(&[("gw", &[p, q])], &edges);
+    model.gateways[0].listeners[1].backends[0].port = other.port();
+    std::fs::write(tools.path().join("slow"), "").unwrap();
+    let during = async {
+        // Well inside the second `haproxy -c` takes: the old configuration still runs.
+        sleep(Duration::from_millis(400)).await;
+        let q_cut = cut_off(q).await;
+        let p_tag = tag_on(p).await;
+        (q_cut, p_tag)
+    };
+    let ((), (q_cut, p_tag)) = tokio::join!(engine.apply(render(&model, w.dir.path())), during);
+    assert!(
+        q_cut,
+        "a visitor on q reached the old backend during the reload"
+    );
+    assert_eq!(p_tag, b"A", "p stopped serving during the reload");
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(tag_on(q).await, b"B");
+    assert_eq!(tag_on(p).await, b"A");
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
 #[tokio::test]
 async fn failed_apply_that_moves_an_edge_closes_its_port() {
     let w = World::with_tagged(&[("gw1", b"A"), ("gw2", b"B")]).await;

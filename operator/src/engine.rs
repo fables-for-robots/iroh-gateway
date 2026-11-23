@@ -116,9 +116,10 @@ impl Engine {
     /// Applies `rendered`: HAProxy's configuration, and the links of the edges in it.
     ///
     /// Links of edges that left the plan, or whose id or address changed, are shut down in any
-    /// case. Only when HAProxy took the configuration are links started and ports added; when it
-    /// did not, each link keeps only the ports whose [`PortPlan`] (socket and fingerprint) in the
-    /// new plan is the one HAProxy last loaded.
+    /// case. While HAProxy reloads, each remaining link forwards only on the ports whose
+    /// [`PortPlan`] (socket and fingerprint) in the new plan is the one HAProxy last loaded.
+    /// Only when HAProxy took the configuration are links started and ports added; when it did
+    /// not, each link keeps only those unchanged ports.
     ///
     /// Not meant to be cancelled, and the reconcile loop never cancels it. A cancelled call can
     /// leave the links of the edges that left the plan removed while the other links keep their
@@ -142,6 +143,14 @@ impl Engine {
             .collect();
         for (key, _) in &gone {
             info!(edge = %key, "stopping the link");
+        }
+        // Until HAProxy has the new configuration, a visitor on a port that is moving or going
+        // away is refused rather than delivered to what is behind its socket now. The ports
+        // asked of the edges stay as they are until the outcome is known.
+        for plan in &rendered.edges {
+            if let Some(link) = self.links.get_mut(&plan.key) {
+                link.keep_unchanged(plan);
+            }
         }
         let (applied, ()) = tokio::join!(
             self.supervisor.apply(&rendered.haproxy_cfg),
@@ -169,7 +178,7 @@ impl Engine {
         edges.extend(
             self.links
                 .iter()
-                .map(|(key, link)| (key.clone(), link.state.borrow().clone())),
+                .map(|(key, link)| (key.clone(), observed(&link.state))),
         );
         Facts {
             operator_id: self.endpoint.id(),
@@ -319,6 +328,21 @@ impl Engine {
     }
 }
 
+/// `last_error` of a link whose task has ended although it was not shut down.
+const LINK_STOPPED: &str = "the link stopped unexpectedly";
+
+/// A link's state as the facts report it: as last sent, or, once its task has ended and the
+/// channel is closed, not connected with [`LINK_STOPPED`].
+fn observed(state: &watch::Receiver<EdgeState>) -> EdgeState {
+    if state.has_changed().is_err() {
+        return EdgeState {
+            last_error: Some(LINK_STOPPED.to_owned()),
+            ..EdgeState::default()
+        };
+    }
+    state.borrow().clone()
+}
+
 /// The socket of each port, as the connector takes them.
 fn paths(sockets: &HashMap<ListenerKey, PortPlan>) -> HashMap<ListenerKey, PathBuf> {
     sockets
@@ -370,5 +394,34 @@ async fn stop_links(links: impl IntoIterator<Item = LinkHandle>) {
         if let Err(e) = done {
             error!("a link failed while stopping: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunnel::ListenerState;
+
+    #[test]
+    fn a_link_whose_task_ended_is_reported_stopped() {
+        let up = EdgeState {
+            connected: true,
+            generation: 3,
+            listeners: vec![ListenerState {
+                key: ListenerKey {
+                    protocol: Protocol::Tcp,
+                    port: 80,
+                },
+                bound: Ok(()),
+            }],
+            ..EdgeState::default()
+        };
+        let (tx, rx) = watch::channel(up.clone());
+        assert_eq!(observed(&rx), up);
+        drop(tx);
+        let stopped = observed(&rx);
+        assert!(!stopped.connected);
+        assert!(stopped.listeners.is_empty());
+        assert_eq!(stopped.last_error.as_deref(), Some(LINK_STOPPED));
     }
 }
