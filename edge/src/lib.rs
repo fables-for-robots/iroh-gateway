@@ -25,6 +25,10 @@ use session::{ApplyRequest, Session};
 /// Streams the operator may have open towards the edge: it needs only the control stream.
 const OPERATOR_STREAMS: u32 = 4;
 const APPLY_QUEUE: usize = 16;
+/// Handshakes in progress beyond which new connection attempts are refused unanswered.
+const MAX_PENDING_HANDSHAKES: usize = 64;
+/// How long one handshake may take before it is dropped.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct EdgeOptions {
     pub secret_key: SecretKey,
@@ -143,9 +147,7 @@ impl Supervisor {
             tokio::select! {
                 _ = &mut shutdown => break,
                 incoming = self.endpoint.accept() => match incoming {
-                    Some(incoming) => {
-                        self.handshakes.spawn(handshake(incoming, self.operator));
-                    }
+                    Some(incoming) => self.incoming(incoming),
                     None => {
                         warn!("iroh endpoint closed");
                         break;
@@ -175,6 +177,25 @@ impl Supervisor {
             }
         }
         self.shutdown().await;
+    }
+
+    /// Starts the handshake of a connection attempt, unless its address is not yet validated or
+    /// too many handshakes are in progress.
+    fn incoming(&mut self, incoming: Incoming) {
+        if !incoming.remote_addr_validated() {
+            // Stateless: the sender must prove it receives at its address before any state is
+            // kept for it, so a spoofed source cannot take a handshake slot.
+            if let Err(e) = incoming.retry() {
+                debug!("retry failed: {e}");
+            }
+            return;
+        }
+        if self.handshakes.len() >= MAX_PENDING_HANDSHAKES {
+            debug!(remote = ?incoming.remote_addr(), "refused: too many handshakes in progress");
+            incoming.refuse();
+            return;
+        }
+        self.handshakes.spawn(handshake(incoming, self.operator));
     }
 
     /// Makes `conn` the current session, replacing any running one.
@@ -222,24 +243,29 @@ impl Supervisor {
     }
 }
 
-/// Completes the handshake and keeps the connection only if it is from the pinned operator.
+/// Completes the handshake within `HANDSHAKE_TIMEOUT` and keeps the connection only if it is
+/// from the pinned operator.
 async fn handshake(incoming: Incoming, operator: EndpointId) -> Option<Connection> {
-    let conn = match incoming.accept() {
-        Ok(accepting) => accepting.await,
+    let accepting = match incoming.accept() {
+        Ok(accepting) => accepting,
         Err(e) => {
             debug!("incoming connection failed: {e}");
             return None;
         }
     };
-    let conn = match conn {
-        Ok(conn) => conn,
-        Err(e) => {
+    let conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, accepting).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
             debug!("handshake failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            debug!("handshake timed out after {HANDSHAKE_TIMEOUT:?}");
             return None;
         }
     };
     if conn.remote_id() != operator {
-        warn!(remote = %conn.remote_id(), "rejected connection from an unpinned key");
+        debug!(remote = %conn.remote_id(), "rejected connection from an unpinned key");
         conn.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"");
         return None;
     }
