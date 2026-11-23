@@ -310,11 +310,12 @@ async fn an_edge_that_never_answers_the_config_is_redialled() {
     let p = free_tcp_port();
     let fake = FakeEdge::bind().await;
     let limit = Duration::from_millis(500);
+    // Before the link exists, so certainly before its session starts.
+    let spawned = Instant::now();
     let (link, _desired, _endpoint) = fake
         .link_with(&[(p, echo)], &[p], |opts| opts.first_status_timeout = limit)
         .await;
     let mut s = fake.accept().await;
-    let accepted = Instant::now();
     s.read_config().await;
     let waiting = wait_state(&link, |st| st.last_error.is_some()).await;
     assert!(!waiting.connected);
@@ -330,7 +331,7 @@ async fn an_edge_that_never_answers_the_config_is_redialled() {
     })
     .await;
     assert!(!gave_up.connected);
-    assert!(accepted.elapsed() >= limit, "{:?}", accepted.elapsed());
+    assert!(spawned.elapsed() >= limit, "{:?}", spawned.elapsed());
     timeout(STEP, s.conn.closed())
         .await
         .expect("the link kept the connection");
