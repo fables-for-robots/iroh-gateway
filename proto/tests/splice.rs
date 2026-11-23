@@ -23,7 +23,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
-    time::{Instant, Interval, interval},
+    time::{Instant, Interval, MissedTickBehavior, interval},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -135,11 +135,13 @@ impl LocalStream for StallingLocal {
     }
 }
 
-/// tcp_b as splice's local side, taking at most `per_tick` bytes per tick of `tick`: slow,
-/// but never stalled for longer than one tick.
+/// tcp_b as splice's local side, taking at most `per_tick` bytes per `period`: slow, but never
+/// stalled for longer than one period. The ticks start at the first write, once the rig is set
+/// up, and a late tick delays the next instead of letting a burst through.
 struct TricklingLocal {
     tcp: TcpStream,
-    tick: Interval,
+    period: Duration,
+    tick: Option<Interval>,
     per_tick: usize,
     allowance: usize,
 }
@@ -162,7 +164,13 @@ impl AsyncWrite for TricklingLocal {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         if this.allowance == 0 {
-            ready!(this.tick.poll_tick(cx));
+            let period = this.period;
+            let tick = this.tick.get_or_insert_with(|| {
+                let mut tick = interval(period);
+                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                tick
+            });
+            ready!(tick.poll_tick(cx));
             this.allowance = this.per_tick;
         }
         let n = buf.len().min(this.allowance);
@@ -548,7 +556,8 @@ async fn slow_but_progressing_local_is_not_cut() {
     let (tcp_a, tcp_b) = tcp_pair().await;
     let local_b = TricklingLocal {
         tcp: tcp_b,
-        tick: interval(Duration::from_millis(100)),
+        period: Duration::from_millis(100),
+        tick: None,
         per_tick: 1 << 10,
         allowance: 0,
     };
