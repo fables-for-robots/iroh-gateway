@@ -122,8 +122,9 @@ impl Engine {
     /// not, each link keeps only those unchanged ports.
     ///
     /// Not meant to be cancelled, and the reconcile loop never cancels it. A cancelled call can
-    /// leave the links of the edges that left the plan removed while the other links keep their
-    /// old socket tables, and HAProxy may already run the new configuration.
+    /// leave the links of the edges that left the plan removed and the other links' socket
+    /// tables cut to their unchanged ports, with the old ports still asked of the edges, while
+    /// HAProxy may already run the new configuration.
     pub async fn apply(&mut self, rendered: Rendered) {
         let gone: Vec<ObjRef> = self
             .links
