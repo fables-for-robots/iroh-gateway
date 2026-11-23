@@ -197,6 +197,19 @@ at startup and written to `Edge.status.gatewayEndpointId`.
 
 The operator redials a lost edge with capped exponential backoff, forever.
 
+Port mapping (UPnP, NAT-PMP, PCP) is switched off on both sides and compiled
+out of the build, because on the operator side it would ask the home router
+to open an inbound port.
+
+**Known limitation.** iroh 1.5 has no supported way to switch off QUIC NAT
+traversal. Even in the default mode each side tells the other its local
+interface addresses and probes the addresses it is told: the operator sends
+probe packets to the edge's private and bridge addresses, and the edge to
+the operator's. Binding the edge's iroh port to its public address instead
+of a wildcard stops the edge from advertising its other interfaces. The
+operator's side has no mitigation yet; options are a supported switch
+upstream or binding the operator to specific addresses.
+
 ### Relay mode
 
 Relay mode is off by default. It exists for cases where the direct path
@@ -234,7 +247,20 @@ One setting, with the same value on the operator and on its edges:
 - Closes all public listeners a few seconds after the tunnel drops, so
   visitors fail fast and a future health check sees the edge as down.
 - Enforces a cap on concurrent connections and UDP flows and refuses new
-  ones beyond it.
+  ones beyond it. The default is 2048 connections; the worst case is about
+  400 KiB of memory per connection.
+- Does not let a visitor hold a connection slot indefinitely:
+  - a connection that accepts no data for 300 s while data is waiting for
+    it is aborted;
+  - once one side has finished sending, the connection is aborted if the
+    other side sends nothing for 300 s;
+  - visitor sockets use TCP keepalive, so a visitor that vanishes is
+    noticed.
+- Limits what an unauthenticated host can cost it: source addresses are
+  validated before a handshake is processed, at most 64 handshakes are
+  pending at once, and each has 10 s to complete.
+- Forwards no visitor until the current operator session has sent its first
+  `Config`.
 - Persists only its own key. No certificates, no routes, no hostnames.
 
 ### What a compromised edge can and cannot do
@@ -354,8 +380,17 @@ are length-prefixed CBOR (as in `secret-bunker-iroh`).
   the full desired set, resent on every change. `id` is a small integer.
 - Edge → operator: `Status { generation, listeners: [{ id, bound | error }], version }`.
 
-Liveness uses QUIC keep-alive and idle timeout (order of 5 s and 20 s), not
-application pings.
+Listener ids belong to the operator's link to one edge. An id stays with its
+listener for as long as the listener is wanted, across reconnects, and is
+never reused. The edge stamps a visitor with the id that is current when it
+forwards the stream.
+
+Liveness uses QUIC keep-alive (5 s) and idle timeout (20 s for the
+connection, 15 s per path, which is iroh's maximum), not application pings.
+
+Close codes: 1 unauthorized, 2 replaced by a newer connection from the same
+operator, 3 shutdown, 4 control stream ended. Stream reset codes: 1 aborted,
+2 unknown listener, 3 backend unavailable, 4 bad header.
 
 **TCP.** For each accepted visitor connection the edge opens a
 bidirectional stream and writes a header: listener id, visitor address,
@@ -366,6 +401,24 @@ header with the visitor's address, and copies.
 
 The default QUIC limit on concurrent streams is far too low for this and
 must be raised on both sides to the connection cap.
+
+Receive memory is bounded explicitly, because the QUIC defaults are not:
+
+- Each stream has a 256 KiB receive window, on both sides.
+- The operator also caps each edge connection at 256 MiB of unread data, so
+  a compromised edge cannot exhaust the operator's memory. If one edge
+  fills it, only that edge's own traffic waits.
+- The edge has no such connection-wide cap on purpose: with one, a few
+  hundred visitors that stop reading could stall every other visitor.
+- The stream header is at most 256 bytes and must arrive within 5 s.
+
+The operator also refuses a stream whose header names a local port that
+does not match the listener its id belongs to.
+
+**Open question for the HAProxy step.** A Unix socket cannot signal an
+abort: closing it looks like a clean end of data. An aborted visitor
+connection would therefore reach HAProxy as a clean close. Either accept
+that, or connect to HAProxy over loopback TCP instead of Unix sockets.
 
 **UDP.** Each visitor packet travels as one or more QUIC datagrams:
 

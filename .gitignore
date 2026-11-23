@@ -1,0 +1,8 @@
+/target
+.direnv
+.DS_Store
+*.key
+# Created by the README quickstart.
+/operator.toml
+/edge.log
+/operator.log
