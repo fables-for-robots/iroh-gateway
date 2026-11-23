@@ -7,15 +7,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use common::*;
-use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError, TransportErrorCode};
+use iroh::endpoint::ConnectionError;
 use iroh::{EndpointAddr, EndpointId, SecretKey};
 use iroh_gateway_proto::control::{BindState, ListenerStatus};
 use iroh_gateway_proto::transport::{Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{ALPN, CLOSE_REPLACED, CLOSE_UNAUTHORIZED};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const GRACE: Duration = Duration::from_secs(5);
 
@@ -393,22 +394,24 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A UDP relay from one dialer to the edge that forwards the dialer's datagrams only until the
 /// edge answers with anything but a Retry. The edge's handshake then waits for a client
-/// `Finished` that never arrives, and holds its handshake slot.
-async fn stalling_proxy(edge: SocketAddr) -> (SocketAddr, JoinHandle<()>) {
+/// `Finished` that never arrives, and holds its handshake slot. Everything the edge sends still
+/// reaches the dialer. The receiver fires once the relay has stalled.
+async fn stalling_proxy(edge: SocketAddr) -> (SocketAddr, oneshot::Receiver<()>, JoinHandle<()>) {
     let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     up.connect(edge).await.unwrap();
     let addr = front.local_addr().unwrap();
+    let (stalled_tx, stalled_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         let (mut from_dialer, mut from_edge) = ([0u8; 2048], [0u8; 2048]);
         let mut dialer = None;
-        let mut stalled = false;
+        let mut stalled_tx = Some(stalled_tx);
         loop {
             tokio::select! {
                 r = front.recv_from(&mut from_dialer) => {
                     let Ok((n, from)) = r else { return };
                     dialer = Some(from);
-                    if !stalled {
+                    if stalled_tx.is_some() {
                         let _ = up.send(&from_dialer[..n]).await;
                     }
                 }
@@ -416,20 +419,39 @@ async fn stalling_proxy(edge: SocketAddr) -> (SocketAddr, JoinHandle<()>) {
                     let Ok(n) = r else { return };
                     // A QUIC v1 long header with packet type Retry.
                     let retry = n > 0 && from_edge[0] & 0xf0 == 0xf0;
-                    stalled |= !retry;
                     if let Some(dialer) = dialer {
                         let _ = front.send_to(&from_edge[..n], dialer).await;
+                    }
+                    if !retry && let Some(tx) = stalled_tx.take() {
+                        let _ = tx.send(());
                     }
                 }
             }
         }
     });
-    (addr, task)
+    (addr, stalled_rx, task)
 }
 
-/// Dials the edge through `proxy` with a fresh unpinned key; true if the edge refused the
-/// connection attempt outright.
-async fn flood_once(edge_id: EndpointId, proxy: SocketAddr) -> (bool, iroh::Endpoint) {
+/// A dialer with a fresh unpinned key whose handshake the edge holds pending. Dropping it
+/// stops the dialer and its relay.
+struct Stalled {
+    /// When the edge began answering the handshake.
+    pending_since: Instant,
+    proxy: JoinHandle<()>,
+    /// Finishes once the dialer's connection attempt has failed or its connection has closed.
+    ended: JoinHandle<()>,
+}
+
+impl Drop for Stalled {
+    fn drop(&mut self) {
+        self.proxy.abort();
+        self.ended.abort();
+    }
+}
+
+/// Starts a handshake with the edge through a stalling relay; returns once the edge is
+/// answering it, which it does only after counting it as pending.
+async fn stall_handshake(edge_id: EndpointId, edge_addr: SocketAddr) -> Stalled {
     let endpoint = endpoint_builder(SecretKey::generate(), 4, &Relay::Disabled, Role::Operator)
         .clear_ip_transports()
         .bind_addr("127.0.0.1:0")
@@ -437,64 +459,89 @@ async fn flood_once(edge_id: EndpointId, proxy: SocketAddr) -> (bool, iroh::Endp
         .bind()
         .await
         .unwrap();
-    let addr = EndpointAddr::new(edge_id).with_ip_addr(proxy);
-    let dialed = timeout(Duration::from_secs(5), endpoint.connect(addr, ALPN)).await;
-    let refused = matches!(
-        dialed,
-        Ok(Err(ConnectError::Connecting {
-            source: ConnectingError::ConnectionError {
-                source: ConnectionError::ConnectionClosed(close),
-                ..
-            },
-            ..
-        })) if close.error_code == TransportErrorCode::CONNECTION_REFUSED
-    );
-    (refused, endpoint)
+    // No await between spawning the relay and guarding it with `Stalled`, so a cancelled call
+    // leaves no task behind.
+    let (addr, stalled, proxy) = stalling_proxy(edge_addr).await;
+    let target = EndpointAddr::new(edge_id).with_ip_addr(addr);
+    let ended = tokio::spawn(async move {
+        if let Ok(conn) = endpoint.connect(target, ALPN).await {
+            conn.closed().await;
+        }
+    });
+    let mut s = Stalled {
+        pending_since: Instant::now(),
+        proxy,
+        ended,
+    };
+    timeout(STEP, stalled)
+        .await
+        .expect("the edge did not answer a validated handshake")
+        .unwrap();
+    s.pending_since = Instant::now();
+    s
 }
 
 #[tokio::test]
-async fn handshake_flood_is_capped() {
-    const FLOODERS: usize = MAX_PENDING_HANDSHAKES + 16;
+async fn handshake_flood_does_not_lock_out_the_operator() {
     let key = SecretKey::generate();
     let edge = spawn_edge(key.public(), GRACE, 100).await;
+    let (edge_id, edge_addr) = (edge.endpoint_id(), edge.iroh_addr());
 
-    let mut proxies = Vec::new();
-    let mut flood = JoinSet::new();
-    for _ in 0..FLOODERS {
-        let (addr, proxy) = stalling_proxy(edge.iroh_addr()).await;
-        proxies.push(proxy);
-        flood.spawn(flood_once(edge.endpoint_id(), addr));
+    let mut held = Vec::new();
+    for _ in 0..MAX_PENDING_HANDSHAKES {
+        held.push(stall_handshake(edge_id, edge_addr).await);
     }
-    let flood_started = Instant::now();
-    let mut refused = 0;
-    let mut flooders = Vec::new();
-    while let Some(done) = flood.join_next().await {
-        let (was_refused, endpoint) = done.unwrap();
-        refused += usize::from(was_refused);
-        flooders.push(endpoint);
-    }
-    // Every handshake past the cap was refused; the others hold their slots until they time out.
-    assert_eq!(refused, FLOODERS - MAX_PENDING_HANDSHAKES);
-
-    // The stalled handshakes time out, and then the pinned operator gets in.
-    let mut fake = loop {
-        match FakeOperator::connect(key.clone(), edge.endpoint_id(), edge.iroh_addr()).await {
-            Ok(fake) => break fake,
-            Err(e) => {
-                assert!(
-                    flood_started.elapsed() < HANDSHAKE_TIMEOUT + Duration::from_secs(5),
-                    "operator still locked out: {e:#}"
-                );
-                sleep(Duration::from_millis(200)).await;
-            }
+    // Every slot is taken; the flood keeps starting new handshakes while the operator dials.
+    let flood = tokio::spawn(async move {
+        let mut more = Vec::new();
+        loop {
+            more.push(stall_handshake(edge_id, edge_addr).await);
+            sleep(Duration::from_millis(50)).await;
         }
-    };
-    let p = free_tcp_port();
-    assert!(bound(&fake.push(tcp_cfg(1, &[p])).await));
+    });
 
-    for proxy in proxies {
-        proxy.abort();
+    let p = free_tcp_port();
+    let st = timeout(Duration::from_secs(3), async {
+        let mut fake = FakeOperator::connect(key, edge_id, edge_addr)
+            .await
+            .expect("operator locked out by the flood");
+        fake.push(tcp_cfg(1, &[p])).await
+    })
+    .await
+    .expect("operator not configured within 3 s");
+    assert!(bound(&st));
+
+    flood.abort();
+    let _ = flood.await;
+    drop(held);
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn oldest_pending_handshake_is_evicted() {
+    const EVICTED: usize = 16;
+    let edge = spawn_edge(SecretKey::generate().public(), GRACE, 100).await;
+
+    let mut stalled = Vec::new();
+    for _ in 0..MAX_PENDING_HANDSHAKES + EVICTED {
+        stalled.push(stall_handshake(edge.endpoint_id(), edge.iroh_addr()).await);
     }
-    drop(flooders);
+    let (oldest, newest) = stalled.split_at_mut(EVICTED);
+    for (i, s) in oldest.iter_mut().enumerate() {
+        // Well before it could have timed out.
+        timeout_at(s.pending_since + HANDSHAKE_TIMEOUT / 2, &mut s.ended)
+            .await
+            .unwrap_or_else(|_| panic!("handshake {i} still pending: not evicted"))
+            .unwrap();
+    }
+    for (i, s) in newest.iter().enumerate() {
+        assert!(
+            !s.ended.is_finished(),
+            "handshake {} ended, but only the {EVICTED} oldest should have",
+            EVICTED + i
+        );
+    }
+
+    drop(stalled);
     edge.shutdown().await;
 }

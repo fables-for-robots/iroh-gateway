@@ -3,6 +3,7 @@
 pub mod listeners;
 mod session;
 
+use std::collections::VecDeque;
 use std::future::pending;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -14,7 +15,7 @@ use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gateway_proto::transport::{Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{ALPN, CLOSE_REPLACED, CLOSE_SHUTDOWN, CLOSE_UNAUTHORIZED};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 use tokio::time::Sleep;
 use tracing::{debug, error, info, warn};
 
@@ -25,7 +26,7 @@ use session::{ApplyRequest, Session};
 /// Streams the operator may have open towards the edge: it needs only the control stream.
 const OPERATOR_STREAMS: u32 = 4;
 const APPLY_QUEUE: usize = 16;
-/// Handshakes in progress beyond which new connection attempts are refused at once.
+/// Handshakes in progress beyond which the oldest is aborted to admit a new one.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 /// How long one handshake may take before it is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -87,6 +88,7 @@ impl Edge {
             apply_tx,
             apply_rx,
             handshakes: JoinSet::new(),
+            pending: VecDeque::new(),
             current: None,
             next_id: 0,
             grace_timer: None,
@@ -149,6 +151,8 @@ struct Supervisor {
     apply_rx: mpsc::Receiver<ApplyRequest>,
     /// Incoming connections until their handshake is done and their key checked.
     handshakes: JoinSet<Option<Connection>>,
+    /// The handshakes in `handshakes` not yet done or aborted, oldest first.
+    pending: VecDeque<AbortHandle>,
     current: Option<Session>,
     next_id: u64,
     /// Runs while no session has been configured since the last one ended.
@@ -167,8 +171,14 @@ impl Supervisor {
                         break;
                     }
                 },
-                Some(done) = self.handshakes.join_next() => {
-                    if let Some(Some(conn)) = log_panic(done, "handshake task") {
+                Some(done) = self.handshakes.join_next_with_id() => {
+                    let id = match &done {
+                        Ok((id, _)) => *id,
+                        Err(e) => e.id(),
+                    };
+                    // Already gone if it was evicted.
+                    self.pending.retain(|h| h.id() != id);
+                    if let Some((_, Some(conn))) = log_panic(done, "handshake task") {
                         self.install(conn);
                     }
                 }
@@ -190,8 +200,9 @@ impl Supervisor {
         self.shutdown().await;
     }
 
-    /// Starts the handshake of a connection attempt, unless its address is not yet validated or
-    /// too many handshakes are in progress.
+    /// Starts the handshake of a connection attempt once its address is validated. With
+    /// `MAX_PENDING_HANDSHAKES` in progress, the oldest is aborted to make room: a flood then
+    /// cannot keep out a handshake that completes before the flood has started that many more.
     fn incoming(&mut self, incoming: Incoming) {
         if !incoming.remote_addr_validated() {
             // Stateless: the sender must prove it receives at its address before any state is
@@ -201,12 +212,16 @@ impl Supervisor {
             }
             return;
         }
-        if self.handshakes.len() >= MAX_PENDING_HANDSHAKES {
-            debug!(remote = ?incoming.remote_addr(), "refused: too many handshakes in progress");
-            incoming.refuse();
-            return;
+        if self.pending.len() >= MAX_PENDING_HANDSHAKES
+            && let Some(oldest) = self.pending.pop_front()
+        {
+            // Cancelling the task drops its connection attempt, which closes it; `run` reaps
+            // the task from `handshakes`.
+            debug!("too many handshakes in progress: aborted the oldest");
+            oldest.abort();
         }
-        self.handshakes.spawn(handshake(incoming, self.operator));
+        let handle = self.handshakes.spawn(handshake(incoming, self.operator));
+        self.pending.push_back(handle);
     }
 
     /// Makes `conn` the current session, replacing any running one.
@@ -270,6 +285,7 @@ impl Supervisor {
             session.close(CLOSE_SHUTDOWN, b"shutdown");
         }
         self.handshakes.abort_all();
+        self.pending.clear();
         while let Some(done) = self.handshakes.join_next().await {
             log_panic(done, "handshake task");
         }
