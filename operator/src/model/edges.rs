@@ -1,6 +1,6 @@
 //! Edges and the gateways they serve.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iroh::EndpointId;
 use kube::ResourceExt;
@@ -17,21 +17,46 @@ pub(super) fn edges(
     settings: &Settings,
     gateways: &[GatewayModel],
 ) -> Vec<EdgeModel> {
-    let mut out: Vec<EdgeModel> = snapshot
+    let mut pairs: Vec<(&Edge, EdgeModel)> = snapshot
         .edges
         .iter()
-        .map(|e| edge(e, snapshot, settings, gateways))
+        .map(|e| (e, edge(e, settings, gateways)))
         .collect();
-    out.sort_by(|a, b| a.key.cmp(&b.key));
-    out
+    pairs.sort_by(|a, b| a.1.key.cmp(&b.1.key));
+    refuse_duplicates(&mut pairs);
+    pairs.into_iter().map(|(_, m)| m).collect()
 }
 
-fn edge(
-    e: &Edge,
-    snapshot: &Snapshot,
-    settings: &Settings,
-    gateways: &[GatewayModel],
-) -> EdgeModel {
+/// Among the edges that passed every other check and share an endpoint id, only the oldest is
+/// accepted: earliest creation time (none counts as newest), then smallest key. An edge
+/// rejected for another reason neither competes nor loses its reason.
+fn refuse_duplicates(pairs: &mut [(&Edge, EdgeModel)]) {
+    let mut by_id: BTreeMap<EndpointId, Vec<usize>> = BTreeMap::new();
+    for (i, (_, m)) in pairs.iter().enumerate() {
+        if let (Ok(()), Some(id)) = (&m.accepted, m.endpoint_id) {
+            by_id.entry(id).or_default().push(i);
+        }
+    }
+    for members in by_id.into_values().filter(|m| m.len() > 1) {
+        let order = |i: usize| {
+            let ts = pairs[i].0.creation_timestamp();
+            (ts.is_none(), ts, pairs[i].1.key.clone())
+        };
+        let winner = *members
+            .iter()
+            .min_by_key(|&&i| order(i))
+            .expect("non-empty");
+        let older = pairs[winner].1.key.clone();
+        for i in members.into_iter().filter(|&i| i != winner) {
+            pairs[i].1.accepted = Err(Reject::new(
+                "DuplicateEndpointId",
+                format!("edge {older} has the same endpoint id and is older"),
+            ));
+        }
+    }
+}
+
+fn edge(e: &Edge, settings: &Settings, gateways: &[GatewayModel]) -> EdgeModel {
     let key = ObjRef::of(e);
     let spec = &e.spec;
     let endpoint_id = spec.endpoint_id.parse::<EndpointId>().ok();
@@ -49,12 +74,12 @@ fn edge(
                 ),
             ));
         }
-        let Some(id) = endpoint_id else {
+        if endpoint_id.is_none() {
             return Err(Reject::new(
                 "InvalidEndpointId",
                 format!("{:?} is not an endpoint id", spec.endpoint_id),
             ));
-        };
+        }
         match &spec.address {
             None if settings.relay == Relay::Disabled => {
                 return Err(Reject::new(
@@ -93,12 +118,6 @@ fn edge(
                 format!("gateway {} is not accepted", gw.key),
             ));
         }
-        if let Some(older) = older_duplicate(e, id, snapshot) {
-            return Err(Reject::new(
-                "DuplicateEndpointId",
-                format!("edge {older} has the same endpoint id and is older"),
-            ));
-        }
         Ok(())
     })();
 
@@ -111,26 +130,6 @@ fn edge(
         gateway,
         public_addresses,
     }
-}
-
-/// An edge with the same endpoint id that is older: earlier creation time (none counts as
-/// newest), then smaller key.
-fn older_duplicate(e: &Edge, id: EndpointId, snapshot: &Snapshot) -> Option<ObjRef> {
-    let order = |x: &Edge| {
-        (
-            x.creation_timestamp().is_none(),
-            x.creation_timestamp(),
-            ObjRef::of(x),
-        )
-    };
-    let mine = order(e);
-    snapshot
-        .edges
-        .iter()
-        .filter(|o| o.spec.endpoint_id.parse::<EndpointId>().ok() == Some(id))
-        .filter(|o| order(o) < mine)
-        .map(ObjRef::of)
-        .min()
 }
 
 /// `spec.publicAddresses`, or the host of `address`.
@@ -397,6 +396,30 @@ mod tests {
         let m = run(vec![good("a", 1), good("b", 1).created(10)]);
         assert_eq!(reason(&m.edges[0]), "DuplicateEndpointId");
         assert_eq!(reason(&m.edges[1]), "Ok");
+    }
+
+    #[test]
+    fn rejected_older_edge_does_not_block_a_valid_younger_one() {
+        let m = run(vec![
+            good("a", 1).gateway("absent").created(10),
+            good("b", 1).created(20),
+        ]);
+        assert_eq!(reason(&m.edges[0]), "GatewayNotFound");
+        assert_eq!(reason(&m.edges[1]), "Ok");
+        assert_eq!(m.gateways[0].edges, [ObjRef::new("infra", "b")]);
+    }
+
+    #[test]
+    fn three_way_duplicate() {
+        let m = run(vec![
+            good("c", 1).created(30),
+            good("a", 1).created(20),
+            good("b", 1).created(10),
+        ]);
+        assert_eq!(reason(&m.edges[0]), "DuplicateEndpointId");
+        assert_eq!(reason(&m.edges[1]), "Ok");
+        assert_eq!(reason(&m.edges[2]), "DuplicateEndpointId");
+        assert_eq!(m.gateways[0].edges, [ObjRef::new("infra", "b")]);
     }
 
     #[test]
