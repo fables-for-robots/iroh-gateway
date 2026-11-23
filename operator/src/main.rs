@@ -11,7 +11,7 @@ use iroh_gateway_operator::tunnel::{EdgeLink, LinkOptions, StaticConnector, bind
 use iroh_gateway_proto::control::ListenerKey;
 use iroh_gateway_proto::key::load_or_generate;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -61,6 +61,9 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
     let cfg = staticcfg::parse(&text).with_context(|| format!("in {}", path.display()))?;
     let key = load_or_generate(&cfg.key_file)
         .with_context(|| format!("key file {}", cfg.key_file.display()))?;
+    // One descriptor per backend connection, plus the endpoint and the rest.
+    let limit = raise_open_file_limit()?;
+    info!("open file limit is {limit}");
     let endpoint = bind_endpoint(key.clone(), &cfg.relay).await?;
     info!(id = %key.public(), "operator started");
 
@@ -136,6 +139,25 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
     drop(desired_senders);
     endpoint.close().await;
     Ok(())
+}
+
+/// Raises the soft open-file limit as far as the hard limit allows and returns the soft limit
+/// then in force. A failure to raise it is logged and the old limit stays.
+fn raise_open_file_limit() -> anyhow::Result<u64> {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).context("reading the open file limit")?;
+    // macOS refuses a soft limit above OPEN_MAX, which an unlimited hard limit would ask for.
+    #[cfg(target_os = "macos")]
+    let target = hard.min(10_240);
+    #[cfg(not(target_os = "macos"))]
+    let target = hard;
+    if soft < target
+        && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard)
+    {
+        warn!("raising the open file limit from {soft} to {target} failed: {e}");
+    }
+    let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).context("reading the open file limit")?;
+    Ok(soft)
 }
 
 /// Resolves on SIGINT or SIGTERM.

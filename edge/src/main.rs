@@ -10,7 +10,7 @@ use iroh::EndpointId;
 use iroh_gateway_edge::{Edge, EdgeOptions};
 use iroh_gateway_proto::key::load_or_generate;
 use iroh_gateway_proto::transport::Relay;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -100,6 +100,16 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let secret_key = load_or_generate(&key_file)
                 .with_context(|| format!("key file {}", key_file.display()))?;
+            // One descriptor per visitor, plus the endpoint, listeners and the rest.
+            let limit = raise_open_file_limit()?;
+            info!("open file limit is {limit}");
+            let needed = u64::from(max_connections) + 64;
+            if needed > limit {
+                warn!(
+                    "--max-connections {max_connections} needs about {needed} open files, \
+                     more than the limit of {limit}: visitors past it will fail to be accepted"
+                );
+            }
             let edge = Edge::spawn(EdgeOptions {
                 secret_key,
                 operator,
@@ -117,6 +127,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Raises the soft open-file limit as far as the hard limit allows and returns the soft limit
+/// then in force. A failure to raise it is logged and the old limit stays.
+fn raise_open_file_limit() -> anyhow::Result<u64> {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).context("reading the open file limit")?;
+    // macOS refuses a soft limit above OPEN_MAX, which an unlimited hard limit would ask for.
+    #[cfg(target_os = "macos")]
+    let target = hard.min(10_240);
+    #[cfg(not(target_os = "macos"))]
+    let target = hard;
+    if soft < target
+        && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard)
+    {
+        warn!("raising the open file limit from {soft} to {target} failed: {e}");
+    }
+    let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).context("reading the open file limit")?;
+    Ok(soft)
 }
 
 /// Resolves on SIGINT or SIGTERM.

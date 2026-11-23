@@ -124,6 +124,12 @@ target = "127.0.0.1:3000"
 
 Unknown fields, an edge listed twice, an edge without listeners, two listeners with the same protocol and port in one edge, and a missing `address` while `relay` is `disabled` are rejected at start.
 
+## Running in production
+
+- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection). Both binaries raise their soft open-file limit to the hard limit at start and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
+- **Ports below 1024.** Listening on a public port below 1024 needs `CAP_NET_BIND_SERVICE` or root on the edge.
+- **The iroh port.** The edge's iroh UDP port (`--iroh-listen`, default 7842) must be reachable from the operator for a direct connection.
+
 ## Trust
 
 The visitor address a backend sees is only as trustworthy as the edge. It is for logging, not for access control. Each side pins the other's key: the edge serves only the operator named by `--operator`, and the operator connects only to the edges it lists.

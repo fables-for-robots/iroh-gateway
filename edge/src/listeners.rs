@@ -10,10 +10,12 @@ use iroh_gateway_proto::control::{
     BindState, Config, ListenerKey, ListenerStatus, Protocol, Status,
 };
 use iroh_gateway_proto::tcp::set_keepalive_and_nodelay;
+use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 const ACCEPTED_QUEUE: usize = 1024;
 
@@ -132,11 +134,18 @@ async fn accept_loop(
     permits: Arc<Semaphore>,
     tx: mpsc::Sender<Accepted>,
 ) {
+    let mut accept_errors = LogThrottle::new(LOG_EVERY);
     loop {
         let (stream, visitor) = match listener.accept().await {
             Ok(x) => x,
             // Transient accept errors (fd exhaustion, aborted handshakes): back off briefly.
-            Err(_) => {
+            Err(e) => {
+                if let Some(suppressed) = accept_errors.hit() {
+                    warn!(
+                        port = key.port,
+                        suppressed, "accepting a visitor failed: {e}"
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }

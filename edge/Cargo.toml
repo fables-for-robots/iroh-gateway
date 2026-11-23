@@ -15,6 +15,7 @@ iroh-gateway-proto = { path = "../proto" }
 tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+nix = { workspace = true, features = ["resource"] }
 
 [dev-dependencies]
 nix.workspace = true

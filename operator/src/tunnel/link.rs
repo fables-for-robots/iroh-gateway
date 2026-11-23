@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -16,6 +16,7 @@ use iroh_gateway_proto::control::{
 };
 use iroh_gateway_proto::frame::{FrameError, read_frame, read_frame_max, write_frame};
 use iroh_gateway_proto::splice::splice;
+use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{
     ALPN, CLOSE_SHUTDOWN, RESET_BACKEND_UNAVAILABLE, RESET_BAD_HEADER, RESET_UNKNOWN_LISTENER,
@@ -115,6 +116,7 @@ impl EdgeLink {
             generation: 0,
             ids: HashMap::new(),
             next_id: 1,
+            backend_errors: Arc::default(),
         };
         let task = tokio::spawn(link.run(shutdown_rx).instrument(span));
         LinkHandle {
@@ -164,7 +166,11 @@ struct Link<C> {
     /// as long as the link runs, so on no connection does one id ever stand for two keys.
     ids: HashMap<ListenerKey, u32>,
     next_id: u32,
+    backend_errors: BackendErrors,
 }
+
+/// Per listener key, how often a failed backend connection is logged at warn.
+type BackendErrors = Arc<Mutex<HashMap<ListenerKey, LogThrottle>>>;
 
 /// Per-connection state.
 struct Session {
@@ -365,6 +371,7 @@ impl<C: Connector> Link<C> {
                             s.routes.subscribe(),
                             self.connector.clone(),
                             self.opts.connect_timeout,
+                            self.backend_errors.clone(),
                         );
                         s.streams.spawn(stream.in_current_span());
                     }
@@ -508,6 +515,7 @@ async fn serve_stream<C: Connector>(
     routes: watch::Receiver<HashMap<u32, ListenerKey>>,
     connector: Arc<C>,
     connect_timeout: Duration,
+    backend_errors: BackendErrors,
 ) {
     let header = match timeout(
         HEADER_TIMEOUT,
@@ -537,14 +545,23 @@ async fn serve_stream<C: Connector>(
         return refuse(send, recv, RESET_UNKNOWN_LISTENER, why);
     }
     let visitor = header.visitor;
-    let local = match timeout(connect_timeout, connector.connect(key, &header)).await {
-        Ok(Ok(local)) => local,
-        Ok(Err(e)) => {
-            let why = format!("backend for {key:?} unavailable: {e}");
-            return refuse(send, recv, RESET_BACKEND_UNAVAILABLE, why);
-        }
-        Err(_) => {
-            let why = format!("backend for {key:?} did not connect in time");
+    let failed = match timeout(connect_timeout, connector.connect(key, &header)).await {
+        Ok(Ok(local)) => Ok(local),
+        Ok(Err(e)) => Err(format!("backend for {key:?} unavailable: {e}")),
+        Err(_) => Err(format!("backend for {key:?} did not connect in time")),
+    };
+    let local = match failed {
+        Ok(local) => local,
+        Err(why) => {
+            let suppressed = backend_errors
+                .lock()
+                .expect("not poisoned")
+                .entry(key)
+                .or_insert_with(|| LogThrottle::new(LOG_EVERY))
+                .hit();
+            if let Some(suppressed) = suppressed {
+                warn!(suppressed, "{why}");
+            }
             return refuse(send, recv, RESET_BACKEND_UNAVAILABLE, why);
         }
     };

@@ -4,11 +4,15 @@
 #[allow(dead_code)]
 mod common;
 
+use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use iroh::{EndpointId, SecretKey};
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::io::AsyncWriteExt;
@@ -57,6 +61,84 @@ impl Running {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// The parent's hard open-file limit, capped at `cap`: a child may lower it, not raise it.
+fn hard_nofile_at_most(cap: u64) -> u64 {
+    let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    hard.min(cap)
+}
+
+/// Spawns `cmd` with open-file limits `soft` and `hard` and its stderr lines sent to the
+/// receiver.
+fn spawn_with_nofile(mut cmd: Command, soft: u64, hard: u64) -> (Running, mpsc::Receiver<String>) {
+    // SAFETY: setrlimit is async-signal-safe and the closure touches nothing else.
+    unsafe {
+        cmd.pre_exec(move || Ok(setrlimit(Resource::RLIMIT_NOFILE, soft, hard)?));
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    (Running(child), rx)
+}
+
+/// The first stderr line containing `needle` within 10 s; panics with what came instead.
+fn line_with(lines: &mpsc::Receiver<String>, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match lines.recv_timeout(left) {
+            Ok(line) if line.contains(needle) => return line,
+            Ok(line) => seen.push(line),
+            Err(_) => break,
+        }
+    }
+    panic!("no line with {needle:?} in {seen:#?}");
+}
+
+/// `run` with a fresh key, a random operator and loopback addresses.
+fn run_command(dir: &Path, extra: &[&str]) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.args(["run", "--key-file", dir.join("e.key").to_str().unwrap()])
+        .args(["--operator", &SecretKey::generate().public().to_string()])
+        .args(["--iroh-listen", &format!("127.0.0.1:{}", free_udp_port())])
+        .args(["--public-bind", "127.0.0.1"])
+        .args(extra)
+        .env_remove("RUST_LOG");
+    cmd
+}
+
+#[test]
+fn run_raises_the_open_file_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let hard = hard_nofile_at_most(4096);
+    let (_child, lines) = spawn_with_nofile(run_command(dir.path(), &[]), 256, hard);
+    line_with(&lines, &format!("open file limit is {hard}"));
+    assert!(!lines.try_iter().any(|l| l.contains("--max-connections")));
+}
+
+#[test]
+fn run_warns_when_max_connections_exceed_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let hard = hard_nofile_at_most(1024);
+    let cmd = run_command(dir.path(), &["--max-connections", "2048"]);
+    let (_child, lines) = spawn_with_nofile(cmd, 256, hard);
+    line_with(&lines, &format!("open file limit is {hard}"));
+    let warning = line_with(&lines, "--max-connections 2048 needs about 2112 open files");
+    assert!(warning.contains("WARN"), "{warning}");
 }
 
 #[test]
