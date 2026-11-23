@@ -7,6 +7,7 @@ mod edges;
 #[cfg(test)]
 mod fixtures;
 mod gateways;
+mod routes;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -93,7 +94,7 @@ pub struct Model {
     pub gateways: Vec<GatewayModel>,
     /// Every `Edge`, by key.
     pub edges: Vec<EdgeModel>,
-    /// Every `TCPRoute` that names one of our gateways; empty until routes are modelled.
+    /// Every `TCPRoute` with a `parentRef` naming one of our gateways, by key.
     pub routes: Vec<RouteModel>,
 }
 
@@ -225,9 +226,8 @@ pub fn build(snapshot: &Snapshot, settings: &Settings) -> Model {
     let edges = edges::edges(snapshot, settings, &gateways);
     edges::bind(&mut gateways, &edges);
 
-    // Routes pass (next task): attach TCPRoutes to listeners, fill `attached_routes` and
-    // `backends`. Needs the finished gateways and edges, so it goes here.
-    let routes = Vec::new();
+    // Routes pass: attach TCPRoutes to listeners, fill `attached_routes` and `backends`.
+    let routes = routes::routes(snapshot, &mut gateways);
 
     Model {
         classes,

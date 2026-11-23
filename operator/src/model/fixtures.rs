@@ -7,10 +7,13 @@ use gateway_api::gateways::v1::{
     Gateway, GatewayAddresses, GatewayListeners, GatewayListenersAllowedRoutes,
     GatewayListenersAllowedRoutesKinds, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersAllowedRoutesNamespacesSelector,
-    GatewaySpec,
+    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewaySpec,
+};
+use gateway_api::tcproutes::v1::{
+    TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteRulesBackendRefs, TcpRouteSpec,
 };
 use iroh_gateway_proto::transport::Relay;
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::{Namespace, Service, ServicePort, ServiceSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 
 use super::Settings;
@@ -56,6 +59,13 @@ pub trait GatewayExt: Sized {
     fn allowed_kinds(self, kinds: &[(&str, &str)]) -> Self;
     fn allow_all_namespaces(self) -> Self;
     fn allow_selector(self, labels: &[(&str, &str)]) -> Self;
+    /// `from: Selector` with only `matchExpressions`: (key, operator, values).
+    fn allow_expressions(self, exprs: &[(&str, &str, &[&str])]) -> Self;
+    /// `from: Selector` with the given selector, `None` for no selector at all.
+    fn allow_raw_selector(
+        self,
+        selector: Option<GatewayListenersAllowedRoutesNamespacesSelector>,
+    ) -> Self;
     fn requested_address(self, value: &str) -> Self;
 }
 
@@ -122,6 +132,35 @@ impl GatewayExt for Gateway {
         self
     }
 
+    fn allow_expressions(self, exprs: &[(&str, &str, &[&str])]) -> Self {
+        self.allow_raw_selector(Some(GatewayListenersAllowedRoutesNamespacesSelector {
+            match_expressions: Some(
+                exprs
+                    .iter()
+                    .map(|(key, operator, values)| {
+                        GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions {
+                            key: (*key).into(),
+                            operator: (*operator).into(),
+                            values: (!values.is_empty())
+                                .then(|| values.iter().map(|v| (*v).into()).collect()),
+                        }
+                    })
+                    .collect(),
+            ),
+            match_labels: None,
+        }))
+    }
+
+    fn allow_raw_selector(
+        mut self,
+        selector: Option<GatewayListenersAllowedRoutesNamespacesSelector>,
+    ) -> Self {
+        let ns = namespaces(last(&mut self));
+        ns.from = Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector);
+        ns.selector = selector;
+        self
+    }
+
     fn requested_address(mut self, value: &str) -> Self {
         self.spec
             .addresses
@@ -184,9 +223,7 @@ impl EdgeExt for Edge {
     }
 
     fn created(mut self, seconds: i64) -> Self {
-        self.metadata.creation_timestamp = Some(Time(
-            k8s_openapi::jiff::Timestamp::from_second(seconds).expect("in range"),
-        ));
+        self.metadata.creation_timestamp = Some(time(seconds));
         self
     }
 }
@@ -215,49 +252,184 @@ pub fn ns(name: &str, labels: &[(&str, &str)]) -> Namespace {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A route with one empty rule and no parents.
+pub fn tcp_route(ns: &str, name: &str) -> TcpRoute {
+    let mut r = TcpRoute::new(
+        name,
+        TcpRouteSpec {
+            parent_refs: None,
+            rules: vec![TcpRouteRules::default()],
+        },
+    );
+    r.metadata.namespace = Some(ns.into());
+    r
+}
 
-    #[test]
-    fn namespace_rules_land_on_the_last_listener() {
-        let gw = gateway("infra", "gw")
-            .listener("a", 1, "TCP")
-            .listener("b", 2, "TCP")
-            .allow_all_namespaces()
-            .listener("c", 3, "TCP")
-            .allow_selector(&[("team", "db")]);
-        let from = |i: usize| {
-            gw.spec.listeners[i]
-                .allowed_routes
-                .as_ref()
-                .and_then(|a| a.namespaces.as_ref())
-        };
-        assert!(from(0).is_none());
-        assert_eq!(
-            from(1).unwrap().from,
-            Some(GatewayListenersAllowedRoutesNamespacesFrom::All)
-        );
-        let sel = from(2).unwrap();
-        assert_eq!(
-            sel.from,
-            Some(GatewayListenersAllowedRoutesNamespacesFrom::Selector)
-        );
-        assert_eq!(
-            sel.selector
-                .as_ref()
-                .unwrap()
-                .match_labels
-                .as_ref()
-                .unwrap()["team"],
-            "db"
-        );
+pub trait RouteExt: Sized {
+    /// A parent gateway in the route's namespace.
+    fn parent(self, gateway: &str) -> Self;
+    fn parent_in(self, ns: &str, gateway: &str) -> Self;
+    /// Applies to the last parent.
+    fn section(self, name: &str) -> Self;
+    /// Applies to the last parent.
+    fn port(self, port: i32) -> Self;
+    /// Applies to the last rule, as do the other backend builders.
+    fn backend(self, service: &str, port: i32) -> Self;
+    fn weighted(self, service: &str, port: i32, weight: i32) -> Self;
+    fn backend_in(self, ns: &str, service: &str, port: i32) -> Self;
+    /// A backend of another group and kind, on port 5432.
+    fn backend_kind(self, group: &str, kind: &str, name: &str) -> Self;
+    /// Starts a new, empty rule.
+    fn second_rule(self) -> Self;
+    /// Creation time, in seconds after the epoch.
+    fn created(self, seconds: i64) -> Self;
+}
+
+fn last_parent(r: &mut TcpRoute) -> &mut TcpRouteParentRefs {
+    r.spec
+        .parent_refs
+        .as_mut()
+        .and_then(|p| p.last_mut())
+        .expect("add a parent first")
+}
+
+fn push_backend(mut r: TcpRoute, b: TcpRouteRulesBackendRefs) -> TcpRoute {
+    r.spec
+        .rules
+        .last_mut()
+        .expect("a route has a rule")
+        .backend_refs
+        .push(b);
+    r
+}
+
+impl RouteExt for TcpRoute {
+    fn parent(mut self, gateway: &str) -> Self {
+        self.spec
+            .parent_refs
+            .get_or_insert_with(Vec::new)
+            .push(TcpRouteParentRefs {
+                name: gateway.into(),
+                ..Default::default()
+            });
+        self
     }
 
-    #[test]
-    fn namespace_carries_labels() {
-        let n = ns("apps", &[("team", "db")]);
-        assert_eq!(n.metadata.name.as_deref(), Some("apps"));
-        assert_eq!(n.metadata.labels.unwrap()["team"], "db");
+    fn parent_in(mut self, ns: &str, gateway: &str) -> Self {
+        self = self.parent(gateway);
+        last_parent(&mut self).namespace = Some(ns.into());
+        self
+    }
+
+    fn section(mut self, name: &str) -> Self {
+        last_parent(&mut self).section_name = Some(name.into());
+        self
+    }
+
+    fn port(mut self, port: i32) -> Self {
+        last_parent(&mut self).port = Some(port);
+        self
+    }
+
+    fn backend(self, service: &str, port: i32) -> Self {
+        push_backend(
+            self,
+            TcpRouteRulesBackendRefs {
+                name: service.into(),
+                port: Some(port),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn weighted(self, service: &str, port: i32, weight: i32) -> Self {
+        push_backend(
+            self,
+            TcpRouteRulesBackendRefs {
+                name: service.into(),
+                port: Some(port),
+                weight: Some(weight),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn backend_in(self, ns: &str, service: &str, port: i32) -> Self {
+        push_backend(
+            self,
+            TcpRouteRulesBackendRefs {
+                name: service.into(),
+                namespace: Some(ns.into()),
+                port: Some(port),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn backend_kind(self, group: &str, kind: &str, name: &str) -> Self {
+        push_backend(
+            self,
+            TcpRouteRulesBackendRefs {
+                group: Some(group.into()),
+                kind: Some(kind.into()),
+                name: name.into(),
+                port: Some(5432),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn second_rule(mut self) -> Self {
+        self.spec.rules.push(TcpRouteRules::default());
+        self
+    }
+
+    fn created(mut self, seconds: i64) -> Self {
+        self.metadata.creation_timestamp = Some(time(seconds));
+        self
+    }
+}
+
+fn time(seconds: i64) -> Time {
+    Time(k8s_openapi::jiff::Timestamp::from_second(seconds).expect("in range"))
+}
+
+/// A `ClusterIP` service with TCP ports.
+pub fn service(ns: &str, name: &str, cluster_ip: &str, ports: &[i32]) -> Service {
+    Service {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".into()),
+            cluster_ip: Some(cluster_ip.into()),
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|&port| ServicePort {
+                        port,
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+pub trait ServiceExt: Sized {
+    /// Type `ExternalName`; the cluster IP is left as it was.
+    fn external_name(self) -> Self;
+}
+
+impl ServiceExt for Service {
+    fn external_name(mut self) -> Self {
+        let spec = self.spec.get_or_insert_with(ServiceSpec::default);
+        spec.type_ = Some("ExternalName".into());
+        spec.external_name = Some("db.example.com".into());
+        self
     }
 }

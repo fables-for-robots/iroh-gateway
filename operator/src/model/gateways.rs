@@ -7,8 +7,8 @@ use kube::ResourceExt;
 use super::generation;
 use super::{ClassModel, GatewayModel, ListenerModel, ObjRef, Reject, Settings, Snapshot};
 
-const ROUTE_GROUP: &str = "gateway.networking.k8s.io";
-const ROUTE_KIND: &str = "TCPRoute";
+pub(super) const ROUTE_GROUP: &str = "gateway.networking.k8s.io";
+pub(super) const ROUTE_KIND: &str = "TCPRoute";
 
 /// Every class with our controller name, by name.
 pub(super) fn classes(snapshot: &Snapshot, settings: &Settings) -> Vec<ClassModel> {
