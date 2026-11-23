@@ -230,11 +230,12 @@ mod tests {
     }
 
     /// Connects until the port refuses: a dropped set aborts its accept tasks without waiting.
+    /// An attempt that races the close can be accepted, or reset while half open.
     async fn refused(p: u16) -> std::io::ErrorKind {
         for _ in 0..50 {
             match TcpStream::connect(("127.0.0.1", p)).await {
-                Err(e) => return e.kind(),
-                Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(e) if e.kind() != std::io::ErrorKind::ConnectionReset => return e.kind(),
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
             }
         }
         panic!("port {p} still accepts");
