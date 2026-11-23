@@ -485,8 +485,8 @@ mod tests {
     #[test]
     fn long_names_give_short_socket_paths() {
         let g = gw(&"n".repeat(63), &"g".repeat(63));
-        let dir = format!("/{}", "d".repeat(69));
-        assert_eq!(dir.len(), 70);
+        let dir = format!("/{}", "d".repeat(59));
+        assert_eq!(dir.len(), crate::haproxy::MAX_RUNTIME_DIR_LEN);
         let m = model(
             vec![gateway(
                 g.clone(),
@@ -495,8 +495,9 @@ mod tests {
             vec![edge("e", 1, &g)],
         );
         let r = render(&m, Path::new(&dir));
+        // HAProxy appends `.<pid>.tmp` while it binds and refuses more than 93 bytes on macOS.
         for p in r.edges[0].sockets.values() {
-            assert!(p.socket.as_os_str().len() <= 103, "{}", p.socket.display());
+            assert!(p.socket.as_os_str().len() <= 90, "{}", p.socket.display());
         }
         assert_eq!(r.edges[0].sockets.len(), 1);
     }

@@ -774,11 +774,21 @@ async fn rendered_config_passes_haproxy_validation() {
         edges: Vec::new(),
         routes: Vec::new(),
     };
+    // The longest runtime directory the supervisor accepts, so that HAProxy binds the longest
+    // socket paths the render can give.
     let dir = short_dir();
-    let rendered = render(&model, dir.path());
+    let mut runtime = dir.path().as_os_str().to_owned();
+    runtime.push("/");
+    while runtime.len() < MAX_RUNTIME_DIR_LEN {
+        runtime.push("r");
+    }
+    assert_eq!(runtime.len(), 60);
+    let runtime = std::path::PathBuf::from(runtime);
+    let rendered = render(&model, &runtime);
     assert!(rendered.haproxy_cfg.contains("[fd00::12]:5432"));
-    let sup = Supervisor::start(opts(&dir), &rendered.haproxy_cfg)
-        .await
-        .unwrap();
+    let mut o = opts(&dir);
+    o.runtime_dir = runtime.clone();
+    let sup = Supervisor::start(o, &rendered.haproxy_cfg).await.unwrap();
+    assert!(exists(&runtime.join("s").join("idle.sock")));
     sup.shutdown().await;
 }
