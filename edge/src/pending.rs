@@ -1,17 +1,27 @@
 //! Which pending handshake to give up when too many are in progress.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
-/// Handshakes in progress, in start order, each under its source IP.
+/// Handshakes in progress, in start order, each under its source: an IPv4 address, or the /64
+/// prefix of an IPv6 address, since one host commonly holds a whole /64.
 ///
-/// At the cap, a newcomer evicts the oldest handshake of the source IP that holds the most
-/// slots; between IPs holding equally many, the one whose oldest handshake is the oldest. A
-/// flood from one IP then evicts only its own handshakes.
+/// At the cap, a newcomer evicts the oldest handshake of the source that holds the most slots;
+/// between sources holding equally many, the one whose oldest handshake is the oldest. A flood
+/// from one source then evicts only its own handshakes.
 pub(crate) struct PendingHandshakes<T> {
     cap: usize,
-    /// Oldest first; IPv4-mapped IPv6 addresses are stored as IPv4.
+    /// Oldest first, under [`source`] of the address.
     entries: VecDeque<(IpAddr, T)>,
+}
+
+/// The eviction key of `ip`: an IPv4 address (IPv4-mapped IPv6 included) as it is, an IPv6
+/// address with its low 64 bits zeroed.
+fn source(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        v4 => v4,
+    }
 }
 
 impl<T> PendingHandshakes<T> {
@@ -30,7 +40,7 @@ impl<T> PendingHandshakes<T> {
         } else {
             None
         };
-        self.entries.push_back((ip.to_canonical(), item));
+        self.entries.push_back((source(ip), item));
         evicted
     }
 
@@ -51,8 +61,8 @@ impl<T> PendingHandshakes<T> {
             *slots.entry(*ip).or_default() += 1;
         }
         let most = slots.values().copied().max()?;
-        // In start order, the first handshake from an IP holding `most` slots is that IP's
-        // oldest, and its IP is the one whose oldest is the oldest.
+        // In start order, the first handshake from a source holding `most` slots is that
+        // source's oldest, and its source is the one whose oldest is the oldest.
         let i = self.entries.iter().position(|(ip, _)| slots[ip] == most)?;
         self.entries.remove(i).map(|(_, item)| item)
     }
@@ -137,6 +147,36 @@ mod tests {
         set.admit(mapped, 4);
         // As one address A holds 3 slots and loses its oldest; split, B's oldest would go.
         assert_eq!(set.admit(IpAddr::V6(Ipv6Addr::LOCALHOST), 5), Some(2));
+    }
+
+    #[test]
+    fn an_ipv6_slash_64_counts_as_one_source() {
+        let prefix: u128 = 0x2001_0db8_0000_0001 << 64;
+        let other = IpAddr::V6(Ipv6Addr::from(0x2001_0db8_0000_0002_u128 << 64 | 1));
+        let mut set = PendingHandshakes::new(CAP);
+        assert_eq!(set.admit(other, 0), None);
+        let mut evicted = Vec::new();
+        for n in 1..=200u32 {
+            let ip = IpAddr::V6(Ipv6Addr::from(prefix | u128::from(n) << 32 | 7));
+            evicted.extend(set.admit(ip, n));
+        }
+        // The /64 evicts only its own handshakes, oldest first.
+        assert_eq!(evicted, (1..=200 - (CAP as u32 - 1)).collect::<Vec<_>>());
+        assert_eq!(
+            set.remove(|&n| n == 0),
+            Some(0),
+            "the other prefix was evicted"
+        );
+    }
+
+    #[test]
+    fn ipv4_addresses_are_not_grouped() {
+        // Neighbouring IPv4 addresses are separate sources: the tie rule applies.
+        let mut set = PendingHandshakes::new(CAP);
+        for n in 0..CAP as u32 {
+            assert_eq!(set.admit(ip(n), n), None);
+        }
+        assert_eq!(set.admit(ip(1000), 64), Some(0));
     }
 
     #[test]

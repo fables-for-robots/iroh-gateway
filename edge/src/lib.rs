@@ -32,7 +32,8 @@ const MAX_PENDING_HANDSHAKES: usize = 64;
 /// How long one handshake may take before it is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The source key of handshakes that arrive over a relay or custom transport, which carry no
-/// IP address; it cannot be the source address of a direct path.
+/// IP address; it cannot be the source address of a direct path. As a /64 prefix it is also the
+/// key of the IPv6 loopback address `::1`.
 const NO_IP: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 
 pub struct EdgeOptions {
@@ -206,10 +207,11 @@ impl Supervisor {
 
     /// Starts the handshake of a connection attempt once its address is validated. With
     /// `MAX_PENDING_HANDSHAKES` in progress, one is aborted to make room: the oldest of the
-    /// source IP holding the most of them (see [`PendingHandshakes`]). A host with a single
-    /// handshake in progress is evicted only when no IP holds more than one, so a flood from
-    /// fewer IPs evicts its own handshakes, not that host's. A flood from 63 or more other
-    /// distinct, validated source IPs can still evict that host's handshake. Handshakes over a
+    /// source holding the most of them, where a source is an IPv4 address or an IPv6 /64 prefix
+    /// (see [`PendingHandshakes`]). A host with a single handshake in progress is evicted only
+    /// when no source holds more than one, so a flood from fewer sources evicts its own
+    /// handshakes, not that host's. A flood from 63 or more other distinct, validated IPv4
+    /// addresses or IPv6 /64 prefixes can still evict that host's handshake. Handshakes over a
     /// relay or custom transport carry no IP and all share one key, `NO_IP`, so a flood
     /// through a relay evicts relayed handshakes, a relayed operator's among them.
     fn incoming(&mut self, incoming: Incoming) {
