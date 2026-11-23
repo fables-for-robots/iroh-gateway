@@ -581,12 +581,17 @@ impl<C: Connector> Link<C> {
             .drain(..=pos)
             .next_back()
             .expect("drains at least one");
-        let listeners: Vec<ListenerState> = status
+        // One entry per listener of the acknowledged config, in its order: the edge's first
+        // entry for that id. Extra and repeated entries are ignored.
+        let mut first: HashMap<u32, &BindState> = HashMap::with_capacity(cfg.listeners.len());
+        for ls in &status.listeners {
+            first.entry(ls.id).or_insert(&ls.state);
+        }
+        let listeners: Vec<ListenerState> = cfg
             .listeners
             .iter()
-            .filter_map(|ls| {
-                let l = cfg.listeners.iter().find(|l| l.id == ls.id)?;
-                let bound = match &ls.state {
+            .filter_map(|l| {
+                let bound = match first.get(&l.id)? {
                     BindState::Bound => Ok(()),
                     BindState::Error(e) => Err(truncate_status_text(e)),
                 };

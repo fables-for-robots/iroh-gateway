@@ -491,6 +491,56 @@ async fn long_close_reason_reaches_last_error_cut_and_clean() {
 }
 
 #[tokio::test]
+async fn status_entries_follow_the_config_and_duplicates_are_ignored() {
+    let echo = echo_server().await;
+    let (p, q) = (free_tcp_port(), free_tcp_port());
+    let fake = FakeEdge::bind().await;
+    let (link, _desired, _endpoint) = fake.link(&[(p, echo), (q, echo)], &[p, q]).await;
+    let mut s = fake.accept().await;
+    let cfg = s.read_config().await;
+    let (a, b) = (cfg.listeners[0].id, cfg.listeners[1].id);
+    // As many duplicates as one frame holds (5000 would exceed MAX_FRAME_LEN), the first entry
+    // for `a` an error, an unknown id, and `b` last.
+    let mut listeners = vec![ListenerStatus {
+        id: a,
+        state: BindState::Error("first".into()),
+    }];
+    listeners.extend((0..3500).map(|_| ListenerStatus {
+        id: a,
+        state: BindState::Bound,
+    }));
+    listeners.push(ListenerStatus {
+        id: 9999,
+        state: BindState::Bound,
+    });
+    listeners.push(ListenerStatus {
+        id: b,
+        state: BindState::Bound,
+    });
+    let status = Status {
+        generation: cfg.generation,
+        listeners,
+        version: "fake".into(),
+    };
+    write_frame(&mut s.control_send, &status).await.unwrap();
+    let st = wait_state(&link, |st| st.connected).await;
+    assert_eq!(
+        st.listeners,
+        [
+            ListenerState {
+                key: tcp(p),
+                bound: Err("first".into()),
+            },
+            ListenerState {
+                key: tcp(q),
+                bound: Ok(()),
+            },
+        ]
+    );
+    link.shutdown().await;
+}
+
+#[tokio::test]
 async fn static_connector_rejects_an_unknown_key() {
     let connector = StaticConnector::new(Default::default());
     let header = StreamHeader {
