@@ -56,8 +56,10 @@ send_line() {
 
 step "Gateway API CRDs"
 kubectl apply --server-side -f "$gateway_api_crds"
+# deploy/ creates a GatewayClass, so its CRD must be served before that is applied.
 kubectl wait --for=condition=Established --timeout=60s \
-  crd/gateways.gateway.networking.k8s.io crd/tcproutes.gateway.networking.k8s.io
+  crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
+  crd/tcproutes.gateway.networking.k8s.io
 
 step "deploy/ and the operator"
 kubectl apply -f "$root/deploy/"
