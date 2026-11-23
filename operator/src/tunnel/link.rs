@@ -35,6 +35,11 @@ use super::connector::Connector;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many sent but unacknowledged configs are kept to read a `Status` against.
 const MAX_UNACKED_CONFIGS: usize = 32;
+/// `last_error` while a session is up but the edge has not answered its first `Config` yet.
+const WAITING_FOR_STATUS: &str = "connected; waiting for the edge to answer the config";
+/// `last_error` after a session ended because the edge did not answer within
+/// [`LinkOptions::first_status_timeout`].
+const NO_STATUS: &str = "the edge accepted the connection but did not answer the config";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EdgeState {
@@ -46,9 +51,9 @@ pub struct EdgeState {
     pub listeners: Vec<ListenerState>,
     /// Why the link is not connected, in plain words; None while connected.
     ///
-    /// Set when a dial attempt fails or a session ends, so it is also None until the first
-    /// attempt has failed; a shutdown leaves it as it was. At most [`MAX_STATUS_TEXT`]
-    /// characters.
+    /// Set when a dial attempt fails, when a session starts ("connected; waiting for the edge to
+    /// answer the config") and when a session ends, so it is also None until the first attempt;
+    /// a shutdown leaves it as it was. At most [`MAX_STATUS_TEXT`] characters.
     pub last_error: Option<String>,
 }
 
@@ -92,6 +97,9 @@ pub struct LinkOptions {
     /// While the last `Status` the edge sent reports a listener it could not bind, the current
     /// listener list is sent again as a new `Config` this often.
     pub bind_retry: Duration,
+    /// How long a new session waits for the edge's first `Status`; without one it ends and the
+    /// link redials.
+    pub first_status_timeout: Duration,
 }
 
 impl LinkOptions {
@@ -109,6 +117,7 @@ impl LinkOptions {
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(30),
             bind_retry: Duration::from_secs(30),
+            first_status_timeout: Duration::from_secs(10),
         })
     }
 }
@@ -218,6 +227,8 @@ enum SessionError {
     Lost(ConnectionError),
     /// The control stream failed; the connection is still open.
     Control(anyhow::Error),
+    /// The edge sent no `Status` within `first_status_timeout`; the connection is still open.
+    NoStatus,
 }
 
 enum Ended {
@@ -352,6 +363,12 @@ impl<C: Connector> Link<C> {
             streams: JoinSet::new(),
             got_status: false,
         };
+        let waiting = Some(WAITING_FOR_STATUS.to_owned());
+        self.state.send_if_modified(|st| {
+            let changed = st.last_error != waiting;
+            st.last_error = waiting;
+            changed
+        });
         let end = tokio::select! {
             _ = &mut *shutdown => None,
             e = self.drive(&mut s) => Some(e),
@@ -411,6 +428,14 @@ impl<C: Connector> Link<C> {
                 );
                 why
             }
+            SessionError::NoStatus => {
+                warn!(
+                    timeout = ?self.opts.first_status_timeout,
+                    "{NO_STATUS}; dialing again"
+                );
+                conn.close(VarInt::from_u32(CLOSE_CONTROL_ENDED), b"no status");
+                NO_STATUS.to_owned()
+            }
         }
     }
 
@@ -436,9 +461,12 @@ impl<C: Connector> Link<C> {
         // such an error is acknowledged first.
         let mut retry = pin!(sleep(self.opts.bind_retry));
         let mut retry_armed = false;
+        // Ends the session unless the edge answers a config in time.
+        let mut first_status = pin!(sleep(self.opts.first_status_timeout));
         loop {
             tokio::select! {
                 e = conn.closed() => return SessionError::Lost(e),
+                () = &mut first_status, if !s.got_status => return SessionError::NoStatus,
                 (send, written) = &mut writing, if idle_send.is_none() => {
                     if let Err(e) = written {
                         return SessionError::Control(e.into());

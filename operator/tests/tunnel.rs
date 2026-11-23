@@ -301,6 +301,49 @@ fn no_address_and_no_relay_is_rejected() {
     assert_eq!(opts.backoff_min, Duration::from_millis(500));
     assert_eq!(opts.backoff_max, Duration::from_secs(30));
     assert_eq!(opts.bind_retry, Duration::from_secs(30));
+    assert_eq!(opts.first_status_timeout, Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn an_edge_that_never_answers_the_config_is_redialled() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let fake = FakeEdge::bind().await;
+    let limit = Duration::from_millis(500);
+    let (link, _desired, _endpoint) = fake
+        .link_with(&[(p, echo)], &[p], |opts| opts.first_status_timeout = limit)
+        .await;
+    let mut s = fake.accept().await;
+    let accepted = Instant::now();
+    s.read_config().await;
+    let waiting = wait_state(&link, |st| st.last_error.is_some()).await;
+    assert!(!waiting.connected);
+    assert_eq!(
+        waiting.last_error.as_deref(),
+        Some("connected; waiting for the edge to answer the config")
+    );
+
+    // No answer: the link closes this connection and dials again.
+    let gave_up = wait_state(&link, |st| {
+        st.last_error.as_deref()
+            == Some("the edge accepted the connection but did not answer the config")
+    })
+    .await;
+    assert!(!gave_up.connected);
+    assert!(accepted.elapsed() >= limit, "{:?}", accepted.elapsed());
+    timeout(STEP, s.conn.closed())
+        .await
+        .expect("the link kept the connection");
+    let mut again = fake.accept().await;
+    let cfg = again.read_config().await;
+    again.reply(&cfg).await;
+    let up = wait_state(&link, |st| st.connected).await;
+    assert_eq!(up.last_error, None);
+    // Answered: the deadline no longer applies.
+    tokio::time::sleep(limit * 2).await;
+    assert!(link.state().borrow().connected);
+    assert!(again.conn.close_reason().is_none());
+    link.shutdown().await;
 }
 
 #[tokio::test]
