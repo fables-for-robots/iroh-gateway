@@ -323,7 +323,14 @@ impl<C: Connector> Link<C> {
                 );
             }
         }
-        s.streams.shutdown().await;
+        s.streams.abort_all();
+        while let Some(done) = s.streams.join_next().await {
+            if let Err(e) = done
+                && e.is_panic()
+            {
+                error!("stream task panicked: {e}");
+            }
+        }
         self.state.send_if_modified(|st| {
             let changed = st.connected || !st.listeners.is_empty();
             st.connected = false;

@@ -25,7 +25,7 @@ use session::{ApplyRequest, Session};
 /// Streams the operator may have open towards the edge: it needs only the control stream.
 const OPERATOR_STREAMS: u32 = 4;
 const APPLY_QUEUE: usize = 16;
-/// Handshakes in progress beyond which new connection attempts are refused unanswered.
+/// Handshakes in progress beyond which new connection attempts are refused at once.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 /// How long one handshake may take before it is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -269,7 +269,10 @@ impl Supervisor {
         if let Some(session) = self.current.take() {
             session.close(CLOSE_SHUTDOWN, b"shutdown");
         }
-        self.handshakes.shutdown().await;
+        self.handshakes.abort_all();
+        while let Some(done) = self.handshakes.join_next().await {
+            log_panic(done, "handshake task");
+        }
         self.listeners.close_all().await;
         self.endpoint.close().await;
         info!("edge stopped");

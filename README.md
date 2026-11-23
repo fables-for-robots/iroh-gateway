@@ -126,8 +126,8 @@ A relative `key_file` is taken relative to the directory of the configuration fi
 
 ## Running in production
 
-- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection). Both binaries raise their soft open-file limit to the hard limit at start (on macOS to at most 10240) and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
-- **Ports below 1024.** Listening on a public port below 1024 needs `CAP_NET_BIND_SERVICE` or root on the edge.
+- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection). `iroh-gateway-edge run` and `iroh-gateway-operator static` raise their soft open-file limit to the hard limit at start (on macOS to at most 10240) and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
+- **Ports below 1024.** On Linux, a public port below 1024 needs `CAP_NET_BIND_SERVICE` or root on the edge.
 - **The iroh port.** The edge's iroh UDP port (`--iroh-listen`, default 7842) must be reachable from the operator for a direct connection.
 
 ## Trust
