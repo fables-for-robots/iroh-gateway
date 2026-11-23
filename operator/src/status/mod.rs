@@ -265,7 +265,7 @@ fn gateway_status(g: &GatewayModel, facts: &Facts) -> GatewayStatusOut {
     let mut listeners: Vec<ListenerStatusOut> = g
         .listeners
         .iter()
-        .map(|l| listener_status(g, l, facts, any_ready, &edge_keys))
+        .map(|l| listener_status(g, l, facts, &edge_keys))
         .collect();
     listeners.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -309,7 +309,6 @@ fn listener_status(
     g: &GatewayModel,
     l: &ListenerModel,
     facts: &Facts,
-    any_ready: bool,
     edge_keys: &[ObjRef],
 ) -> ListenerStatusOut {
     let conflicted = match &l.conflicted {
@@ -329,27 +328,8 @@ fn listener_status(
         )
     } else if let Err(e) = &facts.haproxy {
         cond("Programmed", false, "Invalid", e.clone())
-    } else if !any_ready {
-        let errors: Vec<String> = edge_keys
-            .iter()
-            .filter_map(|k| {
-                let state = facts.edges.get(k)?;
-                match tcp_port(state, l.port)? {
-                    ListenerState { bound: Err(e), .. } => {
-                        Some(format!("edge {k} cannot bind port {}: {e}", l.port))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-        let message = if errors.is_empty() {
-            "no edge is ready for this Gateway".to_owned()
-        } else {
-            errors.join("; ")
-        };
-        cond("Programmed", false, "Pending", message)
     } else {
-        cond("Programmed", true, "Programmed", "")
+        listener_programmed(l, facts, edge_keys)
     };
     ListenerStatusOut {
         name: l.name.clone(),
@@ -362,6 +342,56 @@ fn listener_status(
             programmed,
         ],
     }
+}
+
+/// `Programmed` of a listener that is valid, of an accepted Gateway, with HAProxy fine: True once
+/// an accepted, connected edge of the Gateway reports the listener's port bound, or, for a
+/// listener that is not serving, once one is connected.
+fn listener_programmed(l: &ListenerModel, facts: &Facts, edge_keys: &[ObjRef]) -> Cond {
+    let serving = l.serving();
+    let connected = |k: &ObjRef| facts.edges.get(k).filter(|s| s.connected);
+    let ready = edge_keys.iter().filter_map(connected).any(|state| {
+        !serving
+            || matches!(
+                tcp_port(state, l.port),
+                Some(ListenerState { bound: Ok(()), .. })
+            )
+    });
+    if ready {
+        return cond("Programmed", true, "Programmed", "");
+    }
+    if edge_keys.is_empty() {
+        return cond(
+            "Programmed",
+            false,
+            "Pending",
+            "no accepted Edge is bound to this Gateway",
+        );
+    }
+    let mut bind_errors = Vec::new();
+    let mut others = Vec::new();
+    for k in edge_keys {
+        match facts.edges.get(k) {
+            Some(state) if state.connected => match tcp_port(state, l.port) {
+                Some(ListenerState { bound: Err(e), .. }) => {
+                    bind_errors.push(format!("edge {k} cannot bind port {}: {e}", l.port));
+                }
+                _ => others.push(format!("edge {k} has not reported port {} yet", l.port)),
+            },
+            state => {
+                let why = state
+                    .and_then(|s| s.last_error.as_deref())
+                    .unwrap_or(NOT_STARTED);
+                others.push(format!("edge {k} is not connected: {why}"));
+            }
+        }
+    }
+    let message = if bind_errors.is_empty() {
+        others.join("; ")
+    } else {
+        bind_errors.join("; ")
+    };
+    cond("Programmed", false, "Pending", message)
 }
 
 fn edge_status(model: &Model, e: &EdgeModel, facts: &Facts) -> EdgeStatusOut {
@@ -394,21 +424,28 @@ fn edge_status(model: &Model, e: &EdgeModel, facts: &Facts) -> EdgeStatusOut {
         .map(serving_ports)
         .unwrap_or_default();
     let programmed = match state {
-        Some(s) if connected => match first_unbound(s, &ports) {
-            None => cond("Programmed", true, "Programmed", ""),
-            Some((port, Some(why))) => cond(
-                "Programmed",
-                false,
-                "BindFailed",
-                format!("port {port} is not bound: {why}"),
-            ),
-            Some((port, None)) => cond(
-                "Programmed",
-                false,
-                "BindFailed",
-                format!("port {port} is not bound: not reported yet"),
-            ),
-        },
+        Some(s) if connected => {
+            // A port the edge reported as failed comes before one it has not reported yet.
+            let failed = ports.iter().find_map(|&port| match tcp_port(s, port) {
+                Some(ListenerState { bound: Err(e), .. }) => Some((port, e)),
+                _ => None,
+            });
+            match (failed, first_unbound(s, &ports)) {
+                (Some((port, why)), _) => cond(
+                    "Programmed",
+                    false,
+                    "BindFailed",
+                    format!("port {port} is not bound: {why}"),
+                ),
+                (None, Some((port, _))) => cond(
+                    "Programmed",
+                    false,
+                    "Pending",
+                    format!("port {port} not reported yet"),
+                ),
+                (None, None) => cond("Programmed", true, "Programmed", ""),
+            }
+        }
         _ => cond("Programmed", false, "NotConnected", not_connected_message),
     };
     let mut listeners: Vec<EdgeListenerStatus> = state
@@ -719,10 +756,135 @@ mod tests {
         assert_eq!(ports, [80, 81]);
         assert!(!e.listeners[0].bound);
         assert_eq!(e.listeners[0].message.as_deref(), Some("address in use"));
-        // The listener without an error is not told about the other's error.
+        // The listener whose port is bound is programmed and not told about the other's error.
         let b = get(&g.listeners[1].conditions, "Programmed");
-        check(b, false, "Pending");
+        check(b, true, "Programmed");
         assert!(!b.message.contains("address in use"), "{}", b.message);
+    }
+
+    #[test]
+    fn listener_programmed_needs_its_own_port_bound() {
+        let gw = || {
+            gateway(
+                vec![listener("a", 80, true), listener("b", 81, true)],
+                &["e", "f"],
+            )
+        };
+        let m = model(gw(), vec![edge("e", Ok(())), edge("f", Ok(()))]);
+        let programmed = |d: &DesiredStatus, i: usize| -> Cond {
+            get(&d.gateways[0].listeners[i].conditions, "Programmed").clone()
+        };
+        // Each port is bound by a different edge: both listeners are programmed, the Gateway
+        // is not (no edge has every port).
+        let d = compute(
+            &m,
+            &facts(vec![
+                ("e", up(vec![bound(80, Ok(()))])),
+                ("f", up(vec![bound(81, Ok(()))])),
+            ]),
+        );
+        check(&programmed(&d, 0), true, "Programmed");
+        check(&programmed(&d, 1), true, "Programmed");
+        check(
+            get(&d.gateways[0].conditions, "Programmed"),
+            false,
+            "Pending",
+        );
+
+        // Port 81 not reported by a connected edge, the other edge down.
+        let d = compute(
+            &m,
+            &facts(vec![
+                ("e", up(vec![bound(80, Ok(()))])),
+                ("f", down(Some("dial timed out"))),
+            ]),
+        );
+        check(&programmed(&d, 0), true, "Programmed");
+        let b = programmed(&d, 1);
+        check(&b, false, "Pending");
+        assert!(
+            b.message.contains("edge ns/e has not reported port 81 yet"),
+            "{}",
+            b.message
+        );
+        assert!(
+            b.message
+                .contains("edge ns/f is not connected: dial timed out"),
+            "{}",
+            b.message
+        );
+
+        // A bind error for the port is what the message gives.
+        let d = compute(
+            &m,
+            &facts(vec![
+                (
+                    "e",
+                    up(vec![bound(80, Ok(())), bound(81, Err("address in use"))]),
+                ),
+                ("f", down(Some("dial timed out"))),
+            ]),
+        );
+        let b = programmed(&d, 1);
+        check(&b, false, "Pending");
+        assert_eq!(b.message, "edge ns/e cannot bind port 81: address in use");
+
+        // No edge at all.
+        let d = compute(
+            &model(gateway(vec![listener("a", 80, true)], &[]), vec![]),
+            &facts(vec![]),
+        );
+        let a = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        check(a, false, "Pending");
+        assert!(a.message.contains("no accepted Edge"), "{}", a.message);
+    }
+
+    #[test]
+    fn listener_without_a_route_is_programmed_once_an_edge_is_connected() {
+        let m = model(
+            gateway(vec![listener("idle", 90, false)], &["e"]),
+            vec![edge("e", Ok(()))],
+        );
+        let d = compute(&m, &facts(vec![("e", up(vec![]))]));
+        check(
+            get(&d.gateways[0].listeners[0].conditions, "Programmed"),
+            true,
+            "Programmed",
+        );
+        let d = compute(&m, &facts(vec![("e", down(Some("boom")))]));
+        let l = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        check(l, false, "Pending");
+        assert!(l.message.contains("boom"), "{}", l.message);
+    }
+
+    #[test]
+    fn edge_is_pending_until_it_reports_and_bind_failed_only_on_a_reported_failure() {
+        let m = model(
+            gateway(
+                vec![listener("a", 80, true), listener("b", 81, true)],
+                &["e"],
+            ),
+            vec![edge("e", Ok(()))],
+        );
+        let edge_programmed = |st: EdgeState| -> Cond {
+            let d = compute(&m, &facts(vec![("e", st)]));
+            get(&d.edges[0].conditions, "Programmed").clone()
+        };
+        let p = edge_programmed(up(vec![bound(80, Ok(()))]));
+        check(&p, false, "Pending");
+        assert_eq!(p.message, "port 81 not reported yet");
+        let p = edge_programmed(up(vec![bound(80, Ok(())), bound(81, Err("in use"))]));
+        check(&p, false, "BindFailed");
+        assert!(
+            p.message.contains("81") && p.message.contains("in use"),
+            "{}",
+            p.message
+        );
+        // A reported failure wins over a port not reported yet.
+        let p = edge_programmed(up(vec![bound(81, Err("in use"))]));
+        check(&p, false, "BindFailed");
+        let p = edge_programmed(up(vec![bound(80, Ok(())), bound(81, Ok(()))]));
+        check(&p, true, "Programmed");
     }
 
     #[test]
@@ -733,7 +895,7 @@ mod tests {
         );
         let d = compute(&m, &facts(vec![("e", up(vec![]))]));
         let bp = get(&d.edges[0].conditions, "Programmed");
-        check(bp, false, "BindFailed");
+        check(bp, false, "Pending");
         assert!(bp.message.contains("not reported yet"), "{}", bp.message);
         let p = get(&d.gateways[0].conditions, "Programmed");
         assert!(

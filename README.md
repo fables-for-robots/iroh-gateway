@@ -353,12 +353,12 @@ Every condition below is also visible with `kubectl describe`. A False condition
 | Listener | `Accepted` | False with `UnsupportedProtocol` (only `TCP`) or `PortUnavailable` (not between 1 and 65535). |
 | | `Conflicted` | True with `HostnameConflict` (several listeners on one port with the same protocol) or `ProtocolConflict` (listeners on one port with different protocols); both listeners are then unusable. |
 | | `ResolvedRefs` | False with `InvalidRouteKinds` (`allowedRoutes.kinds` does not include `TCPRoute`). |
-| | `Programmed` | False with `Invalid` (the listener, its Gateway, or HAProxy is at fault) or `Pending` (no edge is ready; the message names edges that cannot bind the port). |
+| | `Programmed` | False with `Invalid` (the listener, its Gateway, or HAProxy is at fault) or `Pending` (no connected edge reports this listener's port open, or, for a listener without a route, no edge is connected; the message names the edges that cannot bind the port, or those not connected and those that have not reported it). True as soon as one edge has the port open, whatever the Gateway's other ports do. |
 | `TCPRoute`, per parent | `Accepted` | False with `NoMatchingParent` (no listener matches `sectionName` and `port`), `NotAllowedByListeners` (no usable listener admits routes from the route's namespace) or `UnsupportedValue` (more than one rule, or another `TCPRoute` already holds the listener). |
 | | `ResolvedRefs` | False with `InvalidKind` (the backend is not a core `Service`), `RefNotPermitted` (the Service is in another namespace), `BackendNotFound` (no such Service, an `ExternalName` Service, no cluster IP, or no TCP port with that number) or `UnsupportedValue` (the backend has no valid port). |
 | `Edge` | `Accepted` | False with `NamespaceNotAllowed`, `InvalidEndpointId`, `NoAddress` (`address` is required while the operator uses no relay), `NoPublicAddress` (no `address` and no `publicAddresses`), `InvalidPublicAddress` (an entry of `publicAddresses` is neither an IP address nor a DNS name; a port is not allowed), `InvalidAddress`, `GatewayNotFound` (no `Gateway` of ours with `gatewayRef.name` in the same namespace), `GatewayNotAccepted`, or `DuplicateEndpointId` (an older `Edge` has the same id). |
 | | `Connected` | False with `NotConnected`; the message says why, for example that the link has not started yet or the last connection error. An edge that is not accepted is never connected. |
-| | `Programmed` | False with `NotConnected` or `BindFailed` (the edge could not open a port; the message names the port and the error). |
+| | `Programmed` | False with `NotConnected`, `Pending` (connected, but the edge has not reported a port yet) or `BindFailed` (the edge could not open a port; the message names the port and the error). |
 
 `Edge.status.listeners` lists, per port, whether the edge reports it bound. `Edge.status.gatewayEndpointId` is the operator's id.
 
