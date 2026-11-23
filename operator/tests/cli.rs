@@ -302,3 +302,54 @@ fn run_needs_a_namespace() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--namespace"), "stderr: {stderr}");
 }
+
+#[test]
+fn run_stops_on_sigterm_during_start_up() {
+    // An API server that takes connections and never answers: the identity load hangs.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let kubeconfig = home.path().join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             clusters:\n\
+             - name: silent\n  \
+               cluster:\n    \
+                 server: http://{}\n\
+             users:\n\
+             - name: nobody\n  \
+               user: {{}}\n\
+             contexts:\n\
+             - name: silent\n  \
+               context:\n    \
+                 cluster: silent\n    \
+                 user: nobody\n\
+             current-context: silent\n",
+            silent.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let runtime = common::short_dir();
+    let mut cmd = bin();
+    cmd.env_remove("KUBERNETES_SERVICE_HOST")
+        .env_remove("KUBERNETES_SERVICE_PORT")
+        .env("HOME", home.path())
+        .env("KUBECONFIG", &kubeconfig)
+        .env("RUST_LOG", "info")
+        .args(["run", "--namespace", "ns", "--runtime-dir"])
+        .arg(runtime.path());
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    let (mut child, lines) = spawn_with_nofile(cmd, soft, hard);
+    // Logged just before the client is built.
+    line_with(&lines, "open file limit is");
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    let status = child.terminate();
+    assert!(status.success(), "{status:?}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // Nothing was started: no HAProxy directory.
+    assert!(!runtime.path().join("haproxy").exists());
+    drop(silent);
+}

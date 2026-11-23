@@ -115,6 +115,10 @@ impl Engine {
     /// Links of edges that left the plan, or whose id or address changed, are shut down in any
     /// case. Only when HAProxy took the configuration are links started and ports added; when it
     /// did not, each link keeps only the ports whose socket the old and the new plan share.
+    ///
+    /// Not meant to be cancelled, and the reconcile loop never cancels it. A cancelled call can
+    /// leave the links of the edges that left the plan removed while the other links keep their
+    /// old socket tables, and HAProxy may already run the new configuration.
     pub async fn apply(&mut self, rendered: Rendered) {
         let gone: Vec<ObjRef> = self
             .links

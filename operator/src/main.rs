@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -224,13 +225,22 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
         gateway_namespaces,
         relay: args.relay.clone(),
     };
+    // First, so that a signal at any point from here on stops the operator cleanly.
+    let shutdown = shutdown_signals()?;
+    let mut shutdown = pin!(shutdown);
     let limit = raise_open_file_limit()?;
     info!("open file limit is {limit}");
 
     let client = kube::Client::try_default()
         .await
         .context("no Kubernetes configuration: neither in-cluster nor from a kubeconfig")?;
-    let key = identity::load_or_create(&client, &args.namespace, &args.identity_secret).await?;
+    let key = tokio::select! {
+        key = identity::load_or_create(&client, &args.namespace, &args.identity_secret) => key?,
+        () = &mut shutdown => {
+            info!("stopped during start-up");
+            return Ok(());
+        }
+    };
     let endpoint = bind_endpoint(key.clone(), &args.relay).await?;
     info!(id = %key.public(), namespaces = ?settings.gateway_namespaces, "operator started");
 
@@ -241,16 +251,24 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     supervisor.haproxy_bin = args.haproxy_bin;
     // Nothing is served until the stores have synced and the first pass has run.
     let initial = render(&model::build(&Snapshot::default(), &settings), &haproxy_dir);
-    let mut engine = Engine::start(
-        endpoint.clone(),
-        EngineOptions::new(supervisor, args.relay),
-        initial,
-    )
-    .await?;
+    let started = tokio::select! {
+        engine = Engine::start(
+            endpoint.clone(),
+            EngineOptions::new(supervisor, args.relay),
+            initial,
+        ) => engine,
+        () = &mut shutdown => {
+            // Dropping the unfinished start kills the HAProxy it may have started.
+            info!("stopped during start-up");
+            endpoint.close().await;
+            return Ok(());
+        }
+    };
+    let mut engine = started?;
     let stores = Stores::start(client.clone());
     let writer = StatusWriter::new(client, args.controller_name);
     let opts = ControllerOptions::new(settings, &haproxy_dir);
-    let shutdown = shutdown_signals()?;
+    // A signal that came since the engine started ends the loop at once.
     let ended = run_loop(stores, &mut engine, writer, opts, shutdown).await;
     info!("shutting down");
     engine.shutdown().await;

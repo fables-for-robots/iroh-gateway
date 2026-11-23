@@ -88,8 +88,8 @@ impl<A: Applier> Applier for &mut A {
 /// Nothing is applied before every store has finished its first list. Then one pass runs, and
 /// another after each change in the stores or in the applier, or once the status retry delay
 /// has passed after a pass whose status write failed; changes that arrive within `debounce` of
-/// the first trigger are taken in the same pass. A pass is never interrupted:
-/// `shutdown` is noticed between passes.
+/// the first trigger are taken in the same pass. A pass's apply is never interrupted; its
+/// status write is cut short by `shutdown`, which is otherwise noticed between passes.
 pub async fn run_loop(
     mut source: impl SnapshotSource,
     mut applier: impl Applier,
@@ -115,7 +115,12 @@ pub async fn run_loop(
         let model = model::build(&snapshot, &opts.settings);
         applier.apply(render(&model, &opts.runtime_dir)).await;
         let desired = status::compute(&model, &applier.facts());
-        let written = sink.write(&desired, &snapshot).await;
+        // Each status request has a timeout, but the write is still raced against shutdown: a
+        // pass with many slow writes would otherwise hold up SIGTERM.
+        let written = tokio::select! {
+            written = sink.write(&desired, &snapshot) => written,
+            () = &mut shutdown => return Ok(()),
+        };
         status_retry = (!written).then(|| match status_retry {
             None => opts.status_retry_min,
             Some(delay) => (delay * 2).min(opts.status_retry_max),
@@ -162,6 +167,7 @@ mod tests {
     use std::future::pending;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::{mpsc, oneshot, watch};
@@ -236,16 +242,21 @@ mod tests {
     }
 
     /// Records each write and when it happened; answers from `results`, true once it is empty.
+    /// While `hang` is set, a write is recorded and then never returns.
     struct FakeSink {
         writes: Arc<Mutex<Vec<DesiredStatus>>>,
         times: Arc<Mutex<Vec<Instant>>>,
         results: Arc<Mutex<VecDeque<bool>>>,
+        hang: Arc<AtomicBool>,
     }
 
     impl StatusSink for FakeSink {
         async fn write(&mut self, desired: &DesiredStatus, _snapshot: &Snapshot) -> bool {
             self.writes.lock().unwrap().push(desired.clone());
             self.times.lock().unwrap().push(Instant::now());
+            if self.hang.load(Ordering::SeqCst) {
+                pending::<()>().await;
+            }
             self.results.lock().unwrap().pop_front().unwrap_or(true)
         }
     }
@@ -260,6 +271,7 @@ mod tests {
         writes: Arc<Mutex<Vec<DesiredStatus>>>,
         times: Arc<Mutex<Vec<Instant>>>,
         results: Arc<Mutex<VecDeque<bool>>>,
+        hang: Arc<AtomicBool>,
         shutdown: Option<oneshot::Sender<()>>,
         task: JoinHandle<anyhow::Result<()>>,
     }
@@ -281,6 +293,7 @@ mod tests {
             let writes = Arc::new(Mutex::new(Vec::new()));
             let times = Arc::new(Mutex::new(Vec::new()));
             let results = Arc::new(Mutex::new(results.iter().copied().collect()));
+            let hang = Arc::new(AtomicBool::new(false));
             let source = FakeSource {
                 synced,
                 changes: changes_rx,
@@ -298,6 +311,7 @@ mod tests {
                 writes: writes.clone(),
                 times: times.clone(),
                 results: results.clone(),
+                hang: hang.clone(),
             };
             let mut opts = ControllerOptions::new(settings(&["gw"]), "/run/igw");
             customize(&mut opts);
@@ -313,6 +327,7 @@ mod tests {
                 writes,
                 times,
                 results,
+                hang,
                 shutdown: Some(shutdown),
                 task,
             }
@@ -434,6 +449,19 @@ mod tests {
         rig.stop().await.unwrap();
 
         let rig = Rig::start();
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ends_the_loop_during_a_write_that_never_returns() {
+        let rig = Rig::start();
+        rig.synced().await;
+        rig.hang.store(true, Ordering::SeqCst);
+        rig.changes.send(()).unwrap();
+        sleep(Duration::from_secs(1)).await;
+        // The second pass is stuck in its write.
+        assert_eq!((rig.applies(), rig.writes()), (2, 2));
+        // `stop` fails unless the loop ends within 1 s of the shutdown.
         rig.stop().await.unwrap();
     }
 

@@ -5,6 +5,8 @@
 //! whole, never in part. Whether an object needs a write is decided against the object in the
 //! snapshot, with `lastTransitionTime` values ignored.
 
+use std::time::Duration;
+
 use gateway_api::gatewayclasses::v1::GatewayClass;
 use gateway_api::gateways::v1::{
     Gateway, GatewayStatusAddresses, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
@@ -30,6 +32,9 @@ use crate::status::{
 /// The group of the route kinds a listener reports as supported.
 const ROUTE_GROUP: &str = "gateway.networking.k8s.io";
 
+/// How long one status request may take; a request that takes longer counts as failed.
+pub const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Where the reconcile loop sends the status it computed.
 pub trait StatusSink: Send {
     /// True when every write of this pass succeeded or was not needed; false when at least one
@@ -45,6 +50,8 @@ pub trait StatusSink: Send {
 pub struct StatusWriter {
     client: Client,
     controller_name: String,
+    /// [`STATUS_REQUEST_TIMEOUT`]; shorter in tests.
+    request_timeout: Duration,
 }
 
 impl StatusWriter {
@@ -52,32 +59,45 @@ impl StatusWriter {
         Self {
             client,
             controller_name,
+            request_timeout: STATUS_REQUEST_TIMEOUT,
         }
     }
 
-    /// Sends one patch; true when it counts as written (see [`written`]).
+    /// Sends one patch; true when it counts as written (see [`written`]). A patch without an
+    /// answer within the request timeout counts as failed.
     async fn send(&self, patch: StatusPatch) -> bool {
         let params = PatchParams::default();
         let body = Patch::Merge(&patch.body);
-        let result = match &patch.target {
-            Target::GatewayClass(name) => Api::<GatewayClass>::all(self.client.clone())
-                .patch_status(name, &params, &body)
-                .await
-                .map(drop),
-            Target::Gateway(key) => Api::<Gateway>::namespaced(self.client.clone(), &key.namespace)
-                .patch_status(&key.name, &params, &body)
-                .await
-                .map(drop),
-            Target::TcpRoute(key) => {
-                Api::<TcpRoute>::namespaced(self.client.clone(), &key.namespace)
+        let request = async {
+            match &patch.target {
+                Target::GatewayClass(name) => Api::<GatewayClass>::all(self.client.clone())
+                    .patch_status(name, &params, &body)
+                    .await
+                    .map(drop),
+                Target::Gateway(key) => {
+                    Api::<Gateway>::namespaced(self.client.clone(), &key.namespace)
+                        .patch_status(&key.name, &params, &body)
+                        .await
+                        .map(drop)
+                }
+                Target::TcpRoute(key) => {
+                    Api::<TcpRoute>::namespaced(self.client.clone(), &key.namespace)
+                        .patch_status(&key.name, &params, &body)
+                        .await
+                        .map(drop)
+                }
+                Target::Edge(key) => Api::<Edge>::namespaced(self.client.clone(), &key.namespace)
                     .patch_status(&key.name, &params, &body)
                     .await
-                    .map(drop)
+                    .map(drop),
             }
-            Target::Edge(key) => Api::<Edge>::namespaced(self.client.clone(), &key.namespace)
-                .patch_status(&key.name, &params, &body)
-                .await
-                .map(drop),
+        };
+        let Ok(result) = tokio::time::timeout(self.request_timeout, request).await else {
+            warn!(
+                object = %patch.target,
+                "writing status failed: no answer within {:?}", self.request_timeout
+            );
+            return false;
         };
         match &result {
             Ok(()) => debug!(object = %patch.target, "wrote status"),
@@ -726,6 +746,35 @@ mod tests {
         };
         let desired = compute(&build(&snapshot, &settings(&["gw"])), &facts);
         (snapshot, desired)
+    }
+
+    /// A request to an API server that takes the connection and never answers counts as failed
+    /// once the request timeout has passed (shortened here from `STATUS_REQUEST_TIMEOUT`).
+    #[tokio::test]
+    async fn a_request_without_an_answer_times_out_and_fails() {
+        // The kernel completes the handshake; nothing ever reads the request.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let client = Client::try_from(kube::Config::new(url)).unwrap();
+        let mut writer = StatusWriter::new(client, CONTROLLER.into());
+        assert_eq!(writer.request_timeout, STATUS_REQUEST_TIMEOUT);
+        let limit = Duration::from_millis(300);
+        writer.request_timeout = limit;
+        let (snapshot, desired) = class_world(None);
+        let started = tokio::time::Instant::now();
+        let written =
+            tokio::time::timeout(Duration::from_secs(5), writer.write(&desired, &snapshot))
+                .await
+                .expect("the write did not end");
+        assert!(!written);
+        let waited = started.elapsed();
+        assert!(
+            waited >= limit && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        drop(silent);
     }
 
     #[tokio::test]
