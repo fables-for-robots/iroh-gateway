@@ -1,6 +1,12 @@
 //! `splice` between a loopback TCP socket and one QUIC stream between two loopback endpoints.
 
-use std::{future::Future, io::ErrorKind, time::Duration};
+use std::{
+    future::Future,
+    io::{self, ErrorKind},
+    pin::Pin,
+    task::{Context, Poll, ready},
+    time::Duration,
+};
 
 use iroh::{
     Endpoint, EndpointAddr, SecretKey,
@@ -8,13 +14,14 @@ use iroh::{
 };
 use iroh_gateway_proto::{
     ALPN, RESET_ABORTED,
-    splice::{SpliceEnd, SpliceStats, splice},
+    splice::{LocalStream, SpliceEnd, SpliceStats, splice},
     transport::{Relay, Role, endpoint_builder},
 };
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::oneshot,
     task::JoinHandle,
 };
 
@@ -71,9 +78,67 @@ struct Rig {
     splice: JoinHandle<SpliceStats>,
 }
 
-async fn rig() -> Rig {
+/// tcp_b as splice's local side, taking `room` more bytes and then none, as if tcp_a had
+/// stopped reading and every buffer on the way were full. Signals `stalled` when it gets
+/// there. Reads, shutdown and `abort` go to the real socket.
+struct StallingLocal {
+    tcp: TcpStream,
+    room: usize,
+    stalled: Option<oneshot::Sender<()>>,
+}
+
+impl AsyncRead for StallingLocal {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for StallingLocal {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        if this.room == 0 {
+            if let Some(stalled) = this.stalled.take() {
+                let _ = stalled.send(());
+            }
+            // Never woken: only an abort can end a splice stuck here.
+            return Poll::Pending;
+        }
+        let n = buf.len().min(this.room);
+        let written = ready!(Pin::new(&mut this.tcp).poll_write(cx, &buf[..n]));
+        if let Ok(written) = written {
+            this.room -= written;
+        }
+        Poll::Ready(written)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_shutdown(cx)
+    }
+}
+
+impl LocalStream for StallingLocal {
+    fn abort(self) {
+        self.tcp.abort();
+    }
+}
+
+/// Spawns `splice(local, ..)` on the near ends of one stream; returns the far ends.
+async fn spliced<L: LocalStream>(
+    local: L,
+) -> (SendStream, RecvStream, QuicPair, JoinHandle<SpliceStats>) {
     let quic = quic_pair().await;
-    let (tcp_a, tcp_b) = tcp_pair().await;
     // A stream reaches the peer only once it carries something, so the near side sends a
     // one-byte stand-in for a stream header before splicing.
     let (mut send, recv) = within(quic.near.open_bi()).await.unwrap();
@@ -82,13 +147,35 @@ async fn rig() -> Rig {
     let mut header = [0; 1];
     within(far_recv.read_exact(&mut header)).await.unwrap();
     assert_eq!(&header, b"h");
-    let splice = tokio::spawn(splice(tcp_b, send, recv));
+    let splice = tokio::spawn(splice(local, send, recv));
+    (far_send, far_recv, quic, splice)
+}
+
+async fn rig_from<L: LocalStream>(tcp_a: TcpStream, local_b: L) -> Rig {
+    let (far_send, far_recv, quic, splice) = spliced(local_b).await;
     Rig {
         tcp_a,
         far_send,
         far_recv,
         quic,
         splice,
+    }
+}
+
+async fn rig() -> Rig {
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    rig_from(tcp_a, tcp_b).await
+}
+
+/// Reads until `tcp_a` fails, skipping data that arrived before the reset; EOF fails the test.
+async fn read_until_reset(tcp_a: &mut TcpStream) -> io::Error {
+    let mut buf = vec![0; 64 << 10];
+    loop {
+        match within(tcp_a.read(&mut buf)).await {
+            Ok(0) => panic!("clean EOF where an abort was expected"),
+            Ok(_) => continue,
+            Err(err) => return err,
+        }
     }
 }
 
@@ -247,4 +334,93 @@ async fn large_transfer_is_intact() {
     let stats = within(splice).await.unwrap();
     assert_eq!(stats.end, SpliceEnd::Clean);
     assert_eq!((stats.to_remote, stats.to_local), (LEN as u64, LEN as u64));
+}
+
+/// What the stalled local side takes before it stops, and what far sends: more than that, and
+/// less than splice reads ahead.
+const ROOM: usize = 4 << 10;
+const BLOCKING_LEN: usize = 64 << 10;
+
+/// tcp_a half-closes, so local → remote is finished, then far sends `BLOCKING_LEN` bytes and
+/// the splice is left blocked writing to a local side that takes no more.
+async fn blocked_on_local_write() -> Rig {
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    let (stalled_tx, stalled) = oneshot::channel();
+    let local_b = StallingLocal {
+        tcp: tcp_b,
+        room: ROOM,
+        stalled: Some(stalled_tx),
+    };
+    let mut r = rig_from(tcp_a, local_b).await;
+    r.tcp_a.shutdown().await.unwrap();
+    assert_eq!(within(r.far_recv.read_to_end(16)).await.unwrap(), b"");
+    within(r.far_send.write_all(&[7; BLOCKING_LEN]))
+        .await
+        .unwrap();
+    within(stalled).await.unwrap();
+    assert!(!r.splice.is_finished());
+    r
+}
+
+#[tokio::test]
+async fn remote_reset_reaches_local_blocked_on_write() {
+    let mut r = blocked_on_local_write().await;
+
+    r.far_send.reset(VarInt::from_u32(9)).unwrap();
+
+    assert_eq!(within(r.splice).await.unwrap().end, SpliceEnd::RemoteReset);
+    let err = read_until_reset(&mut r.tcp_a).await;
+    assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+}
+
+#[tokio::test]
+async fn connection_loss_reaches_local_blocked_on_write() {
+    let mut r = blocked_on_local_write().await;
+
+    r.quic.far.close(0u32.into(), b"bye");
+
+    assert_eq!(
+        within(r.splice).await.unwrap().end,
+        SpliceEnd::ConnectionLost
+    );
+    let err = read_until_reset(&mut r.tcp_a).await;
+    assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+}
+
+#[tokio::test]
+async fn cancelled_splice_aborts_both_sides() {
+    let mut r = rig().await;
+    let mut buf = [0; 4];
+    r.tcp_a.write_all(b"ping").await.unwrap();
+    within(r.far_recv.read_exact(&mut buf)).await.unwrap();
+
+    r.splice.abort();
+    assert!(within(r.splice).await.unwrap_err().is_cancelled());
+
+    let err = within(r.far_recv.read(&mut buf)).await.unwrap_err();
+    assert_eq!(err, ReadError::Reset(aborted()));
+    assert_eq!(within(r.far_send.stopped()).await.unwrap(), Some(aborted()));
+    let err = read_until_reset(&mut r.tcp_a).await;
+    assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_stream_splices_and_sees_remote_reset_as_eof() {
+    let (mut unix_a, unix_b) = tokio::net::UnixStream::pair().unwrap();
+    let (mut far_send, mut far_recv, _quic, splice) = spliced(unix_b).await;
+    let mut buf = [0; 4];
+
+    unix_a.write_all(b"ping").await.unwrap();
+    within(far_recv.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    far_send.write_all(b"pong").await.unwrap();
+    within(unix_a.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"pong");
+
+    far_send.reset(VarInt::from_u32(9)).unwrap();
+
+    // AF_UNIX has no reset, so the abort reaches the Unix peer as a clean end of stream.
+    assert_eq!(within(unix_a.read(&mut buf)).await.unwrap(), 0);
+    assert_eq!(within(splice).await.unwrap().end, SpliceEnd::RemoteReset);
 }

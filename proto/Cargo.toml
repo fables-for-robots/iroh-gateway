@@ -19,4 +19,4 @@ tokio = { workspace = true, features = ["io-util", "net"] }
 iroh = { workspace = true, features = ["test-utils"] }
 sha2.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
