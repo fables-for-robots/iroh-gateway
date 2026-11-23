@@ -1557,8 +1557,11 @@ dependencies = [
 name = "iroh-gateway-edge"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "iroh",
  "iroh-gateway-proto",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

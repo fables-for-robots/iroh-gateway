@@ -7,8 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+iroh.workspace = true
 iroh-gateway-proto = { path = "../proto" }
 tokio = { workspace = true, features = ["net", "sync", "time"] }
+tracing.workspace = true
 
 [dev-dependencies]
+iroh = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["io-util", "time"] }
