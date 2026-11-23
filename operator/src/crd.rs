@@ -51,7 +51,7 @@ pub struct EdgeStatus {
 }
 
 /// Whether one public listener on the edge is bound.
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EdgeListenerStatus {
     pub protocol: String,
