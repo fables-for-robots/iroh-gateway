@@ -15,6 +15,9 @@ RUN cargo build --release --locked -p iroh-gateway-operator -p iroh-gateway-edge
 FROM haproxy:3.2 AS operator
 COPY --from=build /src/target/release/iroh-gateway-operator /usr/local/bin/iroh-gateway-operator
 USER 65532:65532
+WORKDIR /
+# The base image sets SIGUSR1 to stop HAProxy; the entrypoint here is the operator, which stops on SIGTERM.
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/iroh-gateway-operator", "run"]
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS edge

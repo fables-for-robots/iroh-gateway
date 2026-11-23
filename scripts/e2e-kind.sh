@@ -256,4 +256,9 @@ if [ -z "$closed" ]; then
   exit 1
 fi
 
+step "deleting the operator pod is prompt (the image's stop signal reaches the operator)"
+# Well under the 60 s grace period: a pod that is only killed after the grace period fails here.
+k delete pod -l app.kubernetes.io/name=iroh-gateway-operator --wait=true --timeout=30s
+k wait --for=condition=Available deployment/iroh-gateway-operator --timeout=120s
+
 echo "e2e passed"
