@@ -1,14 +1,24 @@
 //! Byte copy between a local socket and a QUIC stream, mapping half-close to stream finish and
 //! abort to stream reset in both directions.
 
-use std::future::{Future, pending};
+use std::{
+    future::{Future, pending},
+    time::Duration,
+};
 
 use iroh::endpoint::{ReadError, RecvStream, SendStream, StoppedError, VarInt, WriteError};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    time::{Instant, sleep_until},
+};
 
 use crate::RESET_ABORTED;
 
 const BUF_LEN: usize = 64 * 1024;
+
+/// How long the local side may accept no bytes while data is waiting for it before the splice
+/// gives up on it.
+pub const LOCAL_WRITE_STALL: Duration = Duration::from_secs(300);
 
 /// A local socket that can be torn down abruptly.
 pub trait LocalStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
@@ -46,10 +56,30 @@ pub enum SpliceEnd {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct SpliceOptions {
+    /// Abort, as `LocalAborted`, once the local side has accepted no bytes for this long while
+    /// data is waiting for it. Never applies while nothing is waiting.
+    pub local_write_stall: Duration,
+}
+
+impl Default for SpliceOptions {
+    fn default() -> Self {
+        Self {
+            local_write_stall: LOCAL_WRITE_STALL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct SpliceStats {
     pub to_remote: u64,
     pub to_local: u64,
     pub end: SpliceEnd,
+}
+
+/// [`splice_with`] with the default [`SpliceOptions`].
+pub async fn splice<L: LocalStream>(local: L, send: SendStream, recv: RecvStream) -> SpliceStats {
+    splice_with(local, send, recv, SpliceOptions::default()).await
 }
 
 /// Copies `local` ↔ (`send`, `recv`) until both directions have ended or either aborts.
@@ -57,7 +87,16 @@ pub struct SpliceStats {
 /// On any abort, and when the future is dropped before it completes, the stream is reset and
 /// stopped with `RESET_ABORTED` and `local` is aborted, so neither side mistakes the abort for a
 /// clean end.
-pub async fn splice<L: LocalStream>(local: L, send: SendStream, recv: RecvStream) -> SpliceStats {
+///
+/// A lost connection is not always visible from the stream alone (for example while the local
+/// side is not reading), so callers are expected to race this future against the connection's
+/// `closed()` and drop it when that wins; dropping it aborts both sides as above.
+pub async fn splice_with<L: LocalStream>(
+    local: L,
+    send: SendStream,
+    recv: RecvStream,
+    opts: SpliceOptions,
+) -> SpliceStats {
     let mut ends = Ends {
         send,
         recv,
@@ -74,7 +113,7 @@ pub async fn splice<L: LocalStream>(local: L, send: SendStream, recv: RecvStream
         // `try_join!` drops the other direction as soon as one returns an abort.
         tokio::try_join!(
             local_to_remote(local_rd, send, &mut to_remote),
-            remote_to_local(recv, local_wr, &mut to_local),
+            remote_to_local(recv, local_wr, opts.local_write_stall, &mut to_local),
         )
     };
     let end = match ended {
@@ -143,10 +182,12 @@ async fn local_to_remote<R: AsyncRead + Unpin>(
 /// connection is seen even when local stops taking data. That holds until `ahead` is full.
 /// Beyond that the only watcher that does not consume data is `received_reset()`, and
 /// cancelling it while data is buffered leaves a reader waker registered, which noq's
-/// `RecvStream` drop asserts against once the stream has been read to the end.
+/// `RecvStream` drop asserts against once the stream has been read to the end. What covers
+/// that state is `stall`: local accepting nothing for that long while `out` waits is an abort.
 async fn remote_to_local<W: AsyncWrite + Unpin>(
     recv: &mut RecvStream,
     local: &mut W,
+    stall: Duration,
     copied: &mut u64,
 ) -> Result<(), SpliceEnd> {
     let mut out = Vec::with_capacity(BUF_LEN);
@@ -160,26 +201,36 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
             finished = !read_more(recv, &mut out).await?;
             continue;
         }
-        {
-            // The write is never cancelled except by an abort; a pending read is, when the
-            // write completes first, which `read_chunk` allows without losing data.
-            let mut write = std::pin::pin!(local.write_all(&out));
-            loop {
-                tokio::select! {
-                    written = &mut write => {
-                        written.map_err(|_| SpliceEnd::LocalAborted)?;
-                        break;
+        // Both `write` and `read_chunk` are cancel-safe: whichever loses a round has done
+        // nothing, so the other branches can complete first without losing data.
+        let mut written = 0;
+        let mut deadline = deadline_after(stall);
+        while written < out.len() {
+            tokio::select! {
+                n = local.write(&out[written..]) => match n {
+                    Ok(n) if n > 0 => {
+                        written += n;
+                        deadline = deadline_after(stall);
                     }
-                    more = read_more(recv, &mut ahead), if !finished && ahead.len() < BUF_LEN => {
-                        finished = !more?;
-                    }
+                    _ => return Err(SpliceEnd::LocalAborted),
+                },
+                more = read_more(recv, &mut ahead), if !finished && ahead.len() < BUF_LEN => {
+                    finished = !more?;
                 }
+                () = sleep_until(deadline) => return Err(SpliceEnd::LocalAborted),
             }
         }
         *copied += out.len() as u64;
         out.clear();
         std::mem::swap(&mut out, &mut ahead);
     }
+}
+
+/// `now + after`, saturating far in the future for durations too large to add.
+fn deadline_after(after: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(after)
+        .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 3600))
 }
 
 /// Appends the next chunk to `buf`, up to `BUF_LEN` in all; `false` once the stream is finished.
