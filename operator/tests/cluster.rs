@@ -18,13 +18,14 @@ use gateway_api::gateways::v1::Gateway;
 use gateway_api::tcproutes::v1::TcpRoute;
 use iroh::SecretKey;
 use iroh_gateway_edge::{Edge as EdgeProcess, EdgeHandle};
-use iroh_gateway_operator::cluster::{StatusWriter, Stores, identity};
+use iroh_gateway_operator::cluster::{StatusSink, StatusWriter, Stores, identity};
 use iroh_gateway_operator::controller::{ControllerOptions, run_loop};
 use iroh_gateway_operator::crd::Edge;
 use iroh_gateway_operator::engine::{Engine, EngineOptions};
 use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::render;
 use iroh_gateway_operator::model::{Settings, Snapshot, build};
+use iroh_gateway_operator::status::{Facts, compute};
 use iroh_gateway_operator::tunnel::bind_endpoint;
 use iroh_gateway_proto::transport::Relay;
 use k8s_openapi::ByteString;
@@ -753,4 +754,74 @@ async fn run_serves_the_cluster_and_stops_on_sigterm() {
         sleep(Duration::from_millis(20)).await;
     };
     assert!(status.success(), "{status}");
+}
+
+/// GatewayClass `iroh`, Gateway `public` and TCPRoute `db` as the API server has them now.
+async fn read_snapshot(client: &Client) -> Snapshot {
+    Snapshot {
+        gateway_classes: vec![Api::all(client.clone()).get("iroh").await.unwrap()],
+        gateways: vec![get(client, NS, "public").await],
+        tcp_routes: vec![get(client, NS, "db").await],
+        ..Snapshot::default()
+    }
+}
+
+fn settings() -> Settings {
+    Settings {
+        controller_name: CONTROLLER.into(),
+        gateway_namespaces: [NS.to_owned()].into(),
+        relay: Relay::Disabled,
+    }
+}
+
+/// `writer`'s answer for the status `snapshot` asks for.
+async fn write(writer: &mut StatusWriter, snapshot: &Snapshot) -> bool {
+    let facts = Facts {
+        operator_id: SecretKey::from_bytes(&[1; 32]).public(),
+        haproxy: Ok(()),
+        edges: Default::default(),
+    };
+    let desired = compute(&build(snapshot, &settings()), &facts);
+    writer.write(&desired, snapshot).await
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn status_writer_reports_what_it_could_not_write() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    env.namespace(NS).await;
+    class(client).await;
+    gateway(client, NS, 5432).await;
+    route(client).await;
+    let mut writer = StatusWriter::new(client.clone(), CONTROLLER.into());
+
+    // Written, then unchanged: both count as written.
+    let first = read_snapshot(client).await;
+    assert!(write(&mut writer, &first).await);
+    let written = read_snapshot(client).await;
+    assert!(written.tcp_routes[0].status.is_some());
+    assert!(write(&mut writer, &written).await);
+    let again = read_snapshot(client).await;
+    assert_eq!(
+        again.gateways[0].resource_version(),
+        written.gateways[0].resource_version()
+    );
+
+    // The route changed since `first`, whose route patch is now refused (409): a failure.
+    let annotate = json!({ "metadata": { "annotations": { "touched": "yes" } } });
+    api::<TcpRoute>(client, NS)
+        .patch("db", &PatchParams::default(), &Patch::Merge(&annotate))
+        .await
+        .unwrap();
+    assert!(!write(&mut writer, &first).await);
+
+    // The Gateway was deleted since the snapshot (404): nothing left to write.
+    let mut stale = read_snapshot(client).await;
+    stale.gateways[0].status = None;
+    api::<Gateway>(client, NS)
+        .delete("public", &DeleteParams::default())
+        .await
+        .unwrap();
+    assert!(write(&mut writer, &stale).await);
 }

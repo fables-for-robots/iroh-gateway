@@ -15,6 +15,10 @@ use crate::status::{self, Facts};
 
 /// Default for [`ControllerOptions::debounce`].
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Default for [`ControllerOptions::status_retry_min`].
+pub const DEFAULT_STATUS_RETRY_MIN: Duration = Duration::from_secs(5);
+/// Default for [`ControllerOptions::status_retry_max`].
+pub const DEFAULT_STATUS_RETRY_MAX: Duration = Duration::from_secs(60);
 
 pub struct ControllerOptions {
     pub settings: Settings,
@@ -22,15 +26,22 @@ pub struct ControllerOptions {
     pub runtime_dir: PathBuf,
     /// After the first change, how long further changes are absorbed into the same pass.
     pub debounce: Duration,
+    /// After a pass whose status write failed, how long until the next pass even if nothing
+    /// changed. Doubles after each consecutive failing pass, up to `status_retry_max`.
+    pub status_retry_min: Duration,
+    pub status_retry_max: Duration,
 }
 
 impl ControllerOptions {
-    /// Options with [`DEFAULT_DEBOUNCE`].
+    /// Options with [`DEFAULT_DEBOUNCE`], [`DEFAULT_STATUS_RETRY_MIN`] and
+    /// [`DEFAULT_STATUS_RETRY_MAX`].
     pub fn new(settings: Settings, runtime_dir: impl Into<PathBuf>) -> Self {
         Self {
             settings,
             runtime_dir: runtime_dir.into(),
             debounce: DEFAULT_DEBOUNCE,
+            status_retry_min: DEFAULT_STATUS_RETRY_MIN,
+            status_retry_max: DEFAULT_STATUS_RETRY_MAX,
         }
     }
 }
@@ -75,8 +86,9 @@ impl<A: Applier> Applier for &mut A {
 /// Runs until `shutdown` resolves (Ok) or HAProxy dies (Err).
 ///
 /// Nothing is applied before every store has finished its first list. Then one pass runs, and
-/// another after each change in the stores or in the applier; changes that arrive within
-/// `debounce` of the first one are taken in the same pass. A pass is never interrupted:
+/// another after each change in the stores or in the applier, or once the status retry delay
+/// has passed after a pass whose status write failed; changes that arrive within `debounce` of
+/// the first trigger are taken in the same pass. A pass is never interrupted:
 /// `shutdown` is noticed between passes.
 pub async fn run_loop(
     mut source: impl SnapshotSource,
@@ -96,16 +108,24 @@ pub async fn run_loop(
         }
     }
 
+    // The delay before the next pass while status writes keep failing.
+    let mut status_retry: Option<Duration> = None;
     loop {
         let snapshot = source.snapshot();
         let model = model::build(&snapshot, &opts.settings);
         applier.apply(render(&model, &opts.runtime_dir)).await;
         let desired = status::compute(&model, &applier.facts());
-        sink.write(&desired, &snapshot).await;
+        let written = sink.write(&desired, &snapshot).await;
+        status_retry = (!written).then(|| match status_retry {
+            None => opts.status_retry_min,
+            Some(delay) => (delay * 2).min(opts.status_retry_max),
+        });
+        let retry_at = status_retry.map(|delay| Instant::now() + delay);
 
         tokio::select! {
             () = source.changed() => {}
             event = applier.next_event() => check(event)?,
+            () = sleep_until_some(retry_at) => {}
             () = &mut shutdown => return Ok(()),
         }
         let deadline = Instant::now() + opts.debounce;
@@ -120,6 +140,14 @@ pub async fn run_loop(
     }
 }
 
+/// Sleeps until `at`, or forever when there is none.
+async fn sleep_until_some(at: Option<Instant>) {
+    match at {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Ok for a change, an error once HAProxy has exited.
 fn check(event: EngineEvent) -> anyhow::Result<()> {
     match event {
@@ -130,7 +158,7 @@ fn check(event: EngineEvent) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::future::pending;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
@@ -207,13 +235,18 @@ mod tests {
         }
     }
 
+    /// Records each write and when it happened; answers from `results`, true once it is empty.
     struct FakeSink {
         writes: Arc<Mutex<Vec<DesiredStatus>>>,
+        times: Arc<Mutex<Vec<Instant>>>,
+        results: Arc<Mutex<VecDeque<bool>>>,
     }
 
     impl StatusSink for FakeSink {
-        async fn write(&mut self, desired: &DesiredStatus, _snapshot: &Snapshot) {
+        async fn write(&mut self, desired: &DesiredStatus, _snapshot: &Snapshot) -> bool {
             self.writes.lock().unwrap().push(desired.clone());
+            self.times.lock().unwrap().push(Instant::now());
+            self.results.lock().unwrap().pop_front().unwrap_or(true)
         }
     }
 
@@ -225,6 +258,8 @@ mod tests {
         facts: Arc<Mutex<Facts>>,
         applies: Arc<Mutex<usize>>,
         writes: Arc<Mutex<Vec<DesiredStatus>>>,
+        times: Arc<Mutex<Vec<Instant>>>,
+        results: Arc<Mutex<VecDeque<bool>>>,
         shutdown: Option<oneshot::Sender<()>>,
         task: JoinHandle<anyhow::Result<()>>,
     }
@@ -232,6 +267,11 @@ mod tests {
     impl Rig {
         /// One edge in namespace `gw`, so the desired status carries the operator's id.
         fn start() -> Self {
+            Self::start_with(&[], |_| {})
+        }
+
+        /// [`Rig::start`] with the sink answering `results` first, and changed options.
+        fn start_with(results: &[bool], customize: impl FnOnce(&mut ControllerOptions)) -> Self {
             let (sync, synced) = watch::channel(false);
             let (changes, changes_rx) = mpsc::unbounded_channel();
             let (events, events_rx) = mpsc::unbounded_channel();
@@ -239,6 +279,8 @@ mod tests {
             let facts = Arc::new(Mutex::new(facts(1)));
             let applies = Arc::new(Mutex::new(0));
             let writes = Arc::new(Mutex::new(Vec::new()));
+            let times = Arc::new(Mutex::new(Vec::new()));
+            let results = Arc::new(Mutex::new(results.iter().copied().collect()));
             let source = FakeSource {
                 synced,
                 changes: changes_rx,
@@ -254,8 +296,11 @@ mod tests {
             };
             let sink = FakeSink {
                 writes: writes.clone(),
+                times: times.clone(),
+                results: results.clone(),
             };
-            let opts = ControllerOptions::new(settings(&["gw"]), "/run/igw");
+            let mut opts = ControllerOptions::new(settings(&["gw"]), "/run/igw");
+            customize(&mut opts);
             let task = tokio::spawn(run_loop(source, applier, sink, opts, async {
                 let _ = shutdown_rx.await;
             }));
@@ -266,6 +311,8 @@ mod tests {
                 facts,
                 applies,
                 writes,
+                times,
+                results,
                 shutdown: Some(shutdown),
                 task,
             }
@@ -277,6 +324,15 @@ mod tests {
 
         fn writes(&self) -> usize {
             self.writes.lock().unwrap().len()
+        }
+
+        /// The time between consecutive writes, in milliseconds.
+        fn gaps_ms(&self) -> Vec<u128> {
+            let times = self.times.lock().unwrap();
+            times
+                .windows(2)
+                .map(|w| (w[1] - w[0]).as_millis())
+                .collect()
         }
 
         /// Syncs the stores and waits until the first pass has written.
@@ -378,6 +434,42 @@ mod tests {
         rig.stop().await.unwrap();
 
         let rig = Rig::start();
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_status_write_is_retried_without_any_change() {
+        let rig = Rig::start_with(&[false], |_| {});
+        rig.synced().await;
+        // Nothing changes; only the failed write calls for another pass.
+        sleep(DEFAULT_STATUS_RETRY_MIN - Duration::from_millis(100)).await;
+        assert_eq!(rig.writes(), 1);
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!((rig.applies(), rig.writes()), (2, 2));
+        // That write succeeded: no more passes.
+        sleep(DEFAULT_STATUS_RETRY_MAX * 3).await;
+        assert_eq!((rig.applies(), rig.writes()), (2, 2));
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_retry_backs_off_and_resets() {
+        let rig = Rig::start_with(&[false, false, false], |opts| {
+            opts.debounce = Duration::ZERO;
+            opts.status_retry_min = Duration::from_millis(20);
+            opts.status_retry_max = Duration::from_millis(50);
+        });
+        rig.synced().await;
+        sleep(Duration::from_secs(1)).await;
+        // Three failing passes, then the fourth succeeds.
+        assert_eq!(rig.gaps_ms(), [20, 40, 50]);
+
+        // A later failure starts again at the minimum.
+        rig.results.lock().unwrap().push_back(false);
+        rig.changes.send(()).unwrap();
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(rig.writes(), 6);
+        assert_eq!(rig.gaps_ms()[4], 20);
         rig.stop().await.unwrap();
     }
 }

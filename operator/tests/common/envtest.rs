@@ -25,6 +25,14 @@ use super::free_tcp_port;
 /// How long the API server gets to become ready, and each CRD to become established.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const TOKEN: &str = "envtest-token";
+/// How often a start that lost one of its ports to another test is tried.
+const START_ATTEMPTS: u32 = 5;
+
+/// A process that ended during start, with its log, and whether it found its port taken.
+struct Exited {
+    message: String,
+    port_taken: bool,
+}
 
 pub struct Envtest {
     pub client: Client,
@@ -69,8 +77,33 @@ fn tail(dir: &Path, name: &str) -> String {
 impl Envtest {
     /// Starts the API server, waits until it serves, and installs the `Edge` CRD and the
     /// Gateway API CRDs from the crate's types.
+    ///
+    /// The ports are picked free but released before the processes bind them, so another test
+    /// can take one in between; a start that fails that way is tried again on new ports.
     pub async fn start() -> Self {
         let assets = assets();
+        let mut attempt = 1;
+        loop {
+            match Self::try_start(&assets).await {
+                Ok(mut env) => {
+                    env.install_crds().await;
+                    return env;
+                }
+                Err(Exited {
+                    message,
+                    port_taken,
+                }) => {
+                    if !port_taken || attempt == START_ATTEMPTS {
+                        panic!("{message}");
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Starts the processes on new ports and waits until the API server serves.
+    async fn try_start(assets: &Path) -> Result<Self, Exited> {
         let dir = tempfile::Builder::new()
             .prefix("envtest")
             .tempdir()
@@ -163,31 +196,45 @@ impl Envtest {
             apiserver,
             dir,
         };
-        env.wait_ready().await;
-        env.install_crds().await;
-        env
+        // On an error `env` is dropped, which stops whichever process is still running.
+        env.wait_ready().await?;
+        Ok(env)
     }
 
-    /// Panics with the logs if either process has ended.
-    fn check_alive(&mut self) {
+    /// Why a process ended, if one has.
+    fn exited(&mut self) -> Option<Exited> {
         for (name, child, log) in [
             ("etcd", &mut self.etcd, "etcd.log"),
             ("kube-apiserver", &mut self.apiserver, "kube-apiserver.log"),
         ] {
             if let Some(status) = child.try_wait().unwrap() {
-                panic!("{name} exited ({status}):\n{}", tail(self.dir.path(), log));
+                let text = std::fs::read_to_string(self.dir.path().join(log)).unwrap_or_default();
+                return Some(Exited {
+                    message: format!("{name} exited ({status}):\n{}", tail(self.dir.path(), log)),
+                    port_taken: text.contains("address already in use"),
+                });
             }
+        }
+        None
+    }
+
+    /// Panics with the logs if either process has ended.
+    fn check_alive(&mut self) {
+        if let Some(exited) = self.exited() {
+            panic!("{}", exited.message);
         }
     }
 
     /// Waits until the API server serves the `default` namespace, which it creates once ready.
-    async fn wait_ready(&mut self) {
+    async fn wait_ready(&mut self) -> Result<(), Exited> {
         let namespaces: Api<Namespace> = Api::all(self.client.clone());
         let start = Instant::now();
         loop {
-            self.check_alive();
+            if let Some(exited) = self.exited() {
+                return Err(exited);
+            }
             match namespaces.get("default").await {
-                Ok(_) => return,
+                Ok(_) => return Ok(()),
                 Err(e) if start.elapsed() > START_TIMEOUT => panic!(
                     "the API server did not become ready: {e}\n{}",
                     tail(self.dir.path(), "kube-apiserver.log")

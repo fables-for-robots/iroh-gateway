@@ -32,14 +32,16 @@ const ROUTE_GROUP: &str = "gateway.networking.k8s.io";
 
 /// Where the reconcile loop sends the status it computed.
 pub trait StatusSink: Send {
+    /// True when every write of this pass succeeded or was not needed; false when at least one
+    /// failed, so that the loop tries again later.
     fn write(
         &mut self,
         desired: &DesiredStatus,
         snapshot: &Snapshot,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = bool> + Send;
 }
 
-/// Patches status in the cluster. A failed patch is logged and tried again on the next pass.
+/// Patches status in the cluster. A failed patch is logged; the loop retries the pass.
 pub struct StatusWriter {
     client: Client,
     controller_name: String,
@@ -53,7 +55,8 @@ impl StatusWriter {
         }
     }
 
-    async fn send(&self, patch: StatusPatch) {
+    /// Sends one patch; true when it counts as written (see [`written`]).
+    async fn send(&self, patch: StatusPatch) -> bool {
         let params = PatchParams::default();
         let body = Patch::Merge(&patch.body);
         let result = match &patch.target {
@@ -76,19 +79,36 @@ impl StatusWriter {
                 .await
                 .map(drop),
         };
-        match result {
+        match &result {
             Ok(()) => debug!(object = %patch.target, "wrote status"),
+            Err(e) if written(&result) => {
+                debug!(object = %patch.target, "not writing status, the object is gone: {e}")
+            }
             Err(e) => warn!(object = %patch.target, "writing status failed: {e}"),
         }
+        written(&result)
+    }
+}
+
+/// Whether a patch's outcome counts as written: it succeeded, or the object was deleted since
+/// the snapshot (404), so there is nothing left to write. A conflict (409) and every other error
+/// count as failed; the retry works from a newer snapshot.
+fn written(result: &kube::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(kube::Error::Api(status)) => status.code == 404,
+        Err(_) => false,
     }
 }
 
 impl StatusSink for StatusWriter {
-    async fn write(&mut self, desired: &DesiredStatus, snapshot: &Snapshot) {
+    async fn write(&mut self, desired: &DesiredStatus, snapshot: &Snapshot) -> bool {
         let now = Time(Timestamp::now());
+        let mut all_written = true;
         for patch in patches(desired, snapshot, &self.controller_name, &now) {
-            self.send(patch).await;
+            all_written &= self.send(patch).await;
         }
+        all_written
     }
 }
 
@@ -659,5 +679,63 @@ mod tests {
             .map(|p| p.target)
             .collect();
         assert_eq!(targets, [Target::GatewayClass("ours".into())]);
+    }
+
+    fn api_error(code: u16) -> kube::Result<()> {
+        Err(kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            ..Default::default()
+        })))
+    }
+
+    #[test]
+    fn deleted_objects_count_as_written_and_conflicts_do_not() {
+        assert!(written(&Ok(())));
+        assert!(written(&api_error(404)));
+        assert!(!written(&api_error(409)));
+        assert!(!written(&api_error(429)));
+        assert!(!written(&api_error(500)));
+    }
+
+    /// A writer whose API server refuses every connection.
+    fn unreachable_writer() -> StatusWriter {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}").parse().unwrap();
+        let client = Client::try_from(kube::Config::new(url)).unwrap();
+        StatusWriter::new(client, CONTROLLER.into())
+    }
+
+    fn class_world(status_from: Option<&Value>) -> (Snapshot, DesiredStatus) {
+        use crate::model::fixtures::settings;
+        let mut c = class("ours");
+        if let Some(patch) = status_from {
+            c.status = Some(serde_json::from_value(patch["status"].clone()).unwrap());
+        }
+        let snapshot = Snapshot {
+            gateway_classes: vec![c],
+            ..Snapshot::default()
+        };
+        let facts = Facts {
+            operator_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            haproxy: Ok(()),
+            edges: BTreeMap::new(),
+        };
+        let desired = compute(&build(&snapshot, &settings(&["gw"])), &facts);
+        (snapshot, desired)
+    }
+
+    #[tokio::test]
+    async fn write_is_false_when_a_patch_fails_and_true_when_none_is_needed() {
+        let mut writer = unreachable_writer();
+        let (snapshot, desired) = class_world(None);
+        assert!(!writer.write(&desired, &snapshot).await);
+
+        let patch = class_patch(&snapshot.gateway_classes[0], &desired.classes[0], &at(1)).unwrap();
+        let (snapshot, desired) = class_world(Some(&patch));
+        assert!(writer.write(&desired, &snapshot).await);
     }
 }
