@@ -366,6 +366,8 @@ Every condition below is also visible with `kubectl describe`. A False condition
 
 - A `Gateway` and an `Edge` are served only in the namespaces of `--gateway-namespaces` (by default only the operator's own). In other namespaces they are not accepted.
 - An `Edge` names its `Gateway` by `gatewayRef.name` and must be in the same namespace. A `Gateway` serves through the `Edge` objects that point at it.
+- Whoever may create an `Edge` in a served namespace controls the published addresses of that namespace's Gateways and sees their raw TCP: an `Edge` with the id of an edge they run adds its addresses to the Gateway, and that edge then carries, and sees, the TCP streams of the visitors who use them, and can reach the Gateway's backends. Restrict who may create `Edge` resources there (RBAC on `edges.gateway.fables-for-robots.ch`).
+- Pointing an `Edge` at another `Gateway` leaves the streams that are already open running until they end; new visitors reach the new Gateway's backends. Deleting the `Edge` cuts its open streams.
 - The `Gateway`'s `gatewayClassName` must name a `GatewayClass` whose `controllerName` is this operator's; any other `Gateway` is ignored.
 - A backend must be a core `Service` with a cluster IP, in the same namespace as the `TCPRoute`. There is no `ReferenceGrant` support, `ExternalName` and headless Services do not work, and the operator sends to the Service's cluster IP.
 - Each listener has at most one `TCPRoute` with at most one rule. If several routes name a listener, the oldest wins and the others are not accepted.
