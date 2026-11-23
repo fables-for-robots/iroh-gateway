@@ -4,7 +4,9 @@
 
 FROM rust:1.100-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# Not rust-toolchain.toml: the image is Rust 1.100 already, and with it rustup would download
+# the extra components it lists.
+COPY Cargo.toml Cargo.lock ./
 COPY proto ./proto
 COPY edge ./edge
 COPY operator ./operator

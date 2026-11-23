@@ -2,6 +2,6 @@ target/
 .git/
 .superpowers/
 .direnv/
-*.key
-*.pem
-.env
+**/*.key
+**/*.pem
+**/.env
