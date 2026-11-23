@@ -11,6 +11,8 @@ use iroh::{
 
 pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// iroh's maximum per-path idle timeout; larger values are clamped with a warning.
+pub const PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_TUNNEL_STREAMS: u32 = 65_536;
 
 /// `incoming_bidi_streams` is how many streams the peer may have open towards us.
@@ -25,7 +27,7 @@ pub fn transport_config(incoming_bidi_streams: u32) -> QuicTransportConfig {
                 .expect("idle timeout fits a QUIC varint"),
         ))
         .default_path_keep_alive_interval(KEEP_ALIVE)
-        .default_path_max_idle_timeout(IDLE_TIMEOUT)
+        .default_path_max_idle_timeout(PATH_IDLE_TIMEOUT)
         .build()
 }
 
