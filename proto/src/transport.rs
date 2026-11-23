@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use iroh::{
     RelayMode, RelayUrl, SecretKey,
     address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
-    endpoint::{Builder, QuicTransportConfig, VarInt, presets},
+    endpoint::{Builder, PortmapperConfig, QuicTransportConfig, VarInt, presets},
 };
 
 pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
@@ -80,6 +80,9 @@ pub enum Role {
 ///
 /// `Disabled` and `Custom` use no address lookup. `N0` makes the edge publish its relay URL
 /// (only) via pkarr and the operator resolve only; the operator never publishes.
+///
+/// Port mapping (UPnP, NAT-PMP, PCP) is disabled: neither side may ask its LAN gateway to open
+/// an inbound port, since the operator's network must need none and the edge has a public IP.
 pub fn endpoint_builder(
     key: SecretKey,
     incoming_bidi_streams: u32,
@@ -89,6 +92,7 @@ pub fn endpoint_builder(
     let builder = Builder::new(presets::Minimal)
         .secret_key(key)
         .transport_config(transport_config(incoming_bidi_streams))
+        .portmapper_config(PortmapperConfig::Disabled)
         .clear_address_lookup();
     match (relay, role) {
         (Relay::Disabled, _) => builder.relay_mode(RelayMode::Disabled),

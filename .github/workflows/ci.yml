@@ -31,6 +31,13 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      - name: iroh port mapping stays compiled out
+        run: |
+          if cargo tree --workspace -e normal,dev --prefix none | grep -q '^portmapper '; then
+            echo "iroh portmapper must stay disabled"
+            exit 1
+          fi
+
   audit:
     runs-on: ubuntu-latest
     # audit-check reports its results as a check run, which needs an
