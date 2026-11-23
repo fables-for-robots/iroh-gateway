@@ -303,6 +303,15 @@ Rules:
   different hostnames may share a port; so may `HTTP` listeners. Any other
   mix on one port is `Conflicted`.
 - A listener may not use the edge's iroh port.
+- A TCP listener carries one `TCPRoute`. If several attach, the oldest
+  wins and the others are not accepted.
+- An edge opens a listener's port only once the listener has a route with at
+  least one usable backend. Until then visitors get a refused connection.
+- A backend that cannot be used is left out and its share of traffic goes
+  to the others. (The Gateway API asks for that share to be refused. This
+  is a known deviation for now.)
+- A backend must be a Service with a cluster IP. Headless and
+  `ExternalName` Services are refused.
 - No matching route answers 404; a rule whose backends are all invalid
   answers 500, as the specification requires.
 
@@ -334,6 +343,8 @@ status:
 - An `Edge` without `address` is `Accepted=False` when relay mode is
   `disabled`, and one without both `address` and `publicAddresses` is
   always `Accepted=False`.
+- If two `Edge` resources carry the same `endpointId`, the older one is
+  accepted and the other is not.
 - An edge serves exactly one Gateway. A Gateway is served by any number of
   edges, and every edge of a Gateway opens all of that Gateway's ports.
   Edges are never shared, so two Gateways can never fight over a port.
@@ -415,10 +426,14 @@ Receive memory is bounded explicitly, because the QUIC defaults are not:
 The operator also refuses a stream whose header names a local port that
 does not match the listener its id belongs to.
 
-**Open question for the HAProxy step.** A Unix socket cannot signal an
-abort: closing it looks like a clean end of data. An aborted visitor
-connection would therefore reach HAProxy as a clean close. Either accept
-that, or connect to HAProxy over loopback TCP instead of Unix sockets.
+**Aborts at the HAProxy hop.** A Unix socket cannot signal an abort:
+closing it looks like a clean end of data, so an aborted visitor connection
+reaches HAProxy as a clean close. This is accepted, and the Unix sockets
+stay. HAProxy itself turns most aborts into ordinary closes towards a TCP
+backend, so loopback TCP would gain little, and for HTTP it notices a
+truncated request from the message framing. In return nothing outside the
+operator's container can reach the sockets, and no ports have to be
+allocated.
 
 **UDP.** Each visitor packet travels as one or more QUIC datagrams:
 
