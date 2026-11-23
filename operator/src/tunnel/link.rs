@@ -53,15 +53,20 @@ pub struct EdgeState {
 }
 
 /// The most characters of text the state passes on from the edge: a listener's bind error, the
-/// edge's version and `last_error`, which may quote the edge's close reason.
+/// edge's version and `last_error`, which may quote the edge's close reason. Control characters
+/// in them become spaces.
 pub const MAX_STATUS_TEXT: usize = 256;
 
-/// `text` with at most [`MAX_STATUS_TEXT`] characters. Cuts at a character boundary and appends
-/// "…" when it cut.
+/// `text` with every control character replaced by a space, then cut to at most
+/// [`MAX_STATUS_TEXT`] characters. Cuts at a character boundary and appends "…" when it cut.
 pub fn truncate_status_text(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     match text.char_indices().nth(MAX_STATUS_TEXT - 1) {
         Some((end, _)) if text[end..].chars().nth(1).is_some() => format!("{}…", &text[..end]),
-        _ => text.to_string(),
+        _ => text,
     }
 }
 
@@ -761,6 +766,19 @@ mod tests {
         b.reset();
         let wait = b.next();
         assert!(within_20_percent(wait, 500), "{wait:?} after reset");
+    }
+
+    #[test]
+    fn truncate_status_text_replaces_control_characters() {
+        assert_eq!(
+            truncate_status_text("a\nb\rc\x1b[31md\0e\tf\u{7f}g\u{85}h"),
+            "a b c [31md e f g h"
+        );
+        // Replaced before the cut, so a cut string is clean too.
+        let long = "\n".repeat(1000);
+        let cut = truncate_status_text(&long);
+        assert_eq!(cut.chars().count(), MAX_STATUS_TEXT);
+        assert!(!cut.chars().any(char::is_control), "{cut:?}");
     }
 
     #[test]

@@ -468,6 +468,29 @@ async fn long_bind_error_is_truncated() {
 }
 
 #[tokio::test]
+async fn long_close_reason_reaches_last_error_cut_and_clean() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let fake = FakeEdge::bind().await;
+    let (link, _desired, _endpoint) = fake.link(&[(p, echo)], &[p]).await;
+    let mut s = fake.accept().await;
+    let cfg = s.read_config().await;
+    s.reply(&cfg).await;
+    wait_state(&link, |st| st.connected).await;
+
+    let reason = "x\n\r\x1b[2J\0".repeat(125);
+    assert_eq!(reason.len(), 1000);
+    s.conn.close(VarInt::from_u32(7), reason.as_bytes());
+    let st = wait_state(&link, |st| !st.connected && st.last_error.is_some()).await;
+    let why = st.last_error.unwrap();
+    assert!(why.contains("x   [2J x"), "{why:?}");
+    assert_eq!(why.chars().count(), MAX_STATUS_TEXT, "{why:?}");
+    assert!(why.ends_with('…'), "{why:?}");
+    assert!(!why.chars().any(char::is_control), "{why:?}");
+    link.shutdown().await;
+}
+
+#[tokio::test]
 async fn static_connector_rejects_an_unknown_key() {
     let connector = StaticConnector::new(Default::default());
     let header = StreamHeader {
