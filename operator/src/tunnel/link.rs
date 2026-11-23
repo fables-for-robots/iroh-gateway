@@ -44,11 +44,31 @@ pub struct EdgeState {
     /// The last generation the edge acknowledged.
     pub generation: u64,
     pub listeners: Vec<ListenerState>,
+    /// Why the link is not connected, in plain words; None while connected.
+    ///
+    /// Set when a dial attempt fails or a session ends, so it is also None until the first
+    /// attempt has failed; a shutdown leaves it as it was. At most [`MAX_STATUS_TEXT`]
+    /// characters.
+    pub last_error: Option<String>,
+}
+
+/// The most characters of text the state passes on from the edge: a listener's bind error, the
+/// edge's version and `last_error`, which may quote the edge's close reason.
+pub const MAX_STATUS_TEXT: usize = 256;
+
+/// `text` with at most [`MAX_STATUS_TEXT`] characters. Cuts at a character boundary and appends
+/// "…" when it cut.
+pub fn truncate_status_text(text: &str) -> String {
+    match text.char_indices().nth(MAX_STATUS_TEXT - 1) {
+        Some((end, _)) if text[end..].chars().nth(1).is_some() => format!("{}…", &text[..end]),
+        _ => text.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerState {
     pub key: ListenerKey,
+    /// The edge's bind error, cut by [`truncate_status_text`].
     pub bound: Result<(), String>,
 }
 
@@ -64,6 +84,9 @@ pub struct LinkOptions {
     pub connect_timeout: Duration,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
+    /// While the last `Status` the edge sent reports a listener it could not bind, the current
+    /// listener list is sent again as a new `Config` this often.
+    pub bind_retry: Duration,
 }
 
 impl LinkOptions {
@@ -80,6 +103,7 @@ impl LinkOptions {
             connect_timeout: Duration::from_secs(5),
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(30),
+            bind_retry: Duration::from_secs(30),
         })
     }
 }
@@ -206,14 +230,22 @@ impl<C: Connector> Link<C> {
                 _ = &mut shutdown => break,
                 conn = self.dial() => conn,
             };
-            if let Some(conn) = dialed {
-                match self.session(conn, &mut shutdown).await {
+            match dialed {
+                Ok(conn) => match self.session(conn, &mut shutdown).await {
                     Ended::Shutdown => break,
                     Ended::Lost { got_status } => {
                         if got_status {
                             backoff.reset();
                         }
                     }
+                },
+                Err(why) => {
+                    let why = Some(truncate_status_text(&why));
+                    self.state.send_if_modified(|st| {
+                        let changed = st.last_error != why;
+                        st.last_error = why;
+                        changed
+                    });
                 }
             }
             let wait = backoff.next();
@@ -226,34 +258,38 @@ impl<C: Connector> Link<C> {
         info!("link stopped");
     }
 
-    /// Logs at warn what the operator must do about a close by the edge that it cannot get past
-    /// by redialing; false, logging nothing, for any other close.
-    fn explain_close(&self, closed: &ConnectionError) -> bool {
+    /// For a close by the edge that redialing cannot get past, logs at warn what the operator
+    /// must do and returns the reason in plain words; None, logging nothing, for any other close.
+    fn explain_close(&self, closed: &ConnectionError) -> Option<String> {
         let ConnectionError::ApplicationClosed(close) = closed else {
-            return false;
+            return None;
         };
         if close.error_code == VarInt::from_u32(CLOSE_UNAUTHORIZED) {
+            let id = self.endpoint.id();
             warn!(
                 "the edge does not accept this operator's key: start the edge with \
-                 --operator {}",
-                self.endpoint.id()
+                 --operator {id}"
             );
-            true
+            Some(format!(
+                "the edge does not accept this operator's key ({id})"
+            ))
         } else if close.error_code == VarInt::from_u32(CLOSE_REPLACED) {
-            warn!("another operator with the same key connected to the edge and replaced this one");
-            true
+            let why =
+                "another operator with the same key connected to the edge and replaced this one";
+            warn!("{why}");
+            Some(why.to_string())
         } else {
-            false
+            None
         }
     }
 
-    /// One dial attempt; None when it failed.
-    async fn dial(&self) -> Option<Connection> {
+    /// One dial attempt; Err says why it failed.
+    async fn dial(&self) -> Result<Connection, String> {
         let target = self.target().await?;
         match timeout(self.opts.dial_timeout, self.endpoint.connect(target, ALPN)).await {
             Ok(Ok(conn)) => {
                 info!("connected");
-                Some(conn)
+                Ok(conn)
             }
             Ok(Err(e)) => {
                 let closed = match &e {
@@ -264,36 +300,41 @@ impl<C: Connector> Link<C> {
                     | ConnectError::Connection { source, .. } => Some(source),
                     _ => None,
                 };
-                if !closed.is_some_and(|c| self.explain_close(c)) {
-                    info!("dial failed: {e:#}");
-                }
-                None
+                Err(closed
+                    .and_then(|c| self.explain_close(c))
+                    .unwrap_or_else(|| {
+                        let why = format!("dial failed: {e:#}");
+                        info!("{why}");
+                        why
+                    }))
             }
             Err(_) => {
-                info!("dial timed out after {:?}", self.opts.dial_timeout);
-                None
+                let why = format!("dial timed out after {:?}", self.opts.dial_timeout);
+                info!("{why}");
+                Err(why)
             }
         }
     }
 
-    /// The edge's id with the addressing this attempt has; None when it has none.
-    async fn target(&self) -> Option<EndpointAddr> {
+    /// The edge's id with the addressing this attempt has; Err says why it has none.
+    async fn target(&self) -> Result<EndpointAddr, String> {
         let mut target = EndpointAddr::new(self.opts.edge_id);
         if let Relay::Custom(url) = &self.opts.relay {
             target = target.with_relay_url(url.clone());
         }
         let Some(address) = &self.opts.address else {
-            return Some(target);
+            return Ok(target);
         };
         match resolve(address, self.opts.dial_timeout).await {
-            Ok(addrs) => Some(addrs.into_iter().fold(target, EndpointAddr::with_ip_addr)),
+            Ok(addrs) => Ok(addrs.into_iter().fold(target, EndpointAddr::with_ip_addr)),
             Err(e) if self.opts.relay == Relay::Disabled => {
-                info!("dial failed: {e:#}");
-                None
+                let why = format!("dial failed: {e:#}");
+                info!("{why}");
+                Err(why)
             }
             Err(e) => {
                 info!("{e:#}; dialing through the relay only");
-                Some(target)
+                Ok(target)
             }
         }
     }
@@ -310,19 +351,13 @@ impl<C: Connector> Link<C> {
             _ = &mut *shutdown => None,
             e = self.drive(&mut s) => Some(e),
         };
-        match &end {
-            None => conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"shutdown"),
-            // Seen as a lost connection or as a failed control stream, whichever came first.
-            Some(_) if conn.close_reason().is_some_and(|c| self.explain_close(&c)) => {}
-            Some(SessionError::Lost(e)) => info!("connection lost: {e}"),
-            Some(SessionError::Control(e)) => {
-                warn!("control stream failed: {e:#}");
-                conn.close(
-                    VarInt::from_u32(CLOSE_CONTROL_ENDED),
-                    b"control stream ended",
-                );
+        let why = match &end {
+            None => {
+                conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"shutdown");
+                None
             }
-        }
+            Some(e) => Some(truncate_status_text(&self.session_ended(&conn, e))),
+        };
         s.streams.abort_all();
         while let Some(done) = s.streams.join_next().await {
             if let Err(e) = done
@@ -332,9 +367,13 @@ impl<C: Connector> Link<C> {
             }
         }
         self.state.send_if_modified(|st| {
-            let changed = st.connected || !st.listeners.is_empty();
+            let mut changed = st.connected || !st.listeners.is_empty();
             st.connected = false;
             st.listeners.clear();
+            if why.is_some() && st.last_error != why {
+                st.last_error = why;
+                changed = true;
+            }
             changed
         });
         match end {
@@ -342,6 +381,31 @@ impl<C: Connector> Link<C> {
             Some(_) => Ended::Lost {
                 got_status: s.got_status,
             },
+        }
+    }
+
+    /// Logs why the session ended, closes the connection with `CLOSE_CONTROL_ENDED` when the
+    /// control stream failed on an open one, and returns the reason in plain words.
+    fn session_ended(&self, conn: &Connection, e: &SessionError) -> String {
+        // Seen as a lost connection or as a failed control stream, whichever came first.
+        if let Some(why) = conn.close_reason().and_then(|c| self.explain_close(&c)) {
+            return why;
+        }
+        match e {
+            SessionError::Lost(e) => {
+                let why = format!("connection lost: {e}");
+                info!("{why}");
+                why
+            }
+            SessionError::Control(e) => {
+                let why = format!("control stream failed: {e:#}");
+                warn!("{why}");
+                conn.close(
+                    VarInt::from_u32(CLOSE_CONTROL_ENDED),
+                    b"control stream ended",
+                );
+                why
+            }
         }
     }
 
@@ -360,9 +424,13 @@ impl<C: Connector> Link<C> {
         let mut writing = pin!(write_config(send, first));
         // The control stream while no write is in flight.
         let mut idle_send: Option<SendStream> = None;
-        // `desired` changed while a write was in flight.
+        // A new `Config` is due: `desired` changed, or binds are retried.
         let mut dirty = false;
         let mut reading = pin!(read_status(recv));
+        // Fires `bind_retry` after a `Status` that reports a bind error, unless one without
+        // such an error is acknowledged first.
+        let mut retry = pin!(sleep(self.opts.bind_retry));
+        let mut retry_armed = false;
         loop {
             tokio::select! {
                 e = conn.closed() => return SessionError::Lost(e),
@@ -370,32 +438,34 @@ impl<C: Connector> Link<C> {
                     if let Err(e) = written {
                         return SessionError::Control(e.into());
                     }
-                    if dirty {
-                        dirty = false;
-                        match self.next_config(s) {
-                            Ok(cfg) => writing.set(write_config(send, cfg)),
-                            Err(e) => return e,
-                        }
-                    } else {
-                        idle_send = Some(send);
-                    }
+                    idle_send = Some(send);
                 }
                 changed = self.desired.changed(), if self.desired_open => {
                     if changed.is_err() {
                         self.desired_open = false;
                         continue;
                     }
-                    match idle_send.take() {
-                        Some(send) => match self.next_config(s) {
-                            Ok(cfg) => writing.set(write_config(send, cfg)),
-                            Err(e) => return e,
-                        },
-                        None => dirty = true,
+                    dirty = true;
+                }
+                () = &mut retry, if retry_armed => {
+                    retry_armed = false;
+                    // A config still unacknowledged retries the binds by itself, and its status
+                    // arms the retry again if they still fail.
+                    if s.unacked.is_empty() {
+                        debug!("retrying the listeners the edge could not bind");
+                        dirty = true;
                     }
                 }
                 (recv, read) = &mut reading => {
                     match read {
-                        Ok(Some(status)) => self.on_status(s, status),
+                        Ok(Some(status)) => {
+                            if let Some(failed) = self.on_status(s, status) {
+                                retry_armed = failed;
+                                if failed {
+                                    retry.set(sleep(self.opts.bind_retry));
+                                }
+                            }
+                        }
                         Ok(None) => {
                             return SessionError::Control(anyhow!("the edge finished the control stream"));
                         }
@@ -425,6 +495,13 @@ impl<C: Connector> Link<C> {
                     {
                         error!("stream task panicked: {e}");
                     }
+                }
+            }
+            if dirty && let Some(send) = idle_send.take() {
+                dirty = false;
+                match self.next_config(s) {
+                    Ok(cfg) => writing.set(write_config(send, cfg)),
+                    Err(e) => return e,
                 }
             }
         }
@@ -480,8 +557,9 @@ impl<C: Connector> Link<C> {
         Ok(cfg)
     }
 
-    /// Makes the state follow `status`, read against the config it acknowledges.
-    fn on_status(&mut self, s: &mut Session, status: Status) {
+    /// Makes the state follow `status`, read against the config it acknowledges. Returns whether
+    /// it reports a listener the edge could not bind; None when it acknowledges no pending config.
+    fn on_status(&mut self, s: &mut Session, status: Status) -> Option<bool> {
         let Some(pos) = s
             .unacked
             .iter()
@@ -491,21 +569,21 @@ impl<C: Connector> Link<C> {
                 generation = status.generation,
                 "ignoring a status for no pending config"
             );
-            return;
+            return None;
         };
         let cfg = s
             .unacked
             .drain(..=pos)
             .next_back()
             .expect("drains at least one");
-        let listeners = status
+        let listeners: Vec<ListenerState> = status
             .listeners
             .iter()
             .filter_map(|ls| {
                 let l = cfg.listeners.iter().find(|l| l.id == ls.id)?;
                 let bound = match &ls.state {
                     BindState::Bound => Ok(()),
-                    BindState::Error(e) => Err(e.clone()),
+                    BindState::Error(e) => Err(truncate_status_text(e)),
                 };
                 Some(ListenerState {
                     key: l.key(),
@@ -514,11 +592,13 @@ impl<C: Connector> Link<C> {
             })
             .collect();
         s.got_status = true;
+        let failed = listeners.iter().any(|l| l.bound.is_err());
         let next = EdgeState {
             connected: true,
-            edge_version: Some(status.version),
+            edge_version: Some(truncate_status_text(&status.version)),
             generation: status.generation,
             listeners,
+            last_error: None,
         };
         debug!(?next, "status received");
         self.state.send_if_modified(|st| {
@@ -526,6 +606,7 @@ impl<C: Connector> Link<C> {
             *st = next;
             changed
         });
+        Some(failed)
     }
 }
 
@@ -680,5 +761,22 @@ mod tests {
         b.reset();
         let wait = b.next();
         assert!(within_20_percent(wait, 500), "{wait:?} after reset");
+    }
+
+    #[test]
+    fn truncate_status_text_respects_char_boundaries() {
+        assert_eq!(truncate_status_text("short"), "short");
+        let long = "é".repeat(300);
+        let cut = truncate_status_text(&long);
+        assert_eq!(cut.chars().count(), 256);
+        assert!(cut.ends_with('…'));
+        assert!(cut.starts_with("éé"));
+        let exact = "é".repeat(MAX_STATUS_TEXT);
+        assert_eq!(truncate_status_text(&exact), exact);
+        let over = "é".repeat(MAX_STATUS_TEXT + 1);
+        assert_eq!(
+            truncate_status_text(&over),
+            format!("{}…", "é".repeat(MAX_STATUS_TEXT - 1))
+        );
     }
 }

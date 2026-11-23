@@ -4,4 +4,7 @@ mod connector;
 mod link;
 
 pub use connector::{Connector, StaticConnector};
-pub use link::{EdgeLink, EdgeState, LinkHandle, LinkOptions, ListenerState, bind_endpoint};
+pub use link::{
+    EdgeLink, EdgeState, LinkHandle, LinkOptions, ListenerState, MAX_STATUS_TEXT, bind_endpoint,
+    truncate_status_text,
+};

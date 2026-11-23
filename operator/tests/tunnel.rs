@@ -5,10 +5,13 @@ use std::time::Duration;
 
 use common::*;
 use iroh::SecretKey;
-use iroh::endpoint::ConnectionError;
+use iroh::endpoint::{ConnectionError, VarInt};
 use iroh_gateway_edge::Edge;
-use iroh_gateway_operator::tunnel::{Connector, LinkOptions, ListenerState, StaticConnector};
-use iroh_gateway_proto::control::StreamHeader;
+use iroh_gateway_operator::tunnel::{
+    Connector, LinkOptions, ListenerState, MAX_STATUS_TEXT, StaticConnector,
+};
+use iroh_gateway_proto::control::{BindState, ListenerStatus, Status, StreamHeader};
+use iroh_gateway_proto::frame::write_frame;
 use iroh_gateway_proto::transport::Relay;
 use iroh_gateway_proto::{CLOSE_SHUTDOWN, RESET_BAD_HEADER, RESET_UNKNOWN_LISTENER};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -251,6 +254,9 @@ async fn unresolvable_address_keeps_retrying() {
     })
     .await;
     stays_disconnected(&rig.link, Duration::from_secs(1)).await;
+    let st = rig.link.state().borrow().clone();
+    let why = st.last_error.expect("no last_error after failed dials");
+    assert!(why.contains("no-such-host.invalid"), "{why}");
     // `shutdown` re-raises a panic of the link task.
     let started = Instant::now();
     timeout(Duration::from_secs(1), rig.link.shutdown())
@@ -293,6 +299,171 @@ fn no_address_and_no_relay_is_rejected() {
     assert_eq!(opts.connect_timeout, Duration::from_secs(5));
     assert_eq!(opts.backoff_min, Duration::from_millis(500));
     assert_eq!(opts.backoff_max, Duration::from_secs(30));
+    assert_eq!(opts.bind_retry, Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn bind_error_is_retried_and_recovers() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let p = held.local_addr().unwrap().port();
+    let echo = echo_server().await;
+    let rig = rig_with(&[(p, echo)], &[p], |_, opts| {
+        opts.bind_retry = Duration::from_millis(200);
+    })
+    .await;
+    let failed = wait_state(&rig.link, |s| {
+        s.listeners.len() == 1 && s.listeners[0].bound.is_err()
+    })
+    .await;
+
+    drop(held);
+    let freed = Instant::now();
+    let st = wait_state(&rig.link, |s| s.listeners == bound(&[p])).await;
+    let waited = freed.elapsed();
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    assert!(st.generation > failed.generation, "{st:?}");
+    echoes(&mut visitor(p).await, b"bound at last").await;
+
+    // Once every port is bound, no further config is sent.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(rig.link.state().borrow().generation, st.generation);
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn bind_retry_keeps_ids_under_a_new_generation() {
+    let echo = echo_server().await;
+    let (p, q) = (free_tcp_port(), free_tcp_port());
+    let fake = FakeEdge::bind().await;
+    let (link, _desired, _endpoint) = fake
+        .link_with(&[(p, echo), (q, echo)], &[p, q], |opts| {
+            opts.bind_retry = Duration::from_millis(200);
+        })
+        .await;
+    let mut s = fake.accept().await;
+    let cfg1 = s.read_config().await;
+    let status = Status {
+        generation: cfg1.generation,
+        listeners: vec![
+            ListenerStatus {
+                id: cfg1.listeners[0].id,
+                state: BindState::Bound,
+            },
+            ListenerStatus {
+                id: cfg1.listeners[1].id,
+                state: BindState::Error("address in use".into()),
+            },
+        ],
+        version: "fake".into(),
+    };
+    write_frame(&mut s.control_send, &status).await.unwrap();
+    wait_state(&link, |st| st.generation == cfg1.generation).await;
+
+    let cfg2 = s.read_config().await;
+    assert_eq!(cfg2.generation, cfg1.generation + 1);
+    assert_eq!(cfg2.listeners, cfg1.listeners);
+
+    // A status without a bind error stops the retries.
+    s.reply(&cfg2).await;
+    wait_state(&link, |st| {
+        st.generation == cfg2.generation && st.listeners == bound(&[p, q])
+    })
+    .await;
+    let more = timeout(Duration::from_millis(600), s.read_config()).await;
+    assert!(more.is_err(), "config sent to a healthy edge: {more:?}");
+    link.shutdown().await;
+}
+
+#[tokio::test]
+async fn last_error_explains_a_wrong_key() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let rig = rig_full(
+        &[(p, echo)],
+        &[p],
+        |e| e.operator = SecretKey::generate().public(),
+        |_, _| {},
+    )
+    .await;
+    let id = rig.operator_key.public();
+    let st = wait_state(&rig.link, |s| {
+        s.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("does not accept this operator's key"))
+    })
+    .await;
+    assert_eq!(
+        st.last_error.as_deref(),
+        Some(format!("the edge does not accept this operator's key ({id})").as_str())
+    );
+    assert!(!st.connected);
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn last_error_clears_on_connect() {
+    // A fake edge, so that the edge can go away and come back without its port being rebound.
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let fake = FakeEdge::bind().await;
+    let (link, _desired, _endpoint) = fake.link(&[(p, echo)], &[p]).await;
+    let mut s = fake.accept().await;
+    let cfg = s.read_config().await;
+    s.reply(&cfg).await;
+    let up = wait_state(&link, |st| st.connected).await;
+    assert_eq!(up.last_error, None);
+
+    // The edge goes down as it does on shutdown, and accepts nothing until it is back.
+    s.conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"shutdown");
+    let down = wait_state(&link, |st| !st.connected && st.last_error.is_some()).await;
+    assert!(down.listeners.is_empty(), "{down:?}");
+
+    // The first connected state seen from here on has no error.
+    let mut seen = link.state();
+    let mut s = fake.accept().await;
+    let cfg = s.read_config().await;
+    s.reply(&cfg).await;
+    let again = timeout(STEP, seen.wait_for(|st| st.connected))
+        .await
+        .expect("did not reconnect")
+        .unwrap()
+        .clone();
+    assert_eq!(again.last_error, None, "{again:?}");
+    assert_eq!(again.listeners, bound(&[p]));
+    link.shutdown().await;
+}
+
+#[tokio::test]
+async fn long_bind_error_is_truncated() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let fake = FakeEdge::bind().await;
+    let (link, _desired, _endpoint) = fake.link(&[(p, echo)], &[p]).await;
+    let mut s = fake.accept().await;
+    let cfg = s.read_config().await;
+    let status = Status {
+        generation: cfg.generation,
+        listeners: vec![ListenerStatus {
+            id: cfg.listeners[0].id,
+            state: BindState::Error("e".repeat(10 * 1024)),
+        }],
+        version: "v".repeat(10 * 1024),
+    };
+    write_frame(&mut s.control_send, &status).await.unwrap();
+    let st = wait_state(&link, |st| {
+        st.listeners.len() == 1 && st.listeners[0].bound.is_err()
+    })
+    .await;
+    let error = st.listeners[0].bound.as_ref().unwrap_err();
+    assert_eq!(error.chars().count(), MAX_STATUS_TEXT);
+    assert!(error.ends_with('…'), "{error}");
+    assert!(error.starts_with("eee"), "{error}");
+    let version = st.edge_version.as_deref().unwrap();
+    assert_eq!(version.chars().count(), MAX_STATUS_TEXT);
+    assert!(version.ends_with('…'), "{version}");
+    link.shutdown().await;
 }
 
 #[tokio::test]

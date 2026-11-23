@@ -297,6 +297,16 @@ impl FakeEdge {
         targets: &[(u16, SocketAddr)],
         desired: &[u16],
     ) -> (LinkHandle, watch::Sender<Vec<ListenerKey>>, Endpoint) {
+        self.link_with(targets, desired, |_| {}).await
+    }
+
+    /// [`FakeEdge::link`] with a hook to change the link's options.
+    pub async fn link_with(
+        &self,
+        targets: &[(u16, SocketAddr)],
+        desired: &[u16],
+        customize: impl FnOnce(&mut LinkOptions),
+    ) -> (LinkHandle, watch::Sender<Vec<ListenerKey>>, Endpoint) {
         let endpoint = bind_endpoint(SecretKey::generate(), &Relay::Disabled)
             .await
             .unwrap();
@@ -305,6 +315,7 @@ impl FakeEdge {
             LinkOptions::new(self.endpoint.id(), Some(addr.to_string()), Relay::Disabled).unwrap();
         opts.backoff_min = Duration::from_millis(50);
         opts.backoff_max = Duration::from_millis(200);
+        customize(&mut opts);
         let (desired, link) = spawn_link(endpoint.clone(), opts, targets, desired);
         (link, desired, endpoint)
     }
