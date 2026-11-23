@@ -27,6 +27,9 @@ pub(crate) struct ApplyRequest {
 /// stream and aborts its local socket.
 pub(crate) struct Session {
     pub id: u64,
+    /// Whether a `Config` from this session has been applied. Until then the listeners carry
+    /// ids from an earlier session, which this one's operator may not have issued.
+    pub configured: bool,
     conn: Connection,
     control: JoinHandle<()>,
     visitors: JoinSet<()>,
@@ -38,6 +41,7 @@ impl Session {
         let control = tokio::spawn(control(id, conn.clone(), apply));
         Self {
             id,
+            configured: false,
             conn,
             control,
             visitors: JoinSet::new(),
@@ -116,6 +120,7 @@ async fn forward(conn: Connection, accepted: Accepted) {
         visitor,
         local,
         permit,
+        ..
     } = accepted;
     let header = StreamHeader {
         listener_id,

@@ -312,13 +312,13 @@ async fn unknown_listener_resets_stream_only() {
     s.reply(&cfg).await;
     wait_state(&link, |st| st.connected).await;
 
-    let (_send, mut recv) = s.open(9999).await;
+    let (_send, mut recv) = s.open(9999, p).await;
     assert_eq!(
         reset_code(&mut recv).await,
         u64::from(RESET_UNKNOWN_LISTENER)
     );
 
-    let (send, recv) = s.open(id).await;
+    let (send, recv) = s.open(id, p).await;
     assert_eq!(stream_roundtrip(send, recv, b"ping").await, b"ping");
     assert!(s.conn.close_reason().is_none());
     link.shutdown().await;
@@ -343,7 +343,7 @@ async fn garbage_header_resets_stream_only() {
         Some(u64::from(RESET_BAD_HEADER))
     );
 
-    let (send, recv) = s.open(cfg.listeners[0].id).await;
+    let (send, recv) = s.open(cfg.listeners[0].id, p).await;
     assert_eq!(stream_roundtrip(send, recv, b"ping").await, b"ping");
     assert!(s.conn.close_reason().is_none());
     assert!(link.state().borrow().connected);
@@ -374,7 +374,7 @@ async fn oversized_header_prefix_resets_stream_only() {
         Some(u64::from(RESET_BAD_HEADER))
     );
 
-    let (send, recv) = s.open(cfg.listeners[0].id).await;
+    let (send, recv) = s.open(cfg.listeners[0].id, p).await;
     assert_eq!(stream_roundtrip(send, recv, b"ping").await, b"ping");
     assert!(s.conn.close_reason().is_none());
     link.shutdown().await;
@@ -396,7 +396,7 @@ async fn missing_header_resets_stream_after_timeout() {
     let opened = Instant::now();
 
     // The waiting stream does not hold up the next one.
-    let (send, recv) = s.open(cfg.listeners[0].id).await;
+    let (send, recv) = s.open(cfg.listeners[0].id, p).await;
     assert_eq!(stream_roundtrip(send, recv, b"ping").await, b"ping");
 
     assert_eq!(
@@ -409,6 +409,32 @@ async fn missing_header_resets_stream_after_timeout() {
         "{waited:?}"
     );
     assert!(s.conn.close_reason().is_none());
+    link.shutdown().await;
+}
+
+#[tokio::test]
+async fn mismatched_local_port_resets_stream() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let fake = FakeEdge::bind().await;
+    let (link, _desired, _endpoint) = fake.link(&[(p, echo)], &[p]).await;
+    let mut s = fake.accept().await;
+    let cfg = s.read_config().await;
+    s.reply(&cfg).await;
+    wait_state(&link, |st| st.connected).await;
+    let id = cfg.listeners[0].id;
+
+    // A valid id, but a visitor on another public port than that listener's.
+    let (_send, mut recv) = s.open(id, p ^ 1).await;
+    assert_eq!(
+        reset_code(&mut recv).await,
+        u64::from(RESET_UNKNOWN_LISTENER)
+    );
+
+    let (send, recv) = s.open(id, p).await;
+    assert_eq!(stream_roundtrip(send, recv, b"ping").await, b"ping");
+    assert!(s.conn.close_reason().is_none());
+    assert!(link.state().borrow().connected);
     link.shutdown().await;
 }
 
@@ -434,7 +460,7 @@ async fn stale_id_still_routes_after_config_change() {
     assert_eq!(ids[1].0, q);
     assert_ne!(ids[1].1, a);
 
-    let (send, recv) = s.open(a).await;
+    let (send, recv) = s.open(a, p).await;
     assert_eq!(stream_roundtrip(send, recv, b"stale").await, b"stale");
     link.shutdown().await;
 }

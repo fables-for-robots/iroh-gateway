@@ -165,10 +165,7 @@ impl Supervisor {
                     self.start_grace();
                 }
                 Some(req) = self.apply_rx.recv() => self.apply(req).await,
-                Some(accepted) = self.accepted.recv() => match &mut self.current {
-                    Some(session) => session.forward(accepted),
-                    None => debug!(visitor = %accepted.visitor, "visitor dropped: no session"),
-                },
+                Some(accepted) = self.accepted.recv() => self.visitor(accepted),
                 () = grace_fired(&mut self.grace_timer) => {
                     self.grace_timer = None;
                     info!("tunnel grace expired: closing all listeners");
@@ -209,12 +206,34 @@ impl Supervisor {
         self.current = Some(Session::start(id, conn, self.apply_tx.clone()));
     }
 
+    /// Forwards `accepted` under the id the current session's last `Config` gave its listener;
+    /// drops it (closing the visitor) when there is no such id.
+    fn visitor(&mut self, mut accepted: Accepted) {
+        let Some(session) = self.current.as_mut() else {
+            debug!(visitor = %accepted.visitor, "visitor dropped: no session");
+            return;
+        };
+        if !session.configured {
+            debug!(visitor = %accepted.visitor, "visitor dropped: session not configured yet");
+            return;
+        }
+        // The id is read now, not when the visitor was accepted: a `Config` applied since then
+        // may have changed or removed it.
+        let Some(id) = self.listeners.id_of(accepted.key) else {
+            debug!(visitor = %accepted.visitor, "visitor dropped: listener closed");
+            return;
+        };
+        accepted.listener_id = id;
+        session.forward(accepted);
+    }
+
     async fn apply(&mut self, req: ApplyRequest) {
         let Some(session) = self.current.as_mut().filter(|s| s.id == req.session) else {
             // From a session that has since been replaced or ended.
             return;
         };
         let status = self.listeners.apply(&req.cfg).await;
+        session.configured = true;
         self.grace_timer = None;
         info!(
             session = session.id,

@@ -347,13 +347,13 @@ impl FakeSession {
         write_frame(&mut self.control_send, &status).await.unwrap();
     }
 
-    /// Opens a visitor stream naming `listener_id`.
-    pub async fn open(&self, listener_id: u32) -> (SendStream, RecvStream) {
+    /// Opens a visitor stream naming `listener_id`, for a visitor on public port `local_port`.
+    pub async fn open(&self, listener_id: u32, local_port: u16) -> (SendStream, RecvStream) {
         let (mut send, recv) = self.conn.open_bi().await.unwrap();
         let header = StreamHeader {
             listener_id,
             visitor: "198.51.100.9:50000".parse().unwrap(),
-            local: "203.0.113.7:443".parse().unwrap(),
+            local: SocketAddr::from(([203, 0, 113, 7], local_port)),
         };
         write_frame(&mut send, &header).await.unwrap();
         (send, recv)

@@ -211,6 +211,41 @@ async fn new_operator_connection_replaces_old() {
 }
 
 #[tokio::test]
+async fn visitor_before_first_config_is_dropped() {
+    let key = SecretKey::generate();
+    let edge = spawn_edge(key.public(), GRACE, 100).await;
+    let mut fake1 = FakeOperator::connect(key.clone(), edge.endpoint_id(), edge.iroh_addr())
+        .await
+        .unwrap();
+    let p = free_tcp_port();
+    assert!(bound(&fake1.push(tcp_cfg(1, &[p])).await));
+
+    // Same key, as after an operator restart; it pushes no config yet.
+    let mut fake2 = FakeOperator::connect(key, edge.endpoint_id(), edge.iroh_addr())
+        .await
+        .unwrap();
+    timeout(STEP, fake1.conn.closed()).await.unwrap();
+    let mut v = visitor(p).await;
+    assert!(matches!(next_read(&mut v).await, Ok(0) | Err(_)));
+    assert!(
+        timeout(Duration::from_millis(500), fake2.accept_stream())
+            .await
+            .is_err(),
+        "a visitor reached a session that has applied no config"
+    );
+
+    assert!(bound(&fake2.push(tcp_cfg(2, &[p])).await));
+    let mut v = visitor(p).await;
+    v.write_all(b"now").await.unwrap();
+    let (header, _send, mut recv) = fake2.accept_from(v.local_addr().unwrap()).await;
+    assert_eq!(header.listener_id, 1);
+    let mut buf = [0u8; 3];
+    recv.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"now");
+    edge.shutdown().await;
+}
+
+#[tokio::test]
 async fn visitors_without_session_are_dropped() {
     let key = SecretKey::generate();
     let edge = spawn_edge(key.public(), GRACE, 100).await;

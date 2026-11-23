@@ -390,7 +390,11 @@ impl<C: Connector> Link<C> {
                 None => {
                     let Some(after) = self.next_id.checked_add(1) else {
                         // Unreachable in practice (2^32 keys added). Ids start over on the next
-                        // connection, which the edge cannot confuse with this one's.
+                        // connection, as they do after an operator restart. The edge keeps its
+                        // listeners' previous ids until the new session's first `Config` is
+                        // applied, but forwards no visitor on a session before that, and
+                        // `serve_stream` refuses a stream whose public port is not its
+                        // listener's, so an old id cannot reach another listener's backend.
                         self.ids.clear();
                         self.next_id = 1;
                         return Err(SessionError::Control(anyhow!("listener ids exhausted")));
@@ -523,6 +527,15 @@ async fn serve_stream<C: Connector>(
         let why = format!("unknown listener id {}", header.listener_id);
         return refuse(send, recv, RESET_UNKNOWN_LISTENER, why);
     };
+    if header.local.port() != key.port {
+        let why = format!(
+            "listener id {} is port {}, but the visitor came in on port {}",
+            header.listener_id,
+            key.port,
+            header.local.port()
+        );
+        return refuse(send, recv, RESET_UNKNOWN_LISTENER, why);
+    }
     let visitor = header.visitor;
     let local = match timeout(connect_timeout, connector.connect(key, &header)).await {
         Ok(Ok(local)) => local,

@@ -19,7 +19,10 @@ const ACCEPTED_QUEUE: usize = 1024;
 
 /// A visitor connection accepted on a public port.
 pub struct Accepted {
+    /// The listener's id when the visitor was accepted.
     pub listener_id: u32,
+    /// The listener the visitor connected to.
+    pub key: ListenerKey,
     pub stream: TcpStream,
     /// Canonical: an IPv4-mapped IPv6 address is turned into IPv4.
     pub visitor: SocketAddr,
@@ -85,6 +88,7 @@ impl ListenerSet {
                         let id = Arc::new(AtomicU32::new(l.id));
                         let task = tokio::spawn(accept_loop(
                             listener,
+                            key,
                             id.clone(),
                             self.permits.clone(),
                             self.tx.clone(),
@@ -109,6 +113,11 @@ impl ListenerSet {
         self.bound.clear();
     }
 
+    /// The id the last applied `Config` gave the listener on `key`, if it is still open.
+    pub fn id_of(&self, key: ListenerKey) -> Option<u32> {
+        self.bound.get(&key).map(|b| b.id.load(Ordering::Relaxed))
+    }
+
     pub fn bound(&self) -> Vec<ListenerKey> {
         let mut keys: Vec<_> = self.bound.keys().copied().collect();
         keys.sort_by_key(|k| k.port);
@@ -118,6 +127,7 @@ impl ListenerSet {
 
 async fn accept_loop(
     listener: TcpListener,
+    key: ListenerKey,
     id: Arc<AtomicU32>,
     permits: Arc<Semaphore>,
     tx: mpsc::Sender<Accepted>,
@@ -140,6 +150,7 @@ async fn accept_loop(
         };
         let accepted = Accepted {
             listener_id: id.load(Ordering::Relaxed),
+            key,
             stream,
             visitor: canonical(visitor),
             local: canonical(local),
@@ -250,6 +261,25 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().listener_id, 8);
         let _c3 = TcpStream::connect(("127.0.0.1", q)).await.unwrap();
         assert_eq!(rx.recv().await.unwrap().listener_id, 9);
+    }
+
+    #[tokio::test]
+    async fn id_of_follows_the_last_config() {
+        let p = free_port();
+        let key = ListenerKey {
+            protocol: Protocol::Tcp,
+            port: p,
+        };
+        let (mut set, mut rx) = new_set(10);
+        set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await;
+        let _c = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+        let a = rx.recv().await.unwrap();
+        assert_eq!((a.key, a.listener_id), (key, 1));
+        assert_eq!(set.id_of(key), Some(1));
+        set.apply(&cfg(2, &[(7, Protocol::Tcp, p)])).await;
+        assert_eq!(set.id_of(key), Some(7));
+        set.apply(&cfg(3, &[])).await;
+        assert_eq!(set.id_of(key), None);
     }
 
     #[tokio::test]
