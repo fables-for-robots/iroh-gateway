@@ -41,6 +41,13 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      - name: CRD manifest is up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -q -p iroh-gateway-operator --bin crdgen > "$RUNNER_TEMP/crd.yaml"
+          diff "$RUNNER_TEMP/crd.yaml" deploy/crd.yaml
+
       - name: iroh port mapping stays compiled out
         shell: bash
         run: |
