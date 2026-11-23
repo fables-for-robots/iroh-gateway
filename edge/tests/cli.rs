@@ -4,7 +4,7 @@
 #[allow(dead_code)]
 mod common;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
@@ -177,22 +177,64 @@ fn run_rejects_malformed_key_file() {
     assert_eq!(std::fs::read_to_string(&key).unwrap(), "abcd");
 }
 
+/// Runs `cmd` to completion; one still running after 10 s is killed and fails the test.
+fn output_within_10s(cmd: &mut Command) -> Output {
+    let mut child = Running(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "still running after 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
 #[test]
 fn run_rejects_bad_relay() {
     let dir = tempfile::tempdir().unwrap();
     let key = dir.path().join("e.key");
     let operator = SecretKey::generate().public().to_string();
-    let out = edge(&[
-        "run",
-        "--key-file",
-        key.to_str().unwrap(),
-        "--operator",
-        &operator,
-        "--relay",
-        "nonsense",
-    ]);
+    let out = output_within_10s(
+        Command::new(BIN)
+            .args(["run", "--key-file", key.to_str().unwrap()])
+            .args(["--operator", &operator, "--relay", "nonsense"])
+            .args(["--iroh-listen", &format!("127.0.0.1:{}", free_udp_port())])
+            .args(["--public-bind", "127.0.0.1"])
+            .env_remove("RUST_LOG"),
+    );
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("relay"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nonsense"), "{stderr}");
 }
 
 #[test]

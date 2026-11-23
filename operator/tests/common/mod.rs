@@ -97,15 +97,25 @@ pub async fn rig_with(
     desired: &[u16],
     customize: impl FnOnce(&EdgeHandle, &mut LinkOptions),
 ) -> Rig {
+    rig_full(targets, desired, |_| {}, customize).await
+}
+
+/// [`rig_with`] with a hook to change the edge's options as well.
+pub async fn rig_full(
+    targets: &[(u16, SocketAddr)],
+    desired: &[u16],
+    customize_edge: impl FnOnce(&mut EdgeOptions),
+    customize: impl FnOnce(&EdgeHandle, &mut LinkOptions),
+) -> Rig {
     let operator_key = SecretKey::generate();
     let edge_key = SecretKey::generate();
-    let edge = Edge::spawn(edge_options(
+    let mut edge_opts = edge_options(
         operator_key.public(),
         edge_key.clone(),
         "127.0.0.1:0".parse().unwrap(),
-    ))
-    .await
-    .unwrap();
+    );
+    customize_edge(&mut edge_opts);
+    let edge = Edge::spawn(edge_opts).await.unwrap();
     let endpoint = bind_endpoint(operator_key.clone(), &Relay::Disabled)
         .await
         .unwrap();

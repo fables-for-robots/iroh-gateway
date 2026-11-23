@@ -114,6 +114,42 @@ async fn backend_down_resets_visitor() {
 }
 
 #[tokio::test]
+async fn early_disconnects_release_slots_end_to_end() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let rig = rig_full(&[(p, echo)], &[p], |e| e.max_connections = 1, |_, _| {}).await;
+    wait_state(&rig.link, |s| s.listeners == bound(&[p])).await;
+
+    for _ in 0..20 {
+        drop(visitor(p).await);
+    }
+
+    // Each dropped visitor's slot comes back once the backend side of its connection has
+    // ended too, which takes a round trip through the tunnel.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let attempt = async {
+            let mut v = visitor(p).await;
+            v.write_all(b"ping").await?;
+            let mut buf = [0u8; 4];
+            timeout(Duration::from_millis(200), v.read_exact(&mut buf))
+                .await
+                .map_err(|_| std::io::Error::other("no echo in time"))??;
+            Ok::<_, std::io::Error>(buf)
+        };
+        match attempt.await {
+            Ok(buf) => {
+                assert_eq!(&buf, b"ping");
+                break;
+            }
+            Err(e) => assert!(Instant::now() < deadline, "no echo within 2 s: {e}"),
+        }
+    }
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
 async fn desired_change_adds_and_removes() {
     let echo = echo_server().await;
     let (p, q) = (free_tcp_port(), free_tcp_port());
