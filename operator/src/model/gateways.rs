@@ -85,6 +85,10 @@ fn listeners(specs: &[gateway_api::gateways::v1::GatewayListeners]) -> Vec<Liste
     // the protocol otherwise.
     let mut by_port: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
     for (i, l) in out.iter().enumerate() {
+        // Listeners with an invalid port (stored as 0) are already refused; they share nothing.
+        if l.port == 0 {
+            continue;
+        }
         by_port.entry(l.port).or_default().push(i);
     }
     for (port, members) in by_port.into_iter().filter(|(_, m)| m.len() > 1) {
@@ -128,10 +132,13 @@ fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel
         }
     };
     if spec.protocol != "TCP" {
-        accepted = Err(Reject::new(
-            "UnsupportedProtocol",
-            format!("protocol {:?} is not supported; only TCP is", spec.protocol),
-        ));
+        // An invalid port keeps its own rejection.
+        if accepted.is_ok() {
+            accepted = Err(Reject::new(
+                "UnsupportedProtocol",
+                format!("protocol {:?} is not supported; only TCP is", spec.protocol),
+            ));
+        }
         supported_kinds.clear();
     } else if let Some(kinds) = spec
         .allowed_routes
@@ -308,6 +315,50 @@ mod tests {
             assert_eq!(l.conflicted.as_ref().unwrap().reason, "ProtocolConflict");
         }
         assert_eq!(reason(&g.accepted), "ListenersNotValid");
+    }
+
+    #[test]
+    fn invalid_port_is_port_unavailable() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("ok", 5432, "TCP")
+                .listener("zero", 0, "TCP")
+                .listener("big", 70000, "TCP")
+                .listener("neg", -1, "TCP"),
+        ));
+        for l in &g.listeners[1..] {
+            assert_eq!(reason(&l.accepted), "PortUnavailable", "{}", l.name);
+            assert_eq!(l.conflicted, None);
+        }
+        assert_eq!(g.listeners[0].accepted, Ok(()));
+    }
+
+    #[test]
+    fn invalid_port_wins_over_unsupported_protocol() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("ok", 5432, "TCP")
+                .listener("bad", 0, "HTTP"),
+        ));
+        assert_eq!(reason(&g.listeners[1].accepted), "PortUnavailable");
+        assert!(g.listeners[1].supported_kinds.is_empty());
+    }
+
+    #[test]
+    fn invalid_port_listeners_do_not_conflict() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 0, "TCP")
+                .listener("b", 0, "TCP")
+                .listener("ok", 5432, "TCP"),
+        ));
+        for l in &g.listeners[..2] {
+            assert_eq!(reason(&l.accepted), "PortUnavailable");
+            assert_eq!(l.conflicted, None);
+        }
+        assert_eq!(g.listeners[2].accepted, Ok(()));
+        assert_eq!(g.listeners[2].conflicted, None);
+        assert_eq!(g.accepted, Ok(()));
     }
 
     #[test]

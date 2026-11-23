@@ -256,6 +256,11 @@ mod tests {
                 relay_settings(),
             ),
             (
+                "GatewayNotAccepted",
+                good("e", 1).gateway("broken"),
+                settings(&["infra"]),
+            ),
+            (
                 "InvalidAddress",
                 good("e", 1).address("203.0.113.7"),
                 settings(&["infra"]),
@@ -278,9 +283,69 @@ mod tests {
             ("Ok", good("e", 1), settings(&["infra"])),
         ];
         for (want, e, settings) in cases {
-            let m = build(&snap(vec![e]), &settings);
+            let mut s = snap(vec![e]);
+            s.gateways
+                .push(gateway("infra", "broken").listener("a", 80, "HTTP"));
+            let m = build(&s, &settings);
             assert_eq!(reason(&m.edges[0]), want);
         }
+    }
+
+    #[test]
+    fn edge_checks_run_in_table_order() {
+        let bad_id = |mut e: crate::crd::Edge| {
+            e.spec.endpoint_id = "nope".into();
+            e
+        };
+        let relay = relay_settings();
+        let plain = settings(&["infra"]);
+        let cases: Vec<(&str, crate::crd::Edge, &Settings)> = vec![
+            (
+                "NamespaceNotAllowed",
+                {
+                    let mut e = bad_id(good("e", 1));
+                    e.metadata.namespace = Some("other".into());
+                    e
+                },
+                &plain,
+            ),
+            (
+                "InvalidEndpointId",
+                bad_id(edge("infra", "e", 1).no_address().gateway("public")),
+                &plain,
+            ),
+            (
+                "NoAddress",
+                edge("infra", "e", 1).no_address().gateway("public"),
+                &plain,
+            ),
+            (
+                "NoPublicAddress",
+                edge("infra", "e", 1).no_address().gateway("absent"),
+                &relay,
+            ),
+            (
+                "InvalidAddress",
+                good("e", 1).address("203.0.113.7").gateway("absent"),
+                &plain,
+            ),
+            ("GatewayNotFound", good("e", 1).gateway("absent"), &plain),
+        ];
+        for (want, e, settings) in cases {
+            let m = build(&snap(vec![e]), settings);
+            assert_eq!(reason(&m.edges[0]), want);
+        }
+
+        // An unaccepted gateway is reported before a duplicate id.
+        let mut s = snap(vec![
+            good("older", 1).gateway("broken").created(10),
+            good("younger", 1).gateway("broken").created(20),
+        ]);
+        s.gateways
+            .push(gateway("infra", "broken").listener("a", 80, "HTTP"));
+        let m = build(&s, &settings(&["infra"]));
+        assert_eq!(reason(&m.edges[0]), "GatewayNotAccepted");
+        assert_eq!(reason(&m.edges[1]), "GatewayNotAccepted");
     }
 
     fn relay_settings() -> Settings {
