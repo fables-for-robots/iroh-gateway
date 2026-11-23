@@ -18,11 +18,12 @@ The binaries are `target/release/iroh-gateway-edge` and `target/release/iroh-gat
 
 ## Quickstart
 
-Everything on one machine, over loopback. Run each numbered block in its own terminal, from the repository root.
+Everything on one machine, over loopback. Run every command below in the same terminal, from the repository root, one block after another.
 
-1. Create both keys and note the two ids:
+1. Build, create both keys and note the two ids:
 
    ```sh
+   cargo build --release
    EDGE=target/release/iroh-gateway-edge
    OPERATOR=target/release/iroh-gateway-operator
    EDGE_ID=$($EDGE id --key-file edge.key)
@@ -30,20 +31,22 @@ Everything on one machine, over loopback. Run each numbered block in its own ter
    echo "edge: $EDGE_ID"; echo "operator: $OPERATOR_ID"
    ```
 
-2. Start something to expose:
+2. Start something to expose, in the background (the `docs` directory, so the keys are not served):
 
    ```sh
-   python3 -m http.server 3000 --bind 127.0.0.1
+   python3 -m http.server 3000 --bind 127.0.0.1 --directory docs >/dev/null 2>&1 &
+   TARGET_PID=$!
    ```
 
-3. Start the edge, serving only that operator. Use the same shell variables as in step 1 (or paste the ids):
+3. Start the edge in the background, serving only that operator:
 
    ```sh
    $EDGE run --key-file edge.key --operator "$OPERATOR_ID" \
-       --iroh-listen 127.0.0.1:7842 --public-bind 127.0.0.1
+       --iroh-listen 127.0.0.1:7842 --public-bind 127.0.0.1 2>edge.log &
+   EDGE_PID=$!
    ```
 
-4. Write the operator configuration and start the operator:
+4. Write the operator configuration and start the operator in the background:
 
    ```sh
    cat > operator.toml <<EOF
@@ -58,16 +61,26 @@ Everything on one machine, over loopback. Run each numbered block in its own ter
    port = 8080
    target = "127.0.0.1:3000"
    EOF
-   $OPERATOR static --config operator.toml
+   $OPERATOR static --config operator.toml 2>operator.log &
+   OPERATOR_PID=$!
    ```
 
-5. Visit the target through the edge port:
+5. Visit the target through the edge port (give the operator a moment to connect):
 
    ```sh
+   sleep 2
    curl http://127.0.0.1:8080/
    ```
 
-   You get the directory listing of `python3 -m http.server`. Stop each process with Ctrl-C.
+   You get the directory listing of `python3 -m http.server`. The edge and operator logs are in `edge.log` and `operator.log`.
+
+6. Stop everything and remove what the quickstart created:
+
+   ```sh
+   kill $OPERATOR_PID $EDGE_PID $TARGET_PID
+   wait
+   rm -f edge.key operator.key operator.toml edge.log operator.log
+   ```
 
 On a real deployment the edge runs on the public machine with `--iroh-listen <public-ip>:7842` and the default `--public-bind ::`, the operator config names the edge's public address, and `port = 8080` is whatever public port you want. Key files must be backed up: the key is the identity. Both binaries log to stderr; set `RUST_LOG` to change the level (default `info`).
 
