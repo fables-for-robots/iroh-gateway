@@ -644,6 +644,50 @@ async fn reload_without_a_reply_times_out_and_restores() {
 }
 
 #[tokio::test]
+async fn restore_replaces_the_file_instead_of_rewriting_it() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = short_dir();
+    let mut o = opts(&dir);
+    o.haproxy_bin = fake_haproxy(&dir);
+    o.reload_timeout = Duration::from_millis(500);
+    let (server, _reloads) = fake_master(&dir);
+    let old = "global\n";
+    let new = "global\n    maxconn 10\n";
+    let mut sup = Supervisor::start(o, old).await.unwrap();
+    let pid = fake_pid(&dir).await;
+    let cfg = dir.path().join("haproxy.cfg");
+    let seen = dir.path().join("seen.cfg");
+    // While the reload waits for its reply, keep a second name for the file HAProxy was told to
+    // load. A restore in place would change what that name shows.
+    let watch = async {
+        let deadline = Instant::now() + STEP;
+        while std::fs::read_to_string(&cfg).ok().as_deref() != Some(new) {
+            assert!(
+                Instant::now() < deadline,
+                "the new configuration was never written"
+            );
+            sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::hard_link(&cfg, &seen).unwrap();
+    };
+    let (applied, ()) = tokio::join!(sup.apply(new), watch);
+    assert!(
+        matches!(applied, Err(ApplyError::ReloadFailed(_))),
+        "{applied:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), old);
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), new);
+    assert_ne!(
+        std::fs::metadata(&cfg).unwrap().ino(),
+        std::fs::metadata(&seen).unwrap().ino()
+    );
+    assert!(!exists(&dir.path().join("haproxy.cfg.new")));
+    server.abort();
+    sup.shutdown().await;
+    gone(&[pid]).await;
+}
+
+#[tokio::test]
 async fn apply_after_a_timed_out_reload_reloads_again() {
     let dir = short_dir();
     let mut o = opts(&dir);

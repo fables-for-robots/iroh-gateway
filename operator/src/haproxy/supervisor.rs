@@ -240,8 +240,16 @@ impl Supervisor {
             self.current = previous;
         }
         warn!(error = %failure, "haproxy reload failed; restoring the previous configuration");
+        // Written beside it and renamed over it, never rewritten in place: a reload whose
+        // outcome was lost may still be reading the file.
         let path = dir.join(CFG);
-        if let Err(e) = tokio::fs::write(&path, &self.loaded).await {
+        let staged = dir.join(CFG_NEW);
+        let restored = match tokio::fs::write(&staged, &self.loaded).await {
+            Ok(()) => tokio::fs::rename(&staged, &path).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = restored {
+            let _ = tokio::fs::remove_file(&staged).await;
             return Err(ApplyError::Io(io::Error::new(
                 e.kind(),
                 format!(
