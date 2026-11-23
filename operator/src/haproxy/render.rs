@@ -27,8 +27,17 @@ pub struct EdgePlan {
     pub endpoint_id: iroh::EndpointId,
     pub address: Option<String>,
     pub gateway: ObjRef,
-    /// The Gateway's serving TCP ports and the socket behind each.
-    pub sockets: HashMap<ListenerKey, PathBuf>,
+    /// The Gateway's serving TCP ports and what HAProxy serves behind each.
+    pub sockets: HashMap<ListenerKey, PortPlan>,
+}
+
+/// One port of an [`EdgePlan`]: HAProxy's socket for it, and a fingerprint of what is behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortPlan {
+    pub socket: PathBuf,
+    /// The first 16 hex characters of SHA-256 over the exact text of the port's `frontend` and
+    /// `backend` sections: equal fingerprints, equal traffic behind the socket.
+    pub fingerprint: String,
 }
 
 pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
@@ -64,22 +73,21 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
         .collect();
     gateways.sort_by(|a, b| a.key.cmp(&b.key));
 
-    let mut sockets: HashMap<&ObjRef, HashMap<ListenerKey, PathBuf>> = HashMap::new();
+    let mut sockets: HashMap<&ObjRef, HashMap<ListenerKey, PortPlan>> = HashMap::new();
     for gateway in &gateways {
         let per_gateway = sockets.entry(&gateway.key).or_default();
         let mut listeners: Vec<_> = gateway.listeners.iter().filter(|l| l.serving()).collect();
         listeners.sort_by_key(|l| l.port);
         for listener in listeners {
             let id = port_id(&gateway.key, listener.port);
-            let _ = write!(
-                cfg,
-                "\n# {} port {}\n\
-                 frontend fe_{id}\n\
+            let _ = write!(cfg, "\n# {} port {}\n", gateway.key, listener.port);
+            // The port's own sections, which its fingerprint covers.
+            let mut section = format!(
+                "frontend fe_{id}\n\
                  \x20   bind unix@{dir}/s/{id}.sock accept-proxy mode 600\n\
                  \x20   default_backend be_{id}\n\
                  \n\
-                 backend be_{id}\n",
-                gateway.key, listener.port
+                 backend be_{id}\n"
             );
             let weights: Vec<u32> = listener.backends.iter().map(|b| b.weight).collect();
             for (i, (backend, weight)) in listener
@@ -93,21 +101,30 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
                 }
                 let _ = match backend.ip {
                     IpAddr::V4(ip) => {
-                        writeln!(cfg, "    server s{i} {ip}:{} weight {weight}", backend.port)
+                        writeln!(
+                            section,
+                            "    server s{i} {ip}:{} weight {weight}",
+                            backend.port
+                        )
                     }
                     IpAddr::V6(ip) => writeln!(
-                        cfg,
+                        section,
                         "    server s{i} [{ip}]:{} weight {weight}",
                         backend.port
                     ),
                 };
             }
+            cfg.push_str(&section);
+            let digest = hex::encode(Sha256::digest(&section));
             per_gateway.insert(
                 ListenerKey {
                     protocol: Protocol::Tcp,
                     port: listener.port,
                 },
-                socket(&id),
+                PortPlan {
+                    socket: socket(&id),
+                    fingerprint: digest[..16].to_owned(),
+                },
             );
         }
     }
@@ -261,10 +278,59 @@ mod tests {
         let r = render_in(&m);
         assert_eq!(r.haproxy_cfg, include_str!("testdata/one.cfg"));
         assert_eq!(r.edges.len(), 1);
+        // The fingerprint covers the port's frontend and backend sections, to the end.
+        let golden = include_str!("testdata/one.cfg");
+        let section = &golden[golden.find("frontend fe_7903a80c6832446b").unwrap()..];
+        let digest = hex::encode(Sha256::digest(section));
         assert_eq!(
             r.edges[0].sockets,
-            HashMap::from([(tcp(5432), PathBuf::from("/run/igw/s/7903a80c6832446b.sock"))])
+            HashMap::from([(
+                tcp(5432),
+                PortPlan {
+                    socket: PathBuf::from("/run/igw/s/7903a80c6832446b.sock"),
+                    fingerprint: digest[..16].to_owned(),
+                }
+            )])
         );
+    }
+
+    #[test]
+    fn fingerprint_follows_the_ports_own_sections() {
+        let g = gw("gw", "public");
+        let plan = |backends: Vec<Backend>, other_port_backend: &str| {
+            let m = model(
+                vec![gateway(
+                    g.clone(),
+                    vec![
+                        listener(80, backends),
+                        listener(81, vec![backend(other_port_backend, 81, 1)]),
+                    ],
+                )],
+                vec![edge("e", 1, &g)],
+            );
+            render_in(&m).edges[0].sockets.clone()
+        };
+        let base = plan(vec![backend("10.0.0.1", 80, 1)], "10.0.0.9");
+        let fp = |s: &HashMap<ListenerKey, PortPlan>, port| s[&tcp(port)].fingerprint.clone();
+        assert_eq!(fp(&base, 80).len(), 16);
+        assert!(fp(&base, 80).chars().all(|c| c.is_ascii_hexdigit()));
+        // Equal input, equal fingerprint.
+        assert_eq!(plan(vec![backend("10.0.0.1", 80, 1)], "10.0.0.9"), base);
+        // A server line differs: that port's fingerprint changes, the other's does not.
+        let moved = plan(vec![backend("10.0.0.2", 80, 1)], "10.0.0.9");
+        assert_ne!(fp(&moved, 80), fp(&base, 80));
+        assert_eq!(fp(&moved, 81), fp(&base, 81));
+        let weighted = plan(
+            vec![backend("10.0.0.1", 80, 1), backend("10.0.0.3", 80, 2)],
+            "10.0.0.9",
+        );
+        assert_ne!(fp(&weighted, 80), fp(&base, 80));
+        // Another port's backend changing leaves this one alone.
+        let elsewhere = plan(vec![backend("10.0.0.1", 80, 1)], "10.0.0.8");
+        assert_eq!(fp(&elsewhere, 80), fp(&base, 80));
+        assert_ne!(fp(&elsewhere, 81), fp(&base, 81));
+        // The socket stays the same throughout.
+        assert_eq!(moved[&tcp(80)].socket, base[&tcp(80)].socket);
     }
 
     #[test]
@@ -429,7 +495,7 @@ mod tests {
         );
         let r = render(&m, Path::new(&dir));
         for p in r.edges[0].sockets.values() {
-            assert!(p.as_os_str().len() <= 103, "{}", p.display());
+            assert!(p.socket.as_os_str().len() <= 103, "{}", p.socket.display());
         }
         assert_eq!(r.edges[0].sockets.len(), 1);
     }

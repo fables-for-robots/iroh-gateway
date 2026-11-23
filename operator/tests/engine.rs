@@ -705,6 +705,43 @@ async fn moving_an_edge_to_another_gateway_reaches_its_backend() {
 }
 
 #[tokio::test]
+async fn failed_apply_that_changes_a_kept_ports_backend_closes_it() {
+    let w = World::with_tagged(&[("gw", b"A")]).await;
+    let other = tagged_echo(b"B").await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let mut engine = w
+        .start(w.plan(&[("gw", &[p])], &[at("e", "gw", &edge)]))
+        .await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(tag_on(p).await, b"A");
+
+    // The same gateway, port and socket, but another backend behind the socket.
+    let mut model = w.model(&[("gw", &[p])], &[at("e", "gw", &edge)]);
+    model.gateways[0].listeners[0].backends[0].port = other.port();
+    let moved = render(&model, w.dir.path());
+    let before = w.plan(&[("gw", &[p])], &[at("e", "gw", &edge)]);
+    assert_eq!(
+        moved.edges[0].sockets[&tcp(p)].socket,
+        before.edges[0].sockets[&tcp(p)].socket
+    );
+
+    let mut bad = moved.clone();
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    assert!(engine.facts().haproxy.is_err());
+    refused(p).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[])).await;
+
+    engine.apply(moved).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(tag_on(p).await, b"B");
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_apply_that_moves_an_edge_closes_its_port() {
     let w = World::with_tagged(&[("gw1", b"A"), ("gw2", b"B")]).await;
     let edge = w.edge().await;

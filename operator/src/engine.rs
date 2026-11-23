@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 use tracing::{error, info, warn};
 
-use crate::haproxy::render::{EdgePlan, Rendered};
+use crate::haproxy::render::{EdgePlan, PortPlan, Rendered};
 use crate::haproxy::{ApplyError, Supervisor, SupervisorOptions};
 use crate::model::ObjRef;
 use crate::status::Facts;
@@ -83,8 +83,11 @@ struct Running {
     state: watch::Receiver<EdgeState>,
     desired: watch::Sender<Vec<ListenerKey>>,
     connector: Arc<HaproxyConnector>,
-    /// The table `connector` was last given.
-    sockets: HashMap<ListenerKey, PathBuf>,
+    /// The ports in the table `connector` was last given, which are also the ports this link
+    /// asks its edge for (once published).
+    sockets: HashMap<ListenerKey, PortPlan>,
+    /// The ports of this link in the last plan HAProxy loaded.
+    loaded: HashMap<ListenerKey, PortPlan>,
 }
 
 impl Engine {
@@ -114,7 +117,8 @@ impl Engine {
     ///
     /// Links of edges that left the plan, or whose id or address changed, are shut down in any
     /// case. Only when HAProxy took the configuration are links started and ports added; when it
-    /// did not, each link keeps only the ports whose socket the old and the new plan share.
+    /// did not, each link keeps only the ports whose [`PortPlan`] (socket and fingerprint) in the
+    /// new plan is the one HAProxy last loaded.
     ///
     /// Not meant to be cancelled, and the reconcile loop never cancels it. A cancelled call can
     /// leave the links of the edges that left the plan removed while the other links keep their
@@ -266,11 +270,14 @@ impl Engine {
         let mut new = Vec::new();
         for plan in plans {
             match self.links.get_mut(&plan.key) {
-                Some(link) => link.set_sockets(plan.sockets.clone()),
+                Some(link) => {
+                    link.set_sockets(plan.sockets.clone());
+                    link.loaded = plan.sockets.clone();
+                }
                 None => {
                     if let Ok(opts) = self.link_options(plan) {
                         let connector = Arc::new(HaproxyConnector::new());
-                        connector.set(plan.sockets.clone());
+                        connector.set(paths(&plan.sockets));
                         new.push((plan, opts, connector));
                     }
                 }
@@ -289,6 +296,7 @@ impl Engine {
                 desired,
                 connector,
                 sockets: plan.sockets.clone(),
+                loaded: plan.sockets.clone(),
             };
             self.links.insert(plan.key.clone(), link);
         }
@@ -299,28 +307,45 @@ impl Engine {
         }
     }
 
-    /// After HAProxy refused the configuration: each link keeps only the ports whose socket is
-    /// the same in its old and its new plan.
+    /// After HAProxy refused the configuration: each link keeps only the ports whose
+    /// [`PortPlan`] in the new plan is the one HAProxy last loaded; nothing is added.
     fn cut_down(&mut self, plans: &[EdgePlan]) {
         for plan in plans {
             if let Some(link) = self.links.get_mut(&plan.key) {
-                let kept = link
-                    .sockets
-                    .iter()
-                    .filter(|(key, path)| plan.sockets.get(key) == Some(path))
-                    .map(|(key, path)| (*key, path.clone()))
-                    .collect();
-                link.set_sockets(kept);
+                link.keep_unchanged(plan);
                 link.publish();
             }
         }
     }
 }
 
+/// The socket of each port, as the connector takes them.
+fn paths(sockets: &HashMap<ListenerKey, PortPlan>) -> HashMap<ListenerKey, PathBuf> {
+    sockets
+        .iter()
+        .map(|(key, port)| (*key, port.socket.clone()))
+        .collect()
+}
+
 impl Running {
-    fn set_sockets(&mut self, sockets: HashMap<ListenerKey, PathBuf>) {
-        self.connector.set(sockets.clone());
+    fn set_sockets(&mut self, sockets: HashMap<ListenerKey, PortPlan>) {
+        self.connector.set(paths(&sockets));
         self.sockets = sockets;
+    }
+
+    /// Cuts the table to the ports whose [`PortPlan`] in `plan` is the one HAProxy last loaded.
+    fn keep_unchanged(&mut self, plan: &EdgePlan) {
+        let kept = self
+            .sockets
+            .iter()
+            .filter(|(key, _)| {
+                plan.sockets
+                    .get(key)
+                    .is_some_and(|port| self.loaded.get(key) == Some(port))
+            })
+            .map(|(key, port)| (*key, port.clone()))
+            .collect();
+        self.set_sockets(kept);
     }
 
     /// Asks the edge for the ports in the socket table, sorted by port.
