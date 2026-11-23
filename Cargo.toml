@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["proto", "edge"]
+members = ["proto", "edge", "operator"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +11,7 @@ repository = "https://github.com/fables-for-robots/iroh-gateway"
 [workspace.dependencies]
 anyhow = "1"
 ciborium = "0.2"
+fastrand = "2"
 hex = "0.4"
 iroh = "1"
 serde = { version = "1", features = ["derive"] }

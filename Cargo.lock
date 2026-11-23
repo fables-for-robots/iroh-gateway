@@ -1565,6 +1565,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-gateway-operator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fastrand",
+ "iroh",
+ "iroh-gateway-edge",
+ "iroh-gateway-proto",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iroh-gateway-proto"
 version = "0.1.0"
 dependencies = [

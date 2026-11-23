@@ -1,0 +1,20 @@
+[package]
+name = "iroh-gateway-operator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fastrand.workspace = true
+iroh.workspace = true
+iroh-gateway-proto = { path = "../proto" }
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+iroh = { workspace = true, features = ["test-utils"] }
+iroh-gateway-edge = { path = "../edge" }
+tokio = { workspace = true, features = ["io-util", "time"] }
