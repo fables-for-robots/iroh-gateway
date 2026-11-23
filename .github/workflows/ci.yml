@@ -41,13 +41,15 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
-      # The operator's cluster tests run a real kube-apiserver and etcd, which
-      # setup-envtest downloads into target/envtest/.
+      # The operator's cluster tests run a real kube-apiserver and etcd (Kubernetes 1.37.0),
+      # which setup-envtest downloads into target/envtest/, with the Gateway API CRDs.
       - name: Cluster tests
         shell: bash
         run: |
           set -euo pipefail
-          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+          # The setup-envtest the flake provides: controller-runtime v0.22.3, which has no
+          # module tag of its own for tools/setup-envtest, hence the pseudo-version of its commit.
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20251010212459-3e8b2594ffc4
           export PATH="$(go env GOPATH)/bin:$PATH"
           assets="$(scripts/envtest-assets)"
           test -n "$assets"

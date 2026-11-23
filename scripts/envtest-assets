@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Downloads kube-apiserver and etcd for this platform into target/envtest/ (once), and the
-# Gateway API v1.7.0 standard manifest next to them (once, checked against its SHA-256), and
-# prints the directory that holds the binaries, for KUBEBUILDER_ASSETS:
+# Downloads kube-apiserver and etcd of Kubernetes 1.37.0 (the same locally and in CI) for this
+# platform into target/envtest/ (once), and the Gateway API v1.7.0 standard manifest next to
+# them (once, checked against its SHA-256), and prints the directory that holds the binaries,
+# for KUBEBUILDER_ASSETS:
 #
 #   KUBEBUILDER_ASSETS=$(scripts/envtest-assets) cargo test -p iroh-gateway-operator \
 #       --test cluster -- --ignored
@@ -11,6 +12,7 @@
 # Prints nothing else on stdout.
 set -euo pipefail
 
+kubernetes_version=1.37.0
 gateway_api_url=https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 gateway_api_sha256=4e2602c4cbe1afbc394d86f4ac6522e1a5263b01133bba1e40a6d1a549e753a1
 
@@ -30,5 +32,5 @@ if [ ! -f "$manifest" ]; then
   mv "$partial" "$manifest"
 fi
 
-setup-envtest use -p path --bin-dir "$bin_dir"
+setup-envtest use "$kubernetes_version" -p path --bin-dir "$bin_dir"
 echo
