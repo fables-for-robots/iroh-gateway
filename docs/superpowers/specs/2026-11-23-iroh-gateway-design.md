@@ -39,8 +39,12 @@ with one.
 
 - Visitors only ever see edge IPs.
 - The cluster needs no inbound port; it dials out to the edges.
-- No third party is involved in the tunnel: no public relays, no public
-  address lookup. The home IP is known to the edge machines and nobody else.
+- By default no third party is involved in the tunnel: no public relays, no
+  public address lookup. The home IP is known to the edge machines and
+  nobody else.
+- An edge can also be reached through an iroh relay with address lookup,
+  for networks where a direct connection is not possible. This is opt-in and
+  its privacy cost is documented (see "Relay mode").
 - The edge holds no TLS keys and no routing knowledge. TLS terminates in
   the cluster.
 - Exposure is declared with standard Gateway API resources, so cert-manager
@@ -61,7 +65,8 @@ with one.
   `ReferenceGrant`, backendRef-level filters, `URLRewrite`, request
   mirroring.
 - Balancing across individual pods (see "Backends").
-- Relay fallback for networks that block outbound UDP.
+- Running a relay. Relay mode uses n0's public relays or one the owner
+  already runs.
 - Rate limiting, WAF, bot protection.
 - Issuing certificates or managing DNS records (cert-manager and
   external-dns do that).
@@ -147,6 +152,8 @@ integrated product was preferred over composing two.
 - The owner deploys edges; the operator calls no provider APIs.
 - Edges are accepted only if their iroh key is listed in the cluster.
 - TCP is built before UDP.
+- An edge must also be reachable through a relay with discovery.
+- Rust 1.100.
 
 Everything below is the designer's call unless marked otherwise.
 
@@ -169,7 +176,7 @@ the binary so they can be split into separate pods later.
 ### Who dials whom
 
 **The operator dials each edge**, directly, at the address in the `Edge`
-resource. Neither side uses relays or address lookup.
+resource. By default neither side uses relays or address lookup.
 
 This reverses an earlier suggestion that the edge dials in. The reason: an
 edge has a stable public address and the cluster does not, so dialing
@@ -189,6 +196,32 @@ own namespace, so its identity survives restarts. Its EndpointId is logged
 at startup and written to `Edge.status.gatewayEndpointId`.
 
 The operator redials a lost edge with capped exponential backoff, forever.
+
+### Relay mode
+
+Relay mode is off by default. It exists for cases where the direct path
+fails: a home network that blocks outbound UDP, a provider firewall that
+blocks the edge's iroh port, or an edge whose address changes.
+
+One setting, with the same value on the operator and on its edges:
+
+| Value | Edge | Operator |
+|---|---|---|
+| `disabled` (default) | direct only | direct only; every `Edge` needs an `address` |
+| `n0` | uses n0's public relays and publishes its relay URL (no IP addresses) to n0's lookup service | uses n0's relays and looks edges up there; publishes nothing |
+| a relay URL | uses that relay | uses that relay; no lookup service |
+
+- The operator still dials. An `Edge` with an `address` is tried directly
+  and through the relay; iroh moves to the direct path whenever one works.
+  An `Edge` without an `address` is found through the relay alone.
+- Key pinning is unchanged, and traffic stays encrypted end to end between
+  the two pinned keys. A relay cannot read or alter it.
+- What a relay does learn: the home IP (the operator connects to it), the
+  edge's IP, and the size and timing of relayed traffic. With `n0`, n0's
+  lookup service also sees lookups coming from home. This is the trade the
+  owner makes by turning it on, and the README says so next to the setting.
+- An edge still needs a public IP for visitors. Relay mode changes how the
+  tunnel is established, not how visitors arrive.
 
 ### What an edge does
 
@@ -259,10 +292,12 @@ metadata:
   namespace: iroh-gateway
 spec:
   endpointId: <edge public key>
-  address: 203.0.113.7:7842        # where the operator dials; IP or DNS name
+  address: 203.0.113.7:7842        # where the operator dials; IP or DNS name.
+                                   # Optional in relay mode.
   gatewayRef:
     name: public                   # same namespace only
-  publicAddresses: []              # optional; defaults to the IP in `address`
+  publicAddresses: []              # defaults to the IP in `address`;
+                                   # required when `address` is absent
 status:
   gatewayEndpointId: <operator public key>
   conditions:                      # Connected, Programmed
@@ -270,6 +305,9 @@ status:
     - {protocol: TCP, port: 443, bound: true}
 ```
 
+- An `Edge` without `address` is `Accepted=False` when relay mode is
+  `disabled`, and one without both `address` and `publicAddresses` is
+  always `Accepted=False`.
 - An edge serves exactly one Gateway. A Gateway is served by any number of
   edges, and every edge of a Gateway opens all of that Gateway's ports.
   Edges are never shared, so two Gateways can never fight over a port.
@@ -415,8 +453,12 @@ for them, so an edge never opens a port that has nothing behind it.
   unit (dynamic user, `CAP_NET_BIND_SERVICE` only), and a NixOS module from
   the flake. Subcommands: `run`, and `id` to print the EndpointId.
   Configuration: key file path, operator EndpointId, iroh listen address,
-  connection cap.
-- **Flake** dev shell: Rust toolchain, `haproxy`, `kind`, `kubectl`, `helm`.
+  connection cap, relay mode.
+- **Operator relay mode** is a chart value, default `disabled`.
+- **Toolchain.** Rust 1.100 (`rust-version = "1.100"`). nixpkgs 26.05 ships
+  1.95 and unstable 1.99, so the flake takes the toolchain from
+  `oxalica/rust-overlay`, pinned by a `rust-toolchain.toml`.
+- **Flake** dev shell: that toolchain, `haproxy`, `kind`, `kubectl`, `helm`.
 - **License** AGPL-3.0-or-later, as the sibling projects.
 
 ## Observability
@@ -434,7 +476,8 @@ HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
 - **Integration, no cluster.** Edge and operator tunnel endpoints in one
   process over loopback with relays off: TCP echo including half-close and
   reset; UDP echo including packets above the datagram size; reconnect after
-  the edge restarts; rejection of an unlisted key. A real `haproxy` binary
+  the edge restarts; rejection of an unlisted key; an edge with no direct
+  address reached through a relay started inside the test. A real `haproxy` binary
   for HTTP routing, TLS termination and reload-on-change.
 - **End to end.** A kind cluster with the chart installed and an edge
   process outside it: HTTP, HTTPS with a test certificate, TCP and UDP
@@ -460,8 +503,8 @@ Each step ends in something that runs.
 - Several edges per Gateway with tested failover: addresses leave
   `Gateway.status` when an edge is unhealthy, with debouncing.
 - Several operator replicas.
-- `ReferenceGrant`, `TLSRoute`, per-pod balancing, relay fallback, opt-in
-  PROXY protocol towards TCP backends.
+- `ReferenceGrant`, `TLSRoute`, per-pod balancing, opt-in PROXY protocol
+  towards TCP backends.
 
 ## Left to the builder
 
