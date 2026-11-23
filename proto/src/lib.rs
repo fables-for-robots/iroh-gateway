@@ -4,6 +4,7 @@ pub mod control;
 pub mod frame;
 pub mod key;
 pub mod splice;
+pub mod tcp;
 pub mod transport;
 
 pub const ALPN: &[u8] = b"iroh-gateway/0";

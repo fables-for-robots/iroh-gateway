@@ -20,6 +20,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 nix.workspace = true
+socket2.workspace = true
 tempfile.workspace = true
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-gateway-edge = { path = "../edge" }

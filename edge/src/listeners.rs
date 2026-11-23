@@ -9,6 +9,7 @@ use std::time::Duration;
 use iroh_gateway_proto::control::{
     BindState, Config, ListenerKey, ListenerStatus, Protocol, Status,
 };
+use iroh_gateway_proto::tcp::set_keepalive_and_nodelay;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -133,6 +134,7 @@ async fn accept_loop(
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue; // cap reached: dropping the stream closes the visitor
         };
+        set_keepalive_and_nodelay(&stream);
         let Ok(local) = stream.local_addr() else {
             continue;
         };
@@ -351,6 +353,25 @@ mod tests {
         set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await;
         drop(set);
         assert_eq!(refused(p).await, std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn accepted_socket_has_keepalive_and_nodelay() {
+        use iroh_gateway_proto::tcp::{KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_PROBES};
+        let p = free_port();
+        let (mut set, mut rx) = new_set(10);
+        set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await;
+        let _c = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+        let a = rx.recv().await.unwrap();
+        let sock = socket2::SockRef::from(&a.stream);
+        assert!(sock.keepalive().unwrap());
+        assert!(sock.tcp_nodelay().unwrap());
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(sock.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
+        }
     }
 
     #[test]

@@ -3,6 +3,8 @@
 
 use std::{
     future::{Future, pending},
+    pin::{Pin, pin},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -19,6 +21,9 @@ const BUF_LEN: usize = 64 * 1024;
 /// How long the local side may accept no bytes while data is waiting for it before the splice
 /// gives up on it.
 pub const LOCAL_WRITE_STALL: Duration = Duration::from_secs(300);
+
+/// How long the direction still open may move nothing once the other has ended.
+pub const HALF_CLOSED_IDLE: Duration = Duration::from_secs(300);
 
 /// A local socket that can be torn down abruptly.
 pub trait LocalStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
@@ -53,6 +58,8 @@ pub enum SpliceEnd {
     RemoteReset,
     /// The QUIC connection went away.
     ConnectionLost,
+    /// One direction had ended and the other moved no byte for `half_closed_idle`.
+    HalfClosedIdle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,12 +67,16 @@ pub struct SpliceOptions {
     /// Abort, as `LocalAborted`, once the local side has accepted no bytes for this long while
     /// data is waiting for it. Never applies while nothing is waiting.
     pub local_write_stall: Duration,
+    /// Abort, as `HalfClosedIdle`, once one direction has ended cleanly and the other has moved
+    /// no byte for this long. Never applies while both directions are open.
+    pub half_closed_idle: Duration,
 }
 
 impl Default for SpliceOptions {
     fn default() -> Self {
         Self {
             local_write_stall: LOCAL_WRITE_STALL,
+            half_closed_idle: HALF_CLOSED_IDLE,
         }
     }
 }
@@ -105,19 +116,28 @@ pub async fn splice_with<L: LocalStream>(
     };
     let mut to_remote = 0;
     let mut to_local = 0;
+    let moved = Moved::new();
     let ended = {
         let Ends {
             send, recv, local, ..
         } = &mut ends;
         let (local_rd, local_wr) = local.as_mut().expect("present until drop");
-        // `try_join!` drops the other direction as soon as one returns an abort.
-        tokio::try_join!(
-            local_to_remote(local_rd, send, &mut to_remote),
-            remote_to_local(recv, local_wr, opts.local_write_stall, &mut to_local),
+        both_directions(
+            local_to_remote(local_rd, send, &mut to_remote, &moved),
+            remote_to_local(
+                recv,
+                local_wr,
+                opts.local_write_stall,
+                &mut to_local,
+                &moved,
+            ),
+            opts.half_closed_idle,
+            &moved,
         )
+        .await
     };
     let end = match ended {
-        Ok(((), ())) => {
+        Ok(()) => {
             ends.armed = false;
             SpliceEnd::Clean
         }
@@ -155,10 +175,79 @@ impl<L: LocalStream> Drop for Ends<L> {
     }
 }
 
+/// When a byte last moved in either direction.
+struct Moved {
+    base: Instant,
+    /// Nanoseconds after `base`.
+    at: AtomicU64,
+}
+
+impl Moved {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            at: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.at.store(nanos, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> Instant {
+        self.base + Duration::from_nanos(self.at.load(Ordering::Relaxed))
+    }
+}
+
+/// Runs both directions until both have ended cleanly or either aborts; an abort drops the
+/// other. Once one has ended cleanly, the other alone is given `idle` without a byte moving
+/// before it is cut as `HalfClosedIdle`.
+async fn both_directions(
+    to_remote: impl Future<Output = Result<(), SpliceEnd>>,
+    to_local: impl Future<Output = Result<(), SpliceEnd>>,
+    idle: Duration,
+    moved: &Moved,
+) -> Result<(), SpliceEnd> {
+    let mut to_remote = pin!(to_remote);
+    let mut to_local = pin!(to_local);
+    tokio::select! {
+        ended = &mut to_remote => {
+            ended?;
+            alone(to_local, idle, moved).await
+        }
+        ended = &mut to_local => {
+            ended?;
+            alone(to_remote, idle, moved).await
+        }
+    }
+}
+
+/// The direction left open after the other ended, cut once no byte has moved for `idle`.
+async fn alone(
+    mut rest: Pin<&mut impl Future<Output = Result<(), SpliceEnd>>>,
+    idle: Duration,
+    moved: &Moved,
+) -> Result<(), SpliceEnd> {
+    let since = Instant::now();
+    loop {
+        let deadline = deadline_from(moved.last().max(since), idle);
+        tokio::select! {
+            ended = &mut rest => return ended,
+            () = sleep_until(deadline) => {
+                if deadline_from(moved.last().max(since), idle) <= Instant::now() {
+                    return Err(SpliceEnd::HalfClosedIdle);
+                }
+            }
+        }
+    }
+}
+
 async fn local_to_remote<R: AsyncRead + Unpin>(
     local: &mut R,
     send: &mut SendStream,
     copied: &mut u64,
+    moved: &Moved,
 ) -> Result<(), SpliceEnd> {
     let mut buf = vec![0; BUF_LEN];
     // A write sees a stop as an error; this catches one while the local side is idle.
@@ -173,7 +262,9 @@ async fn local_to_remote<R: AsyncRead + Unpin>(
             let _ = send.finish();
             return Ok(());
         }
+        moved.touch();
         send.write_all(&buf[..n]).await.map_err(write_end)?;
+        moved.touch();
         *copied += n as u64;
     }
 }
@@ -189,6 +280,7 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
     local: &mut W,
     stall: Duration,
     copied: &mut u64,
+    moved: &Moved,
 ) -> Result<(), SpliceEnd> {
     let mut out = Vec::with_capacity(BUF_LEN);
     let mut ahead = Vec::with_capacity(BUF_LEN);
@@ -198,7 +290,7 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
             if finished {
                 return local.shutdown().await.map_err(|_| SpliceEnd::LocalAborted);
             }
-            finished = !read_more(recv, &mut out).await?;
+            finished = !read_more(recv, &mut out, moved).await?;
             continue;
         }
         // Both `write` and `read_chunk` are cancel-safe: whichever loses a round has done
@@ -210,11 +302,12 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
                 n = local.write(&out[written..]) => match n {
                     Ok(n) if n > 0 => {
                         written += n;
+                        moved.touch();
                         deadline = deadline_after(stall);
                     }
                     _ => return Err(SpliceEnd::LocalAborted),
                 },
-                more = read_more(recv, &mut ahead), if !finished && ahead.len() < BUF_LEN => {
+                more = read_more(recv, &mut ahead, moved), if !finished && ahead.len() < BUF_LEN => {
                     finished = !more?;
                 }
                 () = sleep_until(deadline) => return Err(SpliceEnd::LocalAborted),
@@ -228,19 +321,28 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
 
 /// `now + after`, saturating far in the future for durations too large to add.
 fn deadline_after(after: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_add(after)
-        .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 3600))
+    deadline_from(Instant::now(), after)
+}
+
+/// `from + after`, saturating far in the future for durations too large to add.
+fn deadline_from(from: Instant, after: Duration) -> Instant {
+    from.checked_add(after)
+        .unwrap_or_else(|| from + Duration::from_secs(100 * 365 * 24 * 3600))
 }
 
 /// Appends the next chunk to `buf`, up to `BUF_LEN` in all; `false` once the stream is finished.
-async fn read_more(recv: &mut RecvStream, buf: &mut Vec<u8>) -> Result<bool, SpliceEnd> {
+async fn read_more(
+    recv: &mut RecvStream,
+    buf: &mut Vec<u8>,
+    moved: &Moved,
+) -> Result<bool, SpliceEnd> {
     match recv
         .read_chunk(BUF_LEN - buf.len())
         .await
         .map_err(read_end)?
     {
         Some(chunk) => {
+            moved.touch();
             buf.extend_from_slice(&chunk);
             Ok(true)
         }

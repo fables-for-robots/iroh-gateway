@@ -272,6 +272,32 @@ async fn static_connector_rejects_an_unknown_key() {
 }
 
 #[tokio::test]
+async fn static_connector_sets_keepalive_and_nodelay() {
+    use iroh_gateway_proto::tcp::{KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_PROBES};
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let connector = StaticConnector::new(
+        [(tcp(80), target.local_addr().unwrap())]
+            .into_iter()
+            .collect(),
+    );
+    let header = StreamHeader {
+        listener_id: 1,
+        visitor: "198.51.100.9:50000".parse().unwrap(),
+        local: "203.0.113.7:80".parse().unwrap(),
+    };
+    let stream = connector.connect(tcp(80), &header).await.unwrap();
+    let sock = socket2::SockRef::from(&stream);
+    assert!(sock.keepalive().unwrap());
+    assert!(sock.tcp_nodelay().unwrap());
+    assert_eq!(sock.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        assert_eq!(sock.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(sock.tcp_keepalive_retries().unwrap(), KEEPALIVE_PROBES);
+    }
+}
+
+#[tokio::test]
 async fn unknown_listener_resets_stream_only() {
     let echo = echo_server().await;
     let p = free_tcp_port();

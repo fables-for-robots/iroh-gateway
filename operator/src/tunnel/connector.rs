@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 
 use iroh_gateway_proto::control::{ListenerKey, StreamHeader};
 use iroh_gateway_proto::splice::LocalStream;
+use iroh_gateway_proto::tcp::set_keepalive_and_nodelay;
 use tokio::net::TcpStream;
 
 pub trait Connector: Send + Sync + 'static {
@@ -20,7 +21,8 @@ pub trait Connector: Send + Sync + 'static {
     ) -> impl Future<Output = io::Result<Self::Stream>> + Send;
 }
 
-/// Dials a fixed TCP address per listener. Unknown key → io::ErrorKind::NotFound.
+/// Dials a fixed TCP address per listener, with TCP keepalive and `TCP_NODELAY` on. Unknown key →
+/// io::ErrorKind::NotFound.
 #[derive(Debug, Clone)]
 pub struct StaticConnector {
     targets: HashMap<ListenerKey, SocketAddr>,
@@ -43,7 +45,11 @@ impl Connector for StaticConnector {
         let target = self.targets.get(&key).copied();
         async move {
             match target {
-                Some(addr) => TcpStream::connect(addr).await,
+                Some(addr) => {
+                    let stream = TcpStream::connect(addr).await?;
+                    set_keepalive_and_nodelay(&stream);
+                    Ok(stream)
+                }
                 None => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("no target for {key:?}"),

@@ -138,7 +138,7 @@ A relay learns the home IP, the edge's IP, and the size and timing of the relaye
 
 - **Addresses exchanged in direct mode.** iroh's QUIC NAT traversal cannot be switched off in iroh 1.5: even with relay mode disabled, each side tells the other its local interface addresses and sends probe packets to the addresses it is told. Port mapping (UPnP/NAT-PMP/PCP) is disabled. Mitigation: start the edge with `--iroh-listen <public-ip>:7842` instead of `0.0.0.0:7842`, since only a wildcard bind advertises every interface.
 - **Stalled visitors are cut after 5 minutes.** If a visitor accepts no data for 300 seconds while data is waiting for it, the connection is aborted. Idle connections with nothing pending are not affected.
-- **Half-closed connections hold a slot.** A visitor that closes its sending side keeps its connection slot until the backend side also closes.
+- **Half-closed connections are cut after 5 minutes of silence.** Once one side has finished sending, the connection is aborted if the other side sends nothing for 300 seconds.
 - **TCP only.** UDP listeners are reported as a bind error in this version.
 - **No metrics yet.** Both binaries log to stderr only.
 

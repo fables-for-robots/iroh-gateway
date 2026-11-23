@@ -494,6 +494,7 @@ const STALL: Duration = Duration::from_millis(300);
 fn short_stall() -> Option<SpliceOptions> {
     Some(SpliceOptions {
         local_write_stall: STALL,
+        ..SpliceOptions::default()
     })
 }
 
@@ -578,6 +579,139 @@ async fn idle_connection_is_not_cut_by_stall_timeout() {
     let mut buf = [0; 4];
 
     tokio::time::sleep(STALL * 3).await;
+    assert!(!r.splice.is_finished());
+
+    r.tcp_a.write_all(b"ping").await.unwrap();
+    within(r.far_recv.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    r.far_send.write_all(b"pong").await.unwrap();
+    within(r.tcp_a.read_exact(&mut buf)).await.unwrap();
+    assert_eq!(&buf, b"pong");
+
+    r.tcp_a.shutdown().await.unwrap();
+    r.far_send.finish().unwrap();
+    assert_eq!(within(r.far_recv.read_to_end(16)).await.unwrap(), b"");
+    assert_eq!(within(r.tcp_a.read(&mut buf)).await.unwrap(), 0);
+    assert_eq!(within(r.splice).await.unwrap().end, SpliceEnd::Clean);
+}
+
+/// Short enough for tests, long against loopback round trips.
+const IDLE: Duration = Duration::from_millis(300);
+
+fn short_half_closed_idle() -> Option<SpliceOptions> {
+    Some(SpliceOptions {
+        half_closed_idle: IDLE,
+        ..SpliceOptions::default()
+    })
+}
+
+/// Writes to `tcp_a` until the write fails, as it does once a reset has arrived. Reading cannot
+/// show the reset portably once the peer's FIN has been read: Linux keeps reporting EOF. A
+/// write fails with `BrokenPipe` (seen on macOS) or `ConnectionReset`, by platform and timing.
+async fn write_until_reset(tcp_a: &mut TcpStream) -> io::Error {
+    within(async {
+        loop {
+            match tcp_a.write(b"x").await {
+                Ok(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(err) => return err,
+            }
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn half_closed_idle_aborts_after_local_eof() {
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    let mut r = rig_from(tcp_a, tcp_b, short_half_closed_idle()).await;
+    let start = Instant::now();
+
+    r.tcp_a.shutdown().await.unwrap();
+    assert_eq!(within(r.far_recv.read_to_end(16)).await.unwrap(), b"");
+
+    let stats = within(r.splice).await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(stats.end, SpliceEnd::HalfClosedIdle);
+    assert!(
+        elapsed >= IDLE,
+        "aborted after {elapsed:?}, before the idle timeout"
+    );
+    assert!(elapsed < IDLE * 10, "aborted only after {elapsed:?}");
+    // Far's own direction is the one that was still open: it is stopped as an abort.
+    assert_eq!(within(r.far_send.stopped()).await.unwrap(), Some(aborted()));
+    let err = read_until_reset(&mut r.tcp_a).await;
+    assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+}
+
+#[tokio::test]
+async fn half_closed_idle_aborts_after_remote_finish() {
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    let mut r = rig_from(tcp_a, tcp_b, short_half_closed_idle()).await;
+    let mut buf = [0; 8];
+    let start = Instant::now();
+
+    r.far_send.finish().unwrap();
+    assert_eq!(within(r.tcp_a.read(&mut buf)).await.unwrap(), 0);
+
+    let stats = within(r.splice).await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(stats.end, SpliceEnd::HalfClosedIdle);
+    assert!(
+        elapsed >= IDLE,
+        "aborted after {elapsed:?}, before the idle timeout"
+    );
+    assert!(elapsed < IDLE * 10, "aborted only after {elapsed:?}");
+    let err = within(r.far_recv.read(&mut buf)).await.unwrap_err();
+    assert_eq!(err, ReadError::Reset(aborted()));
+    let err = write_until_reset(&mut r.tcp_a).await;
+    assert!(
+        matches!(
+            err.kind(),
+            ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn half_closed_with_traffic_is_not_cut() {
+    const TICKS: u32 = 13;
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    let mut r = rig_from(tcp_a, tcp_b, short_half_closed_idle()).await;
+    r.tcp_a.shutdown().await.unwrap();
+    assert_eq!(within(r.far_recv.read_to_end(16)).await.unwrap(), b"");
+    let start = Instant::now();
+
+    // One byte per 100 ms, for more than four idle periods in all.
+    let mut far_send = r.far_send;
+    let trickle = tokio::spawn(async move {
+        for i in 0..TICKS {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            far_send.write_all(&[i as u8]).await.unwrap();
+        }
+        far_send.finish().unwrap();
+    });
+    let mut got = Vec::new();
+    within(r.tcp_a.read_to_end(&mut got)).await.unwrap();
+    within(trickle).await.unwrap();
+
+    assert!(
+        start.elapsed() > IDLE * 4,
+        "too fast to test the idle timer"
+    );
+    assert_eq!(got, (0..TICKS as u8).collect::<Vec<_>>());
+    let stats = within(r.splice).await.unwrap();
+    assert_eq!(stats.end, SpliceEnd::Clean);
+    assert_eq!(stats.to_local, u64::from(TICKS));
+}
+
+#[tokio::test]
+async fn fully_open_idle_is_not_cut_by_half_closed_timer() {
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    let mut r = rig_from(tcp_a, tcp_b, short_half_closed_idle()).await;
+    let mut buf = [0; 4];
+
+    tokio::time::sleep(IDLE * 3).await;
     assert!(!r.splice.is_finished());
 
     r.tcp_a.write_all(b"ping").await.unwrap();

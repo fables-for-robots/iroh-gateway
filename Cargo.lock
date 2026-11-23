@@ -1520,6 +1520,7 @@ dependencies = [
  "iroh",
  "iroh-gateway-proto",
  "nix",
+ "socket2",
  "tempfile",
  "tokio",
  "tracing",
@@ -1538,6 +1539,7 @@ dependencies = [
  "iroh-gateway-proto",
  "nix",
  "serde",
+ "socket2",
  "tempfile",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
@@ -1555,9 +1557,11 @@ dependencies = [
  "iroh",
  "serde",
  "sha2",
+ "socket2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
