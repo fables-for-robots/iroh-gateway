@@ -1,16 +1,16 @@
 //! The public side of iroh-gateway: listeners that forward visitors into the tunnel.
 
 pub mod listeners;
+mod pending;
 mod session;
 
-use std::collections::VecDeque;
 use std::future::pending;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Context;
-use iroh::endpoint::{Builder, Connection, Incoming, VarInt};
+use iroh::endpoint::{Builder, Connection, Incoming, IncomingAddr, VarInt};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gateway_proto::transport::{Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{ALPN, CLOSE_REPLACED, CLOSE_SHUTDOWN, CLOSE_UNAUTHORIZED};
@@ -21,15 +21,19 @@ use tracing::{debug, error, info, warn};
 
 pub use listeners::{Accepted, ListenerSet, canonical};
 
+use pending::PendingHandshakes;
 use session::{ApplyRequest, Session};
 
 /// Streams the operator may have open towards the edge: it needs only the control stream.
 const OPERATOR_STREAMS: u32 = 4;
 const APPLY_QUEUE: usize = 16;
-/// Handshakes in progress beyond which the oldest is aborted to admit a new one.
+/// Handshakes in progress beyond which one is aborted to admit a new one.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 /// How long one handshake may take before it is dropped.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The source key of handshakes that arrive over a relay or custom transport, which carry no
+/// IP address; it cannot be the source address of a direct path.
+const NO_IP: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 
 pub struct EdgeOptions {
     pub secret_key: SecretKey,
@@ -88,7 +92,7 @@ impl Edge {
             apply_tx,
             apply_rx,
             handshakes: JoinSet::new(),
-            pending: VecDeque::new(),
+            pending: PendingHandshakes::new(MAX_PENDING_HANDSHAKES),
             current: None,
             next_id: 0,
             grace_timer: None,
@@ -151,8 +155,8 @@ struct Supervisor {
     apply_rx: mpsc::Receiver<ApplyRequest>,
     /// Incoming connections until their handshake is done and their key checked.
     handshakes: JoinSet<Option<Connection>>,
-    /// The handshakes in `handshakes` not yet done or aborted, oldest first.
-    pending: VecDeque<AbortHandle>,
+    /// The handshakes in `handshakes` not yet done or aborted.
+    pending: PendingHandshakes<PendingHandshake>,
     current: Option<Session>,
     next_id: u64,
     /// Runs while no session has been configured since the last one ended.
@@ -177,7 +181,7 @@ impl Supervisor {
                         Err(e) => e.id(),
                     };
                     // Already gone if it was evicted.
-                    self.pending.retain(|h| h.id() != id);
+                    self.pending.remove(|p| p.task.id() == id);
                     if let Some((_, Some(conn))) = log_panic(done, "handshake task") {
                         self.install(conn);
                     }
@@ -201,8 +205,13 @@ impl Supervisor {
     }
 
     /// Starts the handshake of a connection attempt once its address is validated. With
-    /// `MAX_PENDING_HANDSHAKES` in progress, the oldest is aborted to make room: a flood then
-    /// cannot keep out a handshake that completes before the flood has started that many more.
+    /// `MAX_PENDING_HANDSHAKES` in progress, one is aborted to make room: the oldest of the
+    /// source IP holding the most of them (see [`PendingHandshakes`]). A host with a single
+    /// handshake in progress is evicted only when no IP holds more than one, so a flood from
+    /// fewer IPs evicts its own handshakes, not that host's. A flood from 63 or more other
+    /// distinct, validated source IPs can still evict that host's handshake. Handshakes over a
+    /// relay or custom transport carry no IP and all share one key, `NO_IP`, so a flood
+    /// through a relay evicts relayed handshakes, a relayed operator's among them.
     fn incoming(&mut self, incoming: Incoming) {
         if !incoming.remote_addr_validated() {
             // Stateless: the sender must prove it receives at its address before any state is
@@ -212,16 +221,18 @@ impl Supervisor {
             }
             return;
         }
-        if self.pending.len() >= MAX_PENDING_HANDSHAKES
-            && let Some(oldest) = self.pending.pop_front()
-        {
+        let remote = incoming.remote_addr();
+        let ip = match &remote {
+            IncomingAddr::Ip(addr) => addr.ip(),
+            _ => NO_IP,
+        };
+        let task = self.handshakes.spawn(handshake(incoming, self.operator));
+        if let Some(evicted) = self.pending.admit(ip, PendingHandshake { remote, task }) {
             // Cancelling the task drops its connection attempt, which closes it; `run` reaps
             // the task from `handshakes`.
-            debug!("too many handshakes in progress: aborted the oldest");
-            oldest.abort();
+            debug!(remote = ?evicted.remote, "too many handshakes in progress: aborted one");
+            evicted.task.abort();
         }
-        let handle = self.handshakes.spawn(handshake(incoming, self.operator));
-        self.pending.push_back(handle);
     }
 
     /// Makes `conn` the current session, replacing any running one.
@@ -285,7 +296,6 @@ impl Supervisor {
             session.close(CLOSE_SHUTDOWN, b"shutdown");
         }
         self.handshakes.abort_all();
-        self.pending.clear();
         while let Some(done) = self.handshakes.join_next().await {
             log_panic(done, "handshake task");
         }
@@ -293,6 +303,12 @@ impl Supervisor {
         self.endpoint.close().await;
         info!("edge stopped");
     }
+}
+
+/// A handshake in progress, for [`PendingHandshakes`].
+struct PendingHandshake {
+    remote: IncomingAddr,
+    task: AbortHandle,
 }
 
 /// Completes the handshake within `HANDSHAKE_TIMEOUT` and keeps the connection only if it is
