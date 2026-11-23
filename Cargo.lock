@@ -809,6 +809,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "delegate"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780eb241654bf097afb00fc5f054a09b687dad862e485fdcf8399bb056565370"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "der"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1218,6 +1229,21 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "gateway-api"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9913addfd2a7f3ee04a944b71bce8af5f4566bcca5f8506ecba340ca34a41a9b"
+dependencies = [
+ "delegate",
+ "k8s-openapi",
+ "kube",
+ "regex-lite",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1805,6 +1831,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fastrand",
+ "gateway-api",
  "iroh",
  "iroh-gateway-edge",
  "iroh-gateway-proto",
@@ -3233,6 +3260,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"

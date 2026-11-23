@@ -118,7 +118,7 @@ pub fn parse(text: &str, base_dir: &Path) -> anyhow::Result<StaticConfig> {
 
 /// `address` is `host:port`: an IP address (IPv6 in brackets) or a DNS name, and a port in
 /// 1..=65535.
-fn check_address(address: &str) -> anyhow::Result<()> {
+pub(crate) fn check_address(address: &str) -> anyhow::Result<()> {
     let bad = || format!("address {address:?} is not host:port");
     if let Ok(addr) = address.parse::<SocketAddr>() {
         if addr.port() == 0 {

@@ -13,6 +13,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 ciborium = "0.2"
 fastrand = "2"
+gateway-api = "0.23"
 hex = "0.4"
 humantime = "2"
 iroh = { version = "1", default-features = false, features = ["fast-apple-datapath", "tls-ring"] }

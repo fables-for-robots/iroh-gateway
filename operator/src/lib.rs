@@ -2,5 +2,6 @@
 
 pub mod crd;
 pub mod haproxy;
+pub mod model;
 pub mod staticcfg;
 pub mod tunnel;
