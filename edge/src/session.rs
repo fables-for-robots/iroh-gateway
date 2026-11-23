@@ -1,18 +1,16 @@
 //! One tunnel session over one authorized operator connection.
 
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
-use iroh_gateway_proto::RESET_ABORTED;
 use iroh_gateway_proto::control::{Config, Status, StreamHeader};
 use iroh_gateway_proto::frame::{read_frame, write_frame};
 use iroh_gateway_proto::splice::{LocalStream, splice};
+use iroh_gateway_proto::{CLOSE_CONTROL_ENDED, RESET_ABORTED};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info};
 
 use crate::listeners::Accepted;
-
-/// Close code for a session ended by a broken or closed control stream.
-const CLOSE_CONTROL_ENDED: u32 = 0;
+use crate::log_panic;
 
 /// A `Config` read on a session's control stream, for the supervisor to apply.
 pub(crate) struct ApplyRequest {
@@ -59,8 +57,13 @@ impl Session {
     pub async fn ended(&mut self) {
         loop {
             tokio::select! {
-                _ = &mut self.control => return,
-                Some(_) = self.visitors.join_next() => {}
+                ended = &mut self.control => {
+                    log_panic(ended, "control task");
+                    return;
+                }
+                Some(done) = self.visitors.join_next() => {
+                    log_panic(done, "visitor task");
+                }
             }
         }
     }

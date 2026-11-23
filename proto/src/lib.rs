@@ -21,3 +21,5 @@ pub const RESET_BAD_HEADER: u32 = 4;
 pub const CLOSE_UNAUTHORIZED: u32 = 1;
 pub const CLOSE_REPLACED: u32 = 2;
 pub const CLOSE_SHUTDOWN: u32 = 3;
+/// The control stream broke or was closed.
+pub const CLOSE_CONTROL_ENDED: u32 = 4;

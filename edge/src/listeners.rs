@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{error, warn};
 
 const ACCEPTED_QUEUE: usize = 1024;
 
@@ -44,9 +44,21 @@ struct Bound {
     task: JoinHandle<()>,
 }
 
+impl Bound {
+    /// Aborts the accept task and returns once it is gone, and with it the port.
+    async fn close(mut self) {
+        self.task.abort();
+        if let Err(e) = (&mut self.task).await
+            && e.is_panic()
+        {
+            error!("accept task panicked: {e}");
+        }
+    }
+}
+
 impl Drop for Bound {
     fn drop(&mut self) {
-        // Aborting drops the TcpListener, which closes the port.
+        // Aborting drops the TcpListener, which closes the port, once the runtime gets to it.
         self.task.abort();
     }
 }
@@ -70,11 +82,18 @@ impl ListenerSet {
         (set, rx)
     }
 
-    /// Makes the open ports match `cfg` and reports the result.
+    /// Makes the open ports match `cfg` and reports the result. Ports no longer wanted are
+    /// closed before any new one is bound and before this returns.
     pub async fn apply(&mut self, cfg: &Config) -> Status {
         // Close ports that are no longer wanted. Established connections are untouched.
-        self.bound
-            .retain(|key, _| cfg.listeners.iter().any(|l| l.key() == *key));
+        let removed: Vec<Bound> = self
+            .bound
+            .extract_if(|key, _| !cfg.listeners.iter().any(|l| l.key() == *key))
+            .map(|(_, b)| b)
+            .collect();
+        for b in removed {
+            b.close().await;
+        }
 
         let mut listeners = Vec::with_capacity(cfg.listeners.len());
         for l in &cfg.listeners {
@@ -111,8 +130,12 @@ impl ListenerSet {
         }
     }
 
-    pub fn close_all(&mut self) {
-        self.bound.clear();
+    /// Closes every port; they are closed when this returns.
+    pub async fn close_all(&mut self) {
+        let all: Vec<Bound> = self.bound.drain().map(|(_, b)| b).collect();
+        for b in all {
+            b.close().await;
+        }
     }
 
     /// The id the last applied `Config` gave the listener on `key`, if it is still open.
@@ -198,7 +221,15 @@ mod tests {
         ListenerSet::new("127.0.0.1".parse().unwrap(), max)
     }
 
-    /// Connects until the port refuses (an aborted accept task may need a moment to drop).
+    /// What one connection attempt to `p` fails with; panics if it succeeds.
+    async fn refused_now(p: u16) -> std::io::ErrorKind {
+        match TcpStream::connect(("127.0.0.1", p)).await {
+            Err(e) => e.kind(),
+            Ok(_) => panic!("port {p} still accepts"),
+        }
+    }
+
+    /// Connects until the port refuses: a dropped set aborts its accept tasks without waiting.
     async fn refused(p: u16) -> std::io::ErrorKind {
         for _ in 0..50 {
             match TcpStream::connect(("127.0.0.1", p)).await {
@@ -240,7 +271,22 @@ mod tests {
         let st = set.apply(&cfg(2, &[])).await;
         assert!(st.listeners.is_empty());
         assert!(set.bound().is_empty());
-        assert_eq!(refused(p).await, std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(refused_now(p).await, std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn remove_then_add_same_port_rebinds() {
+        let p = free_port();
+        let (mut set, mut rx) = new_set(10);
+        assert_eq!(
+            set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await.listeners[0].state,
+            BindState::Bound
+        );
+        set.apply(&cfg(2, &[])).await;
+        let st = set.apply(&cfg(3, &[(2, Protocol::Tcp, p)])).await;
+        assert_eq!(st.listeners[0].state, BindState::Bound);
+        let _c = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap().listener_id, 2);
     }
 
     #[tokio::test]
@@ -379,10 +425,10 @@ mod tests {
         set.apply(&cfg(1, &[(1, Protocol::Tcp, p), (2, Protocol::Tcp, q)]))
             .await;
         assert_eq!(set.bound().len(), 2);
-        set.close_all();
+        set.close_all().await;
         assert!(set.bound().is_empty());
-        assert_eq!(refused(p).await, std::io::ErrorKind::ConnectionRefused);
-        assert_eq!(refused(q).await, std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(refused_now(p).await, std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(refused_now(q).await, std::io::ErrorKind::ConnectionRefused);
     }
 
     #[tokio::test]

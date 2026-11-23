@@ -19,19 +19,18 @@ use iroh_gateway_proto::splice::splice;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{
-    ALPN, CLOSE_SHUTDOWN, RESET_BACKEND_UNAVAILABLE, RESET_BAD_HEADER, RESET_UNKNOWN_LISTENER,
+    ALPN, CLOSE_CONTROL_ENDED, CLOSE_SHUTDOWN, RESET_BACKEND_UNAVAILABLE, RESET_BAD_HEADER,
+    RESET_UNKNOWN_LISTENER,
 };
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
-use tracing::{Instrument, debug, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::connector::Connector;
 
 /// How long an incoming stream may take to deliver its `StreamHeader`.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
-/// Close code for a session ended by a broken control stream; the edge uses the same.
-const CLOSE_CONTROL_ENDED: u32 = 0;
 /// How many sent but unacknowledged configs are kept to read a `Status` against.
 const MAX_UNACKED_CONFIGS: usize = 32;
 
@@ -378,7 +377,13 @@ impl<C: Connector> Link<C> {
                     Err(e) => return SessionError::Lost(e),
                 },
                 // Reaps finished stream tasks.
-                Some(_) = s.streams.join_next() => {}
+                Some(done) = s.streams.join_next() => {
+                    if let Err(e) = done
+                        && e.is_panic()
+                    {
+                        error!("stream task panicked: {e}");
+                    }
+                }
             }
         }
     }

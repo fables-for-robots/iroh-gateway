@@ -14,9 +14,9 @@ use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gateway_proto::transport::{Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{ALPN, CLOSE_REPLACED, CLOSE_SHUTDOWN, CLOSE_UNAUTHORIZED};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::Sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub use listeners::{Accepted, ListenerSet, canonical};
 
@@ -120,7 +120,7 @@ impl EdgeHandle {
     /// Closes the session with `CLOSE_SHUTDOWN`, the listeners and the endpoint.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
-        let _ = self.task.await;
+        log_panic(self.task.await, "edge supervisor");
     }
 }
 
@@ -154,7 +154,7 @@ impl Supervisor {
                     }
                 },
                 Some(done) = self.handshakes.join_next() => {
-                    if let Ok(Some(conn)) = done {
+                    if let Some(Some(conn)) = log_panic(done, "handshake task") {
                         self.install(conn);
                     }
                 }
@@ -169,7 +169,7 @@ impl Supervisor {
                 () = grace_fired(&mut self.grace_timer) => {
                     self.grace_timer = None;
                     info!("tunnel grace expired: closing all listeners");
-                    self.listeners.close_all();
+                    self.listeners.close_all().await;
                 }
             }
         }
@@ -256,7 +256,7 @@ impl Supervisor {
             session.close(CLOSE_SHUTDOWN, b"shutdown");
         }
         self.handshakes.shutdown().await;
-        self.listeners.close_all();
+        self.listeners.close_all().await;
         self.endpoint.close().await;
         info!("edge stopped");
     }
@@ -289,6 +289,19 @@ async fn handshake(incoming: Incoming, operator: EndpointId) -> Option<Connectio
         return None;
     }
     Some(conn)
+}
+
+/// The task's output; a panic is logged at error, a cancellation dropped quietly.
+pub(crate) fn log_panic<T>(joined: Result<T, JoinError>, task: &str) -> Option<T> {
+    match joined {
+        Ok(out) => Some(out),
+        Err(e) => {
+            if e.is_panic() {
+                error!("{task} panicked: {e}");
+            }
+            None
+        }
+    }
 }
 
 async fn session_ended(current: &mut Option<Session>) {
