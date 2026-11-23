@@ -32,8 +32,10 @@ use k8s_openapi::ByteString;
 use k8s_openapi::NamespaceResourceScope;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
-use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams};
+use kube::discovery::{Scope, pinned_kind};
 use kube::{Api, Client, Resource, ResourceExt};
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -824,4 +826,110 @@ async fn status_writer_reports_what_it_could_not_write() {
         .await
         .unwrap();
     assert!(write(&mut writer, &stale).await);
+}
+
+/// Every object in every `deploy/*.yaml`, in file name order, with the file it came from.
+fn deploy_objects() -> Vec<(String, Value)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no manifests in {}", dir.display());
+    let mut objects = Vec::new();
+    for file in files {
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(&file).unwrap();
+        for document in serde_yaml::Deserializer::from_str(&text) {
+            let value = Value::deserialize(document).unwrap_or_else(|e| panic!("{name}: {e}"));
+            if !value.is_null() {
+                objects.push((name.clone(), value));
+            }
+        }
+    }
+    objects
+}
+
+/// Applies one object with server-side apply; `dry_run` only validates and admits it.
+async fn apply_object(client: &Client, file: &str, object: &Value, dry_run: bool) {
+    let what = format!(
+        "{file}: {} {}",
+        object["kind"].as_str().unwrap_or("?"),
+        object["metadata"]["name"].as_str().unwrap_or("?")
+    );
+    let obj: DynamicObject =
+        serde_json::from_value(object.clone()).unwrap_or_else(|e| panic!("{what}: {e}"));
+    let types = obj
+        .types
+        .clone()
+        .unwrap_or_else(|| panic!("{what}: no kind"));
+    let gvk = GroupVersionKind::try_from(&types).unwrap_or_else(|e| panic!("{what}: {e}"));
+    let (resource, capabilities) = pinned_kind(client, &gvk)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: the API server does not know the kind: {e}"));
+    let api: Api<DynamicObject> = match (capabilities.scope, obj.metadata.namespace.as_deref()) {
+        (Scope::Namespaced, Some(ns)) => Api::namespaced_with(client.clone(), ns, &resource),
+        (Scope::Namespaced, None) => panic!("{what}: a namespaced kind without a namespace"),
+        (Scope::Cluster, _) => Api::all_with(client.clone(), &resource),
+    };
+    let mut params = PatchParams::apply("deploy-manifest-test");
+    if dry_run {
+        params = params.dry_run();
+    }
+    let name = obj
+        .metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| panic!("{what}: no name"));
+    api.patch(&name, &params, &Patch::Apply(&obj))
+        .await
+        .unwrap_or_else(|e| panic!("{what}: rejected: {e}"));
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn deploy_manifests_apply_cleanly() {
+    let objects = deploy_objects();
+    let env = Envtest::start().await;
+    // The namespaces for real, so the namespaced objects have somewhere to go.
+    let mut dry_run_count = 0;
+    for (file, object) in objects.iter().filter(|(_, o)| o["kind"] == "Namespace") {
+        apply_object(&env.client, file, object, false).await;
+    }
+    for (file, object) in objects.iter().filter(|(_, o)| o["kind"] != "Namespace") {
+        apply_object(&env.client, file, object, true).await;
+        dry_run_count += 1;
+    }
+    // The Deployment and the RBAC objects are among what was checked, not skipped.
+    assert!(dry_run_count >= 6, "only {dry_run_count} objects checked");
+    for kind in ["Deployment", "ClusterRole", "Role", "GatewayClass"] {
+        assert!(
+            objects.iter().any(|(_, o)| o["kind"] == kind),
+            "no {kind} in deploy/"
+        );
+    }
+
+    // Secrets: only a namespaced Role may grant them, and the ClusterRole not at all.
+    let mut secret_rules = 0;
+    for (file, object) in objects.iter().filter(|(f, _)| f == "rbac.yaml") {
+        let kind = object["kind"].as_str().unwrap();
+        for rule in object["rules"].as_array().into_iter().flatten() {
+            let resources: Vec<&str> = rule["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let reaches_secrets = resources
+                .iter()
+                .any(|r| matches!(*r, "*" | "secrets") || r.starts_with("secrets/"));
+            if reaches_secrets {
+                assert_eq!(kind, "Role", "{file}: a {kind} rule reaches Secrets");
+                secret_rules += 1;
+            }
+        }
+    }
+    assert_eq!(secret_rules, 1, "the namespaced Role has one Secret rule");
 }

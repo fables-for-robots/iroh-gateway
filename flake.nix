@@ -26,6 +26,7 @@
             # The operator's cluster tests: scripts/envtest-assets fetches an API server.
             pkgs.setup-envtest
             pkgs.kubectl
+            pkgs.shellcheck
           ];
         };
       });

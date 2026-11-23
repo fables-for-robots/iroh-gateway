@@ -76,6 +76,30 @@ jobs:
             exit 1
           fi
 
+  e2e-kind:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the operator image
+        run: docker build --target operator -t iroh-gateway-operator:e2e .
+
+      - name: Build the edge image
+        run: docker build --target edge -t iroh-gateway-edge:e2e .
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: iroh-gateway-e2e
+
+      - name: Load the images into kind
+        run: |
+          kind load docker-image iroh-gateway-operator:e2e --name iroh-gateway-e2e
+          kind load docker-image iroh-gateway-edge:e2e --name iroh-gateway-e2e
+
+      - name: End-to-end test
+        run: scripts/e2e-kind.sh
+
   audit:
     runs-on: ubuntu-latest
     # audit-check reports its results as a check run, which needs an

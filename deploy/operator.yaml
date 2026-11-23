@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: iroh-gateway-operator
+  namespace: iroh-gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iroh-gateway-operator
+  namespace: iroh-gateway
+  labels:
+    app.kubernetes.io/name: iroh-gateway-operator
+spec:
+  # Exactly one operator: two would both dial the edges and fight over status.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: iroh-gateway-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: iroh-gateway-operator
+    spec:
+      serviceAccountName: iroh-gateway-operator
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/fables-for-robots/iroh-gateway-operator:0.1.0
+          # No ports and no probes: the operator has no health endpoint yet.
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            # HAProxy's configuration and sockets (the default --runtime-dir).
+            - name: runtime
+              mountPath: /run/iroh-gateway
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: runtime
+          emptyDir:
+            medium: Memory
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
