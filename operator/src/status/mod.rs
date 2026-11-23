@@ -499,6 +499,7 @@ mod tests {
             conflicted: None,
             resolved_refs: Ok(()),
             supported_kinds: vec!["TCPRoute".into()],
+            allowed_namespaces: Default::default(),
             attached_routes: i32::from(serving),
             backends: if serving {
                 vec![crate::model::Backend {

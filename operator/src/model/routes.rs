@@ -3,18 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use gateway_api::gateways::v1::{
-    Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom as From,
-    GatewayListenersAllowedRoutesNamespacesSelector as Selector,
-    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions as Requirement,
-};
 use gateway_api::tcproutes::v1::{TcpRoute, TcpRouteParentRefs, TcpRouteRulesBackendRefs};
 use k8s_openapi::api::core::v1::Service;
 use kube::ResourceExt;
 
 use super::gateways::{ROUTE_GROUP, ROUTE_KIND};
 use super::{
-    Backend, GatewayModel, ObjRef, ParentKey, Reject, RouteModel, RouteParent, Snapshot, generation,
+    Backend, GatewayModel, LabelRequirement, LabelSelector, ObjRef, ParentKey, Reject, RouteModel,
+    RouteNamespaces, RouteParent, Snapshot, generation,
 };
 
 const GATEWAY_KIND: &str = "Gateway";
@@ -34,11 +30,6 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
         .collect();
     routes.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let specs: BTreeMap<ObjRef, &Gateway> = snapshot
-        .gateways
-        .iter()
-        .map(|g| (ObjRef::of(g), g))
-        .collect();
     let namespaces: BTreeMap<String, Labels> = snapshot
         .namespaces
         .iter()
@@ -55,7 +46,7 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
         .collect();
     let parents: Vec<Vec<Attachment>> = routes
         .iter()
-        .map(|(key, r)| attachments(r, &key.namespace, gateways, &specs, &namespaces))
+        .map(|(key, r)| attachments(r, &key.namespace, gateways, &namespaces))
         .collect();
 
     // Per listener, the oldest route among those that passed every other check wins.
@@ -119,7 +110,6 @@ fn attachments(
     route: &TcpRoute,
     route_ns: &str,
     gateways: &[GatewayModel],
-    specs: &BTreeMap<ObjRef, &Gateway>,
     namespaces: &BTreeMap<String, Labels>,
 ) -> Vec<Attachment> {
     let mut seen = BTreeSet::new();
@@ -135,8 +125,7 @@ fn attachments(
         let Some(g) = gateways.iter().position(|gw| gw.key == key) else {
             continue;
         };
-        let spec = specs.get(&key).copied();
-        let slots = attach(route, route_ns, &parent, &gateways[g], spec, namespaces)
+        let slots = attach(route, route_ns, &parent, &gateways[g], namespaces)
             .map(|ls| ls.into_iter().map(|l| (g, l)).collect());
         out.push(Attachment { parent, slots });
     }
@@ -167,7 +156,6 @@ fn attach(
     route_ns: &str,
     parent: &ParentKey,
     gw: &GatewayModel,
-    spec: Option<&Gateway>,
     namespaces: &BTreeMap<String, Labels>,
 ) -> Result<Vec<usize>, Reject> {
     let candidates: Vec<usize> = gw
@@ -197,7 +185,7 @@ fn attach(
                 && l.conflicted.is_none()
                 && l.supported_kinds.iter().any(|k| k == ROUTE_KIND)
                 && admits(
-                    spec.and_then(|g| g.spec.listeners.get(i)),
+                    &l.allowed_namespaces,
                     &gw.key.namespace,
                     route_ns,
                     namespaces,
@@ -223,57 +211,42 @@ fn attach(
     Ok(kept)
 }
 
-/// Whether the listener's `allowedRoutes.namespaces` admits routes from `route_ns`.
+/// Whether a listener with namespace policy `rule` admits routes from `route_ns`.
 fn admits(
-    listener: Option<&GatewayListeners>,
+    rule: &RouteNamespaces,
     gateway_ns: &str,
     route_ns: &str,
     namespaces: &BTreeMap<String, Labels>,
 ) -> bool {
-    // A listener we cannot see admits nothing.
-    let Some(listener) = listener else {
-        return false;
-    };
-    let rule = listener
-        .allowed_routes
-        .as_ref()
-        .and_then(|a| a.namespaces.as_ref());
-    match rule.and_then(|r| r.from.as_ref()) {
-        None | Some(From::Same) => route_ns == gateway_ns,
-        Some(From::All) => true,
-        Some(From::Selector) => {
-            // No selector selects nothing; a namespace we have not seen is not selected.
-            match (
-                rule.and_then(|r| r.selector.as_ref()),
-                namespaces.get(route_ns),
-            ) {
-                (Some(selector), Some(labels)) => selects(selector, labels),
-                _ => false,
-            }
-        }
+    match rule {
+        RouteNamespaces::Same => route_ns == gateway_ns,
+        RouteNamespaces::All => true,
+        // No selector selects nothing; a namespace we have not seen is not selected.
+        RouteNamespaces::Selector(selector) => match (selector, namespaces.get(route_ns)) {
+            (Some(selector), Some(labels)) => selects(selector, labels),
+            _ => false,
+        },
     }
 }
 
 /// A label selector: every `matchLabels` entry and every `matchExpressions` requirement holds.
 /// The empty selector selects everything.
-fn selects(selector: &Selector, labels: &Labels) -> bool {
+fn selects(selector: &LabelSelector, labels: &Labels) -> bool {
     let match_labels = selector
         .match_labels
         .iter()
-        .flatten()
         .all(|(k, v)| labels.get(k) == Some(v));
     let match_expressions = selector
         .match_expressions
         .iter()
-        .flatten()
         .all(|r| requirement(r, labels));
     match_labels && match_expressions
 }
 
 /// One `matchExpressions` requirement. A malformed one (unknown operator, values missing for
 /// `In`/`NotIn` or given for `Exists`/`DoesNotExist`) holds for no namespace.
-fn requirement(r: &Requirement, labels: &Labels) -> bool {
-    let values = r.values.as_deref().unwrap_or_default();
+fn requirement(r: &LabelRequirement, labels: &Labels) -> bool {
+    let values = r.values.as_slice();
     let value = labels.get(&r.key);
     match (r.operator.as_str(), values.is_empty()) {
         ("In", false) => value.is_some_and(|v| values.contains(v)),
@@ -1001,19 +974,63 @@ mod tests {
 
     #[test]
     fn route_to_unaccepted_listener_is_not_allowed() {
-        let gw = public().listener("web", 80, "HTTP");
+        // `bad` fails only the listener's own `accepted` check: TCP, admits the namespace,
+        // supports TCPRoute. `pg` keeps the Gateway accepted and admits no TCPRoute.
+        let gw = gateway("gw", "public")
+            .listener("bad", 0, "TCP")
+            .listener("pg", 5432, "TCP")
+            .allowed_kinds(&[(GROUP, "HTTPRoute")]);
         let m = run(
             vec![gw],
-            vec![
-                tcp_route("gw", "r")
-                    .parent("public")
-                    .section("web")
-                    .backend("db", 5432),
-            ],
+            vec![tcp_route("gw", "r").parent("public").backend("db", 5432)],
             vec![db()],
         );
+        let bad = listener(&m, "public", "bad");
+        assert_eq!(reason(&bad.accepted), "PortUnavailable");
+        assert_eq!(bad.conflicted, None);
+        assert_eq!(bad.supported_kinds, ["TCPRoute"]);
+        assert_eq!(m.gateways[0].accepted, Ok(()));
         assert_eq!(accepted(&m, "gw", "r"), "NotAllowedByListeners");
-        assert!(listener(&m, "public", "web").backends.is_empty());
+        assert_eq!(bad.attached_routes, 0);
+        assert!(bad.backends.is_empty());
+    }
+
+    #[test]
+    fn listener_model_carries_its_namespace_policy() {
+        use super::super::{LabelRequirement, LabelSelector, RouteNamespaces};
+        let gw = gateway("gw", "public")
+            .listener("same", 1, "TCP")
+            .listener("all", 2, "TCP")
+            .allow_all_namespaces()
+            .listener("sel", 3, "TCP")
+            .allow_selector(&[("team", "a")])
+            .listener("expr", 4, "TCP")
+            .allow_expressions(&[("env", "In", &["prod"])])
+            .listener("none", 5, "TCP")
+            .allow_raw_selector(None);
+        let m = run(vec![gw], vec![], vec![]);
+        let policy = |name| listener(&m, "public", name).allowed_namespaces.clone();
+        assert_eq!(policy("same"), RouteNamespaces::Same);
+        assert_eq!(policy("all"), RouteNamespaces::All);
+        assert_eq!(
+            policy("sel"),
+            RouteNamespaces::Selector(Some(LabelSelector {
+                match_labels: [("team".to_owned(), "a".to_owned())].into(),
+                match_expressions: vec![],
+            }))
+        );
+        assert_eq!(
+            policy("expr"),
+            RouteNamespaces::Selector(Some(LabelSelector {
+                match_labels: Default::default(),
+                match_expressions: vec![LabelRequirement {
+                    key: "env".into(),
+                    operator: "In".into(),
+                    values: vec!["prod".into()],
+                }],
+            }))
+        );
+        assert_eq!(policy("none"), RouteNamespaces::Selector(None));
     }
 
     #[test]

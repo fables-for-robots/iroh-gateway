@@ -4,8 +4,15 @@ use std::collections::BTreeMap;
 
 use kube::ResourceExt;
 
+use gateway_api::gateways::v1::{
+    GatewayListenersAllowedRoutesNamespaces, GatewayListenersAllowedRoutesNamespacesFrom as From,
+};
+
 use super::generation;
-use super::{ClassModel, GatewayModel, ListenerModel, ObjRef, Reject, Settings, Snapshot};
+use super::{
+    ClassModel, GatewayModel, LabelRequirement, LabelSelector, ListenerModel, ObjRef, Reject,
+    RouteNamespaces, Settings, Snapshot,
+};
 
 pub(super) const ROUTE_GROUP: &str = "gateway.networking.k8s.io";
 pub(super) const ROUTE_KIND: &str = "TCPRoute";
@@ -167,8 +174,38 @@ fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel
         conflicted: None,
         resolved_refs,
         supported_kinds,
+        allowed_namespaces: route_namespaces(
+            spec.allowed_routes
+                .as_ref()
+                .and_then(|a| a.namespaces.as_ref()),
+        ),
         attached_routes: 0,
         backends: Vec::new(),
+    }
+}
+
+/// A listener's `allowedRoutes.namespaces`; absent means the Gateway's own namespace.
+fn route_namespaces(rule: Option<&GatewayListenersAllowedRoutesNamespaces>) -> RouteNamespaces {
+    match rule.and_then(|r| r.from.as_ref()) {
+        None | Some(From::Same) => RouteNamespaces::Same,
+        Some(From::All) => RouteNamespaces::All,
+        Some(From::Selector) => {
+            RouteNamespaces::Selector(rule.and_then(|r| r.selector.as_ref()).map(|selector| {
+                LabelSelector {
+                    match_labels: selector.match_labels.clone().unwrap_or_default(),
+                    match_expressions: selector
+                        .match_expressions
+                        .iter()
+                        .flatten()
+                        .map(|r| LabelRequirement {
+                            key: r.key.clone(),
+                            operator: r.operator.clone(),
+                            values: r.values.clone().unwrap_or_default(),
+                        })
+                        .collect(),
+                }
+            }))
+        }
     }
 }
 

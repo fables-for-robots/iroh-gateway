@@ -171,8 +171,37 @@ pub struct ListenerModel {
     pub conflicted: Option<Reject>,
     pub resolved_refs: Result<(), Reject>,
     pub supported_kinds: Vec<String>,
+    /// Its `allowedRoutes.namespaces`: where routes may come from.
+    pub allowed_namespaces: RouteNamespaces,
     pub attached_routes: i32,
     pub backends: Vec<Backend>,
+}
+
+/// The namespaces a listener admits routes from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RouteNamespaces {
+    /// Only the Gateway's own namespace; the default.
+    #[default]
+    Same,
+    All,
+    /// The namespaces the selector selects; `None`, no selector given, selects none.
+    Selector(Option<LabelSelector>),
+}
+
+/// A label selector: every `match_labels` entry and every requirement must hold. The empty
+/// selector selects everything.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LabelSelector {
+    pub match_labels: std::collections::BTreeMap<String, String>,
+    pub match_expressions: Vec<LabelRequirement>,
+}
+
+/// One `matchExpressions` requirement, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelRequirement {
+    pub key: String,
+    pub operator: String,
+    pub values: Vec<String>,
 }
 
 impl ListenerModel {

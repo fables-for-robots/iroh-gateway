@@ -95,6 +95,7 @@ impl World {
             conflicted: None,
             resolved_refs: Ok(()),
             supported_kinds: vec!["TCPRoute".into()],
+            allowed_namespaces: Default::default(),
             attached_routes: 1,
             backends: vec![Backend {
                 service: key("echo"),

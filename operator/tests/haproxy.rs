@@ -726,6 +726,7 @@ async fn rendered_config_passes_haproxy_validation() {
             conflicted: None,
             resolved_refs: Ok(()),
             supported_kinds: vec!["TCPRoute".into()],
+            allowed_namespaces: Default::default(),
             attached_routes: 1,
             backends,
         }
