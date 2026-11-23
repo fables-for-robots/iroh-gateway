@@ -1,7 +1,7 @@
 //! `iroh-gateway-operator`: the private side of the tunnel.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -58,7 +58,9 @@ async fn main() -> anyhow::Result<()> {
 async fn run_static(path: PathBuf) -> anyhow::Result<()> {
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg = staticcfg::parse(&text).with_context(|| format!("in {}", path.display()))?;
+    let base_dir = path.parent().unwrap_or(Path::new(""));
+    let cfg =
+        staticcfg::parse(&text, base_dir).with_context(|| format!("in {}", path.display()))?;
     let key = load_or_generate(&cfg.key_file)
         .with_context(|| format!("key file {}", cfg.key_file.display()))?;
     // One descriptor per backend connection, plus the endpoint and the rest.

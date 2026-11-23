@@ -122,7 +122,7 @@ port = 8080
 target = "127.0.0.1:3000"
 ```
 
-Unknown fields, an edge listed twice, an edge without listeners, two listeners with the same protocol and port in one edge, and a missing `address` while `relay` is `disabled` are rejected at start.
+A relative `key_file` is taken relative to the directory of the configuration file. An `address` is `host:port`: an IP address (IPv6 in brackets, as in `[2001:db8::1]:7842`) or a DNS name, and a port from 1 to 65535. Unknown fields, a file without any `[[edge]]`, an edge listed twice, an edge without listeners, a listener on port 0, two listeners with the same protocol and port in one edge, a malformed `address`, and a missing `address` while `relay` is `disabled` are rejected at start.
 
 ## Running in production
 

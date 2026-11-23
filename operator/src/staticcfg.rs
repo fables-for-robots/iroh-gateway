@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use iroh::EndpointId;
@@ -57,9 +57,13 @@ struct RawListener {
     target: SocketAddr,
 }
 
-/// Parses and validates the configuration text.
-pub fn parse(text: &str) -> anyhow::Result<StaticConfig> {
+/// Parses and validates the configuration text. A relative `key_file` is taken relative to
+/// `base_dir`, the directory of the configuration file.
+pub fn parse(text: &str, base_dir: &Path) -> anyhow::Result<StaticConfig> {
     let raw: RawConfig = toml::from_str(text).context("invalid configuration")?;
+    if raw.edge.is_empty() {
+        bail!("no [[edge]] is configured");
+    }
     let relay: Relay = match raw.relay {
         Some(r) => r.parse()?,
         None => Relay::Disabled,
@@ -74,12 +78,18 @@ pub fn parse(text: &str) -> anyhow::Result<StaticConfig> {
         if e.address.is_none() && relay == Relay::Disabled {
             bail!("edge {id} has no address, which is required while relay is \"disabled\"");
         }
+        if let Some(address) = &e.address {
+            check_address(address).with_context(|| format!("edge {id}"))?;
+        }
         if e.listener.is_empty() {
             bail!("edge {id} has no listeners");
         }
         let mut seen = HashSet::new();
         let mut listeners = Vec::new();
         for l in e.listener {
+            if l.port == 0 {
+                bail!("edge {id} has a {:?} listener on port 0", l.protocol);
+            }
             if !seen.insert((l.protocol, l.port)) {
                 bail!(
                     "edge {id} has two {:?} listeners on port {}",
@@ -100,16 +110,63 @@ pub fn parse(text: &str) -> anyhow::Result<StaticConfig> {
         });
     }
     Ok(StaticConfig {
-        key_file: raw.key_file,
+        key_file: base_dir.join(raw.key_file),
         relay,
         edges,
     })
+}
+
+/// `address` is `host:port`: an IP address (IPv6 in brackets) or a DNS name, and a port in
+/// 1..=65535.
+fn check_address(address: &str) -> anyhow::Result<()> {
+    let bad = || format!("address {address:?} is not host:port");
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        if addr.port() == 0 {
+            bail!("address {address:?} has port 0");
+        }
+        return Ok(());
+    }
+    let (host, port) = address.rsplit_once(':').with_context(bad)?;
+    port.parse::<u16>()
+        .ok()
+        .filter(|&p| p != 0)
+        .with_context(|| format!("address {address:?} needs a port from 1 to 65535"))?;
+    if !is_dns_name(host) {
+        bail!(
+            "address {address:?}: {host:?} is neither an IP address (IPv6 in brackets) nor a \
+             host name"
+        );
+    }
+    Ok(())
+}
+
+/// Letters, digits and inner hyphens in dot-separated labels, with an optional final dot; the
+/// last label not all digits, so a malformed IPv4 address is not taken for a name.
+fn is_dns_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    host.len() <= 253
+        && host.split('.').all(label_ok)
+        && host
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| !last.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use iroh::SecretKey;
+
+    /// `parse` with the config file in `/etc/iroh-gateway`.
+    fn parse_in(text: &str) -> anyhow::Result<StaticConfig> {
+        parse(text, Path::new("/etc/iroh-gateway"))
+    }
 
     fn id() -> String {
         SecretKey::generate().public().to_string()
@@ -136,8 +193,11 @@ target = "127.0.0.1:3000"
     #[test]
     fn parses_the_documented_example() {
         let id = id();
-        let cfg = parse(&example(r#"relay = "disabled""#, &id)).unwrap();
-        assert_eq!(cfg.key_file, PathBuf::from("operator.key"));
+        let cfg = parse_in(&example(r#"relay = "disabled""#, &id)).unwrap();
+        assert_eq!(
+            cfg.key_file,
+            PathBuf::from("/etc/iroh-gateway/operator.key")
+        );
         assert_eq!(cfg.relay, Relay::Disabled);
         assert_eq!(cfg.edges.len(), 1);
         let edge = &cfg.edges[0];
@@ -151,10 +211,10 @@ target = "127.0.0.1:3000"
 
     #[test]
     fn rejects_unknown_fields() {
-        let err = parse(&example(r#"colour = "red""#, &id())).unwrap_err();
+        let err = parse_in(&example(r#"colour = "red""#, &id())).unwrap_err();
         assert!(format!("{err:#}").contains("colour"), "{err:#}");
         let nested = example("", &id()).replace("port = 8080", "port = 8080\nflavour = 1");
-        let err = parse(&nested).unwrap_err();
+        let err = parse_in(&nested).unwrap_err();
         assert!(format!("{err:#}").contains("flavour"), "{err:#}");
     }
 
@@ -167,7 +227,7 @@ protocol = "tcp"
 port = 8080
 target = "127.0.0.1:3001"
 "#;
-        let err = parse(&text).unwrap_err();
+        let err = parse_in(&text).unwrap_err();
         assert!(format!("{err:#}").contains("8080"), "{err:#}");
     }
 
@@ -180,7 +240,7 @@ protocol = "udp"
 port = 8080
 target = "127.0.0.1:3001"
 "#;
-        assert_eq!(parse(&text).unwrap().edges[0].listeners.len(), 2);
+        assert_eq!(parse_in(&text).unwrap().edges[0].listeners.len(), 2);
     }
 
     #[test]
@@ -191,7 +251,7 @@ target = "127.0.0.1:3001"
                 .split_once("[[edge]]")
                 .map(|(_, rest)| format!("[[edge]]{rest}"))
                 .unwrap();
-        let err = parse(&text).unwrap_err();
+        let err = parse_in(&text).unwrap_err();
         assert!(format!("{err:#}").contains(&id), "{err:#}");
     }
 
@@ -201,13 +261,78 @@ target = "127.0.0.1:3001"
             "key_file = \"k\"\n[[edge]]\nendpoint_id = \"{}\"\naddress = \"203.0.113.7:7842\"\n",
             id()
         );
-        let err = parse(&text).unwrap_err();
+        let err = parse_in(&text).unwrap_err();
         assert!(format!("{err:#}").contains("no listeners"), "{err:#}");
     }
 
     #[test]
+    fn key_file_is_relative_to_the_config_directory() {
+        let text = example("", &id());
+        let cfg = parse(&text, Path::new("conf")).unwrap();
+        assert_eq!(cfg.key_file, Path::new("conf").join("operator.key"));
+        let cfg = parse(&text, Path::new("")).unwrap();
+        assert_eq!(cfg.key_file, PathBuf::from("operator.key"));
+        let absolute = text.replace("\"operator.key\"", "\"/var/lib/o.key\"");
+        assert_eq!(
+            parse_in(&absolute).unwrap().key_file,
+            PathBuf::from("/var/lib/o.key")
+        );
+    }
+
+    #[test]
+    fn rejects_a_file_without_edges() {
+        let err = parse_in("key_file = \"k\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("[[edge]]"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_listener_port_zero() {
+        let text = example("", &id()).replace("port = 8080", "port = 0");
+        let err = parse_in(&text).unwrap_err();
+        assert!(format!("{err:#}").contains("port 0"), "{err:#}");
+    }
+
+    #[test]
+    fn address_must_be_host_and_port() {
+        let with_address =
+            |address: &str| parse_in(&example("", &id()).replace("203.0.113.7:7842", address));
+        for good in [
+            "203.0.113.7:7842",
+            "[2001:db8::1]:7842",
+            "edge.example.com:7842",
+            "edge-1.example.com.:65535",
+            "localhost:1",
+        ] {
+            assert!(
+                with_address(good).is_ok(),
+                "{good}: {:#}",
+                with_address(good).unwrap_err()
+            );
+        }
+        for bad in [
+            "203.0.113.7",
+            "203.0.113.7:0",
+            "203.0.113.7:65536",
+            "edge.example.com",
+            "edge.example.com:",
+            "edge.example.com:port",
+            ":7842",
+            "2001:db8::1:7842",
+            "[2001:db8::1]",
+            "[edge.example.com]:7842",
+            "edge example.com:7842",
+            "-edge.example.com:7842",
+            "999.1.1.1:7842",
+            "https://edge.example.com:7842",
+        ] {
+            let err = with_address(bad).unwrap_err();
+            assert!(format!("{err:#}").contains("address"), "{bad}: {err:#}");
+        }
+    }
+
+    #[test]
     fn relay_defaults_to_disabled() {
-        let cfg = parse(&example("", &id())).unwrap();
+        let cfg = parse_in(&example("", &id())).unwrap();
         assert_eq!(cfg.relay, Relay::Disabled);
     }
 
@@ -216,7 +341,7 @@ target = "127.0.0.1:3001"
         let no_address = |relay: &str| {
             let text = example(&format!("relay = \"{relay}\""), &id())
                 .replace("address = \"203.0.113.7:7842\"\n", "");
-            parse(&text)
+            parse_in(&text)
         };
         let err = no_address("disabled").unwrap_err();
         assert!(format!("{err:#}").contains("address"), "{err:#}");
