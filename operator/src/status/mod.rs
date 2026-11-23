@@ -336,10 +336,12 @@ fn listener_status(
 }
 
 fn edge_status(model: &Model, e: &EdgeModel, facts: &Facts) -> EdgeStatusOut {
-    let state = facts.edges.get(&e.key);
+    // An edge the model rejects is never connected or programmed, whatever the facts say.
+    let state = facts.edges.get(&e.key).filter(|_| e.accepted.is_ok());
+    let accepted = e.accepted.is_ok();
     let connected = state.is_some_and(|s| s.connected);
     let not_connected_message = match state {
-        _ if e.accepted.is_err() => "the edge is not accepted".to_owned(),
+        _ if !accepted => "the edge is not accepted".to_owned(),
         Some(s) => s
             .last_error
             .clone()
@@ -885,6 +887,197 @@ mod tests {
         let f = facts(vec![]);
         assert_eq!(compute(&m, &f), compute(&m, &f));
         assert_eq!(d_names(&compute(&m, &f)), ["a", "b"]);
+    }
+
+    fn reject(reason: &str, message: &str) -> Reject {
+        Reject {
+            reason: reason.into(),
+            message: message.into(),
+        }
+    }
+
+    fn other_gateway(name: &str, listeners: Vec<ListenerModel>, edges: &[&str]) -> GatewayModel {
+        let mut g = gateway(listeners, edges);
+        g.key = ObjRef::new("ns", name);
+        g
+    }
+
+    fn gw_cond<'a>(d: &'a DesiredStatus, name: &str, type_: &str) -> &'a Cond {
+        let g = d.gateways.iter().find(|g| g.key.name == name).unwrap();
+        get(&g.conditions, type_)
+    }
+
+    #[test]
+    fn rejected_edge_is_never_connected_or_programmed() {
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e"]),
+            vec![
+                edge("e", Ok(())),
+                edge("f", Err(reject("InvalidEndpointId", "bad id"))),
+            ],
+        );
+        let stale = up(vec![bound(80, Ok(()))]);
+        let d = compute(
+            &m,
+            &facts(vec![("e", up(vec![bound(80, Ok(()))])), ("f", stale)]),
+        );
+        let f = d.edges.iter().find(|e| e.key.name == "f").unwrap();
+        check(get(&f.conditions, "Accepted"), false, "InvalidEndpointId");
+        for t in ["Connected", "Programmed"] {
+            let c = get(&f.conditions, t);
+            check(c, false, "NotConnected");
+            assert_eq!(c.message, "the edge is not accepted");
+        }
+        assert!(f.listeners.is_empty());
+    }
+
+    #[test]
+    fn gateway_not_accepted_beats_haproxy_error() {
+        let mut gw = gateway(vec![listener("a", 80, true)], &[]);
+        gw.accepted = Err(reject("InvalidParameters", "gateway rejected"));
+        let mut f = facts(vec![]);
+        f.haproxy = Err("haproxy nope".into());
+        let d = compute(&model(gw, vec![]), &f);
+        let p = gw_cond(&d, "gw", "Programmed");
+        check(p, false, "Invalid");
+        assert_eq!(p.message, "gateway rejected");
+        let l = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        check(l, false, "Invalid");
+        assert!(l.message.contains("gateway rejected"), "{}", l.message);
+        assert!(!l.message.contains("haproxy nope"), "{}", l.message);
+    }
+
+    #[test]
+    fn haproxy_error_beats_no_edge_and_pending() {
+        let mut f = facts(vec![]);
+        f.haproxy = Err("haproxy nope".into());
+        // No edge at all.
+        let m = model(gateway(vec![listener("a", 80, true)], &[]), vec![]);
+        let d = compute(&m, &f);
+        let p = gw_cond(&d, "gw", "Programmed");
+        check(p, false, "Invalid");
+        assert!(p.message.contains("haproxy nope"), "{}", p.message);
+        let l = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        check(l, false, "Invalid");
+        assert!(l.message.contains("haproxy nope"), "{}", l.message);
+        // An edge exists but is not ready.
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e"]),
+            vec![edge("e", Ok(()))],
+        );
+        let mut f = facts(vec![("e", down(Some("dial timed out")))]);
+        f.haproxy = Err("haproxy nope".into());
+        let d = compute(&m, &f);
+        let p = gw_cond(&d, "gw", "Programmed");
+        check(p, false, "Invalid");
+        assert!(p.message.contains("haproxy nope"), "{}", p.message);
+        assert!(!p.message.contains("dial timed out"), "{}", p.message);
+        let l = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        check(l, false, "Invalid");
+        assert!(l.message.contains("haproxy nope"), "{}", l.message);
+    }
+
+    #[test]
+    fn listener_invalid_rows_and_their_messages() {
+        let mut unaccepted = listener("u", 81, false);
+        unaccepted.accepted = Err(reject("PortUnavailable", "port taken"));
+        let mut conflicted = listener("c", 82, false);
+        conflicted.conflicted = Some(reject("ProtocolConflict", "clash on 82"));
+        let mut gw = gateway(vec![unaccepted, conflicted], &[]);
+        let d = compute(&model(gw.clone(), vec![]), &facts(vec![]));
+        let u = get(&d.gateways[0].listeners[1].conditions, "Programmed");
+        check(u, false, "Invalid");
+        assert!(u.message.contains("port taken"), "{}", u.message);
+        let c = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        check(c, false, "Invalid");
+        assert!(c.message.contains("clash on 82"), "{}", c.message);
+        // The listener's own problem wins over the Gateway being rejected.
+        gw.accepted = Err(reject("InvalidParameters", "gateway rejected"));
+        let d = compute(&model(gw, vec![]), &facts(vec![]));
+        let u = get(&d.gateways[0].listeners[1].conditions, "Programmed");
+        assert!(u.message.contains("port taken"), "{}", u.message);
+        assert!(!u.message.contains("gateway rejected"), "{}", u.message);
+        let c = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        assert!(c.message.contains("clash on 82"), "{}", c.message);
+    }
+
+    #[test]
+    fn listener_invalid_beats_pending() {
+        let mut f = facts(vec![]);
+        f.haproxy = Err("haproxy nope".into());
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e"]),
+            vec![edge("e", Ok(()))],
+        );
+        let st = up(vec![bound(80, Err("address in use"))]);
+        f.edges.insert(ObjRef::new("ns", "e"), st);
+        let d = compute(&m, &f);
+        let l = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        check(l, false, "Invalid");
+        assert!(l.message.contains("haproxy nope"), "{}", l.message);
+    }
+
+    #[test]
+    fn connected_edge_of_another_gateway_does_not_count() {
+        let m = Model {
+            gateways: vec![
+                other_gateway("gw", vec![listener("a", 80, true)], &[]),
+                other_gateway("gw2", vec![listener("a", 80, true)], &["x"]),
+            ],
+            edges: vec![{
+                let mut x = edge("x", Ok(()));
+                x.gateway = Some(ObjRef::new("ns", "gw2"));
+                x
+            }],
+            ..model(gateway(vec![], &[]), vec![])
+        };
+        let d = compute(&m, &facts(vec![("x", up(vec![bound(80, Ok(()))]))]));
+        let p = gw_cond(&d, "gw", "Programmed");
+        check(p, false, "AddressNotAssigned");
+        check(gw_cond(&d, "gw2", "Programmed"), true, "Programmed");
+    }
+
+    #[test]
+    fn stale_state_of_unaccepted_or_absent_edge_does_not_count() {
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &[]),
+            vec![edge("f", Err(reject("InvalidEndpointId", "bad id")))],
+        );
+        let stale = || up(vec![bound(80, Ok(()))]);
+        let d = compute(&m, &facts(vec![("f", stale()), ("ghost", stale())]));
+        let p = gw_cond(&d, "gw", "Programmed");
+        check(p, false, "AddressNotAssigned");
+        let l = get(&d.gateways[0].listeners[0].conditions, "Programmed");
+        assert!(!l.status, "{l:?}");
+    }
+
+    #[test]
+    fn only_the_other_gateways_edge_is_ready() {
+        let m = Model {
+            gateways: vec![
+                other_gateway("gw", vec![listener("a", 80, true)], &["e", "e2"]),
+                other_gateway("gw2", vec![listener("a", 80, true)], &["x"]),
+            ],
+            edges: vec![edge("e", Ok(())), edge("e2", Ok(())), {
+                let mut x = edge("x", Ok(()));
+                x.gateway = Some(ObjRef::new("ns", "gw2"));
+                x
+            }],
+            ..model(gateway(vec![], &[]), vec![])
+        };
+        let d = compute(
+            &m,
+            &facts(vec![
+                ("e", down(Some("boom"))),
+                ("e2", up(vec![bound(80, Err("address in use"))])),
+                ("x", up(vec![bound(80, Ok(()))])),
+            ]),
+        );
+        let p = gw_cond(&d, "gw", "Programmed");
+        check(p, false, "Pending");
+        assert!(p.message.contains("ns/e") && p.message.contains("ns/e2"));
+        assert!(!p.message.contains("ns/x"), "{}", p.message);
+        check(gw_cond(&d, "gw2", "Programmed"), true, "Programmed");
     }
 
     fn d_names(d: &DesiredStatus) -> Vec<String> {
