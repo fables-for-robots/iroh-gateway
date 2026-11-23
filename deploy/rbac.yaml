@@ -13,13 +13,13 @@ rules:
   - apiGroups: [""]
     resources: ["services", "namespaces"]
     verbs: ["get", "list", "watch"]
-  # Status is written as a JSON merge patch.
+  # Status is written as a JSON merge patch, and only so.
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses/status", "gateways/status", "tcproutes/status"]
-    verbs: ["get", "patch", "update"]
+    verbs: ["patch"]
   - apiGroups: ["gateway.fables-for-robots.ch"]
     resources: ["edges/status"]
-    verbs: ["get", "patch", "update"]
+    verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -34,7 +34,8 @@ subjects:
     name: iroh-gateway-operator
     namespace: iroh-gateway
 ---
-# The operator's own key lives in a Secret it creates on first start.
+# The operator's own key lives in a Secret it creates on first start. It may read only that
+# Secret; a create cannot be limited to a name.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -43,7 +44,11 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "create"]
+    resourceNames: ["iroh-gateway-identity"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

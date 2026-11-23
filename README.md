@@ -167,7 +167,7 @@ kubectl -n iroh-gateway set image deployment/iroh-gateway-operator operator=iroh
 kubectl -n iroh-gateway rollout status deployment/iroh-gateway-operator
 ```
 
-The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start (it may only `get` and `create` Secrets there, and has no access to Secrets anywhere else). The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to a private directory `haproxy` that the operator creates in the in-memory volume at `/run/iroh-gateway`.
+The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start (it may `get` only that Secret and `create` Secrets there, and has no access to Secrets anywhere else; with another `--identity-secret`, change the Role's `resourceNames` to match). It writes status only with `patch`. The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to a private directory `haproxy` that the operator creates in the in-memory volume at `/run/iroh-gateway`.
 
 ### Enrolling an edge
 

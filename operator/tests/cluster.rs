@@ -1038,25 +1038,46 @@ async fn deploy_manifests_apply_cleanly() {
         );
     }
 
-    // Secrets: only a namespaced Role may grant them, and the ClusterRole not at all.
-    let mut secret_rules = 0;
+    // Secrets: only the namespaced Role in iroh-gateway may grant them, the ClusterRole not at
+    // all; `get` only for the identity Secret, `create` (which cannot name one) and nothing else.
+    let strings = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut secret_verbs = Vec::new();
     for (file, object) in objects.iter().filter(|(f, _)| f == "rbac.yaml") {
         let kind = object["kind"].as_str().unwrap();
         for rule in object["rules"].as_array().into_iter().flatten() {
-            let resources: Vec<&str> = rule["resources"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
+            let resources = strings(&rule["resources"]);
+            let verbs = strings(&rule["verbs"]);
             let reaches_secrets = resources
                 .iter()
-                .any(|r| matches!(*r, "*" | "secrets") || r.starts_with("secrets/"));
+                .any(|r| matches!(r.as_str(), "*" | "secrets") || r.starts_with("secrets/"));
             if reaches_secrets {
                 assert_eq!(kind, "Role", "{file}: a {kind} rule reaches Secrets");
-                secret_rules += 1;
+                assert_eq!(object["metadata"]["namespace"], "iroh-gateway", "{object}");
+                assert_eq!(resources, ["secrets"], "{rule}");
+                match verbs.as_slice() {
+                    [v] if v == "get" => assert_eq!(
+                        strings(&rule["resourceNames"]),
+                        ["iroh-gateway-identity"],
+                        "{rule}"
+                    ),
+                    [v] if v == "create" => assert!(rule.get("resourceNames").is_none(), "{rule}"),
+                    other => panic!("{file}: Secret verbs {other:?} in {rule}"),
+                }
+                secret_verbs.extend(verbs.clone());
+            }
+            // Status is only ever patched.
+            if resources.iter().any(|r| r.ends_with("/status")) {
+                assert_eq!(verbs, ["patch"], "{file}: {rule}");
             }
         }
     }
-    assert_eq!(secret_rules, 1, "the namespaced Role has one Secret rule");
+    secret_verbs.sort();
+    assert_eq!(secret_verbs, ["create", "get"]);
 }
