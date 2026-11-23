@@ -58,7 +58,8 @@ spec:
             limits:
               memory: 256Mi
           volumeMounts:
-            # HAProxy's configuration and sockets (the default --runtime-dir).
+            # The default --runtime-dir. The volume's root belongs to root; the operator keeps
+            # HAProxy's configuration and sockets in a private directory it creates inside it.
             - name: runtime
               mountPath: /run/iroh-gateway
             - name: tmp

@@ -675,6 +675,7 @@ impl Drop for Child {
 #[ignore = "needs KUBEBUILDER_ASSETS"]
 async fn run_serves_the_cluster_and_stops_on_sigterm() {
     use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
     use nix::sys::signal::{Signal, kill};
@@ -745,6 +746,21 @@ async fn run_serves_the_cluster_and_stops_on_sigterm() {
         has(&conditions, &[("Accepted", "True")])
     })
     .await;
+
+    // HAProxy runs in a private directory the operator created inside --runtime-dir, and
+    // nothing else is written there.
+    let private = dir.path().join("haproxy");
+    let mode = std::fs::metadata(&private)
+        .unwrap_or_else(|e| panic!("{}: {e}", private.display()))
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    assert!(private.join("haproxy.cfg").is_file());
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["haproxy"]);
 
     kill(Pid::from_raw(child.0.id() as i32), Signal::SIGTERM).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

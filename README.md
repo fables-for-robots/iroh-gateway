@@ -165,7 +165,7 @@ kubectl -n iroh-gateway set image deployment/iroh-gateway-operator operator=iroh
 kubectl -n iroh-gateway rollout status deployment/iroh-gateway-operator
 ```
 
-The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start (it may only `get` and `create` Secrets there, and has no access to Secrets anywhere else). The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to an in-memory volume at `/run/iroh-gateway`.
+The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start (it may only `get` and `create` Secrets there, and has no access to Secrets anywhere else). The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to a private directory `haproxy` that the operator creates in the in-memory volume at `/run/iroh-gateway`.
 
 ### Enrolling an edge
 
@@ -334,10 +334,10 @@ Once `kubectl -n iroh-gateway get gateway public` shows `Programmed` `True` and 
 | `--controller-name <name>` | `IROH_GATEWAY_CONTROLLER_NAME` | `gateway.fables-for-robots.ch/iroh-gateway` |
 | `--identity-secret <name>` | `IROH_GATEWAY_IDENTITY_SECRET` | `iroh-gateway-identity` |
 | `--relay <disabled\|n0\|URL>` | `IROH_GATEWAY_RELAY` | `disabled` |
-| `--runtime-dir <dir>` | `IROH_GATEWAY_RUNTIME_DIR` | `/run/iroh-gateway` |
+| `--runtime-dir <dir>` | `IROH_GATEWAY_RUNTIME_DIR` | `/run/iroh-gateway`; the operator creates a private directory `haproxy` inside it for HAProxy's configuration and sockets |
 | `--haproxy-bin <path>` | `IROH_GATEWAY_HAPROXY_BIN` | `haproxy` (from `PATH`) |
 
-`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. `--relay` must match the edges' `--relay`.
+`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit.
 
 ### Status conditions
 

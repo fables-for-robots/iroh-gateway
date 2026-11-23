@@ -21,8 +21,9 @@ use tracing::{info, warn};
 pub const DEFAULT_RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Longest runtime_dir this module accepts, so that `<runtime_dir>/s/<20 chars>` fits a Unix
-/// socket path.
-pub const MAX_RUNTIME_DIR_LEN: usize = 70;
+/// socket path with room for the `.<pid>.tmp` HAProxy appends while it binds one (macOS allows
+/// 104 bytes with the terminating NUL; HAProxy refuses paths longer than about 93 there).
+pub const MAX_RUNTIME_DIR_LEN: usize = 60;
 
 /// How long [`Supervisor::shutdown`] waits after SIGTERM before it kills HAProxy.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);

@@ -488,6 +488,22 @@ async fn a_panic_while_running_stops_haproxy() {
 }
 
 #[tokio::test]
+async fn start_makes_the_runtime_directory_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    for d in [dir.path().to_path_buf(), dir.path().join("s")] {
+        let mode = std::fs::metadata(&d).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{}: {mode:o}", d.display());
+    }
+    sup.shutdown().await;
+}
+
+#[tokio::test]
 async fn start_refuses_an_invalid_config() {
     let echo = echo_backend(b"").await;
     let dir = short_dir();

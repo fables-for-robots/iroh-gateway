@@ -22,6 +22,9 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+/// The directory inside `--runtime-dir` that `run` gives HAProxy.
+const HAPROXY_DIR: &str = "haproxy";
+
 #[derive(Parser)]
 #[command(version, about = "Private operator of iroh-gateway")]
 struct Cli {
@@ -70,7 +73,8 @@ struct RunArgs {
     /// "disabled", "n0" or an https relay URL; the edges must use the same.
     #[arg(long, env = "IROH_GATEWAY_RELAY", default_value = "disabled")]
     relay: Relay,
-    /// HAProxy's configuration and sockets.
+    /// A directory the operator may write to; it creates a private `haproxy` directory inside
+    /// it for HAProxy's configuration and sockets.
     #[arg(
         long,
         env = "IROH_GATEWAY_RUNTIME_DIR",
@@ -230,13 +234,13 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     let endpoint = bind_endpoint(key.clone(), &args.relay).await?;
     info!(id = %key.public(), namespaces = ?settings.gateway_namespaces, "operator started");
 
-    let mut supervisor = SupervisorOptions::new(&args.runtime_dir);
+    // The directory given may belong to someone else (an emptyDir's root belongs to root), so
+    // HAProxy gets one of its own inside it, which the supervisor creates and makes private.
+    let haproxy_dir = args.runtime_dir.join(HAPROXY_DIR);
+    let mut supervisor = SupervisorOptions::new(&haproxy_dir);
     supervisor.haproxy_bin = args.haproxy_bin;
     // Nothing is served until the stores have synced and the first pass has run.
-    let initial = render(
-        &model::build(&Snapshot::default(), &settings),
-        &args.runtime_dir,
-    );
+    let initial = render(&model::build(&Snapshot::default(), &settings), &haproxy_dir);
     let mut engine = Engine::start(
         endpoint.clone(),
         EngineOptions::new(supervisor, args.relay),
@@ -245,7 +249,7 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     .await?;
     let stores = Stores::start(client.clone());
     let writer = StatusWriter::new(client, args.controller_name);
-    let opts = ControllerOptions::new(settings, &args.runtime_dir);
+    let opts = ControllerOptions::new(settings, &haproxy_dir);
     let shutdown = shutdown_signals()?;
     let ended = run_loop(stores, &mut engine, writer, opts, shutdown).await;
     info!("shutting down");
