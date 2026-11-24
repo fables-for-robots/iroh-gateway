@@ -2,20 +2,22 @@
 
 use std::collections::BTreeMap;
 
+use k8s_openapi::api::core::v1::Secret;
 use kube::ResourceExt;
 
 use gateway_api::gateways::v1::{
     GatewayListenersAllowedRoutesNamespaces, GatewayListenersAllowedRoutesNamespacesFrom as From,
+    GatewayListenersTlsMode,
 };
 
+use super::certs;
 use super::generation;
 use super::{
-    ClassModel, GatewayModel, LabelRequirement, LabelSelector, ListenerModel, ObjRef, Reject,
-    RouteNamespaces, Settings, Snapshot,
+    ClassModel, GatewayModel, HostMatch, LabelRequirement, LabelSelector, ListenerModel, ObjRef,
+    Reject, RouteKind, RouteNamespaces, Settings, Snapshot,
 };
 
 pub(super) const ROUTE_GROUP: &str = "gateway.networking.k8s.io";
-pub(super) const ROUTE_KIND: &str = "TCPRoute";
 
 /// Every class with our controller name, by name.
 pub(super) fn classes(snapshot: &Snapshot, settings: &Settings) -> Vec<ClassModel> {
@@ -38,20 +40,30 @@ pub(super) fn gateways(
     settings: &Settings,
     classes: &[ClassModel],
 ) -> Vec<GatewayModel> {
+    let secrets: BTreeMap<ObjRef, &Secret> = snapshot
+        .secrets
+        .iter()
+        .map(|s| (ObjRef::of(s), s))
+        .collect();
     let mut out: Vec<GatewayModel> = snapshot
         .gateways
         .iter()
         .filter(|g| classes.iter().any(|c| c.name == g.spec.gateway_class_name))
-        .map(|g| gateway(g, settings))
+        .map(|g| gateway(g, settings, &secrets))
         .collect();
     out.sort_by(|a, b| a.key.cmp(&b.key));
     out
 }
 
-fn gateway(gw: &gateway_api::gateways::v1::Gateway, settings: &Settings) -> GatewayModel {
+fn gateway(
+    gw: &gateway_api::gateways::v1::Gateway,
+    settings: &Settings,
+    secrets: &BTreeMap<ObjRef, &Secret>,
+) -> GatewayModel {
     let key = ObjRef::of(gw);
-    let listeners = listeners(&gw.spec.listeners);
-    let accepted = if !settings.gateway_namespaces.contains(&key.namespace) {
+    let served = settings.gateway_namespaces.contains(&key.namespace);
+    let listeners = listeners(&gw.spec.listeners, &key.namespace, served, secrets);
+    let accepted = if !served {
         Err(Reject::new(
             "NamespaceNotAllowed",
             format!(
@@ -83,14 +95,23 @@ fn gateway(gw: &gateway_api::gateways::v1::Gateway, settings: &Settings) -> Gate
         edges: Vec::new(),
         addresses: Vec::new(),
         addresses_dropped: 0,
+        http_ports: Vec::new(),
     }
 }
 
-fn listeners(specs: &[gateway_api::gateways::v1::GatewayListeners]) -> Vec<ListenerModel> {
-    let mut out: Vec<ListenerModel> = specs.iter().map(listener).collect();
+fn listeners(
+    specs: &[gateway_api::gateways::v1::GatewayListeners],
+    gateway_ns: &str,
+    served: bool,
+    secrets: &BTreeMap<ObjRef, &Secret>,
+) -> Vec<ListenerModel> {
+    let mut out: Vec<ListenerModel> = specs
+        .iter()
+        .map(|spec| listener(spec, gateway_ns, served, secrets))
+        .collect();
 
-    // Listeners sharing a port conflict: on the hostname when the protocol is the same, on
-    // the protocol otherwise.
+    // Listeners sharing a port conflict: on the protocol when it differs; on the hostname when
+    // it is HTTP or HTTPS, where several hostnames can share a port; on the port otherwise.
     let mut by_port: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
     for (i, l) in out.iter().enumerate() {
         // Listeners with an invalid port (stored as 0) are already refused; they share nothing.
@@ -100,34 +121,56 @@ fn listeners(specs: &[gateway_api::gateways::v1::GatewayListeners]) -> Vec<Liste
         by_port.entry(l.port).or_default().push(i);
     }
     for (port, members) in by_port.into_iter().filter(|(_, m)| m.len() > 1) {
-        let same = members
-            .iter()
-            .all(|&i| out[i].protocol == out[members[0]].protocol);
-        let reject = if same {
-            Reject::new(
-                "HostnameConflict",
-                format!(
-                    "several listeners use port {port} with protocol {}",
-                    out[members[0]].protocol
-                ),
-            )
-        } else {
-            Reject::new(
+        let protocol = out[members[0]].protocol.clone();
+        if members.iter().any(|&i| out[i].protocol != protocol) {
+            let reject = Reject::new(
                 "ProtocolConflict",
                 format!("listeners use port {port} with different protocols"),
-            )
-        };
-        for i in members {
-            out[i].conflicted = Some(reject.clone());
+            );
+            for i in members {
+                out[i].conflicted = Some(reject.clone());
+            }
+        } else if protocol == "HTTP" || protocol == "HTTPS" {
+            // Only listeners that are otherwise valid take part: a refused hostname is not one.
+            for &i in &members {
+                if out[i].accepted.is_err() {
+                    continue;
+                }
+                let hostname = out[i].hostname.clone();
+                let twins = members
+                    .iter()
+                    .filter(|&&j| out[j].accepted.is_ok() && out[j].hostname == hostname)
+                    .count();
+                if twins > 1 {
+                    out[i].conflicted = Some(Reject::new(
+                        "HostnameConflict",
+                        format!("several listeners use port {port} with hostname {hostname}"),
+                    ));
+                }
+            }
+        } else {
+            let reject = Reject::new(
+                "HostnameConflict",
+                format!("several listeners use port {port} with protocol {protocol}"),
+            );
+            for i in members {
+                out[i].conflicted = Some(reject.clone());
+            }
         }
     }
     out
 }
 
-fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel {
+/// One listener; `served` says whether the Gateway's namespace is one the operator serves.
+fn listener(
+    spec: &gateway_api::gateways::v1::GatewayListeners,
+    gateway_ns: &str,
+    served: bool,
+    secrets: &BTreeMap<ObjRef, &Secret>,
+) -> ListenerModel {
     let mut accepted = Ok(());
     let mut resolved_refs = Ok(());
-    let mut supported_kinds = vec![ROUTE_KIND.to_owned()];
+    let mut hostname = HostMatch::Any;
 
     let port = match u16::try_from(spec.port) {
         Ok(p) if p != 0 => p,
@@ -139,30 +182,75 @@ fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel
             0
         }
     };
-    if spec.protocol != "TCP" {
-        // An invalid port keeps its own rejection.
+
+    let kind = match spec.protocol.as_str() {
+        "TCP" => Some(RouteKind::Tcp),
+        "HTTP" | "HTTPS" => Some(RouteKind::Http),
+        _ => None,
+    };
+    // An invalid port keeps its own rejection; the first problem found is the one reported.
+    let mut refuse = |reason: &str, message: String| {
         if accepted.is_ok() {
-            accepted = Err(Reject::new(
-                "UnsupportedProtocol",
-                format!("protocol {:?} is not supported; only TCP is", spec.protocol),
-            ));
+            accepted = Err(Reject::new(reason, message));
         }
-        supported_kinds.clear();
-    } else if let Some(kinds) = spec
-        .allowed_routes
-        .as_ref()
-        .and_then(|a| a.kinds.as_ref())
-        .filter(|k| !k.is_empty())
-    {
-        let tcp = kinds.iter().any(|k| {
-            k.kind == ROUTE_KIND && k.group.as_deref().unwrap_or(ROUTE_GROUP) == ROUTE_GROUP
-        });
-        if !tcp {
-            resolved_refs = Err(Reject::new(
-                "InvalidRouteKinds",
-                "allowedRoutes.kinds does not include TCPRoute",
-            ));
-            supported_kinds.clear();
+    };
+    match spec.protocol.as_str() {
+        "TCP" => {}
+        "HTTP" | "HTTPS" => {
+            match HostMatch::parse(spec.hostname.as_deref()) {
+                Ok(h) => hostname = h,
+                Err(message) => refuse("UnsupportedValue", message),
+            }
+            let passthrough = spec
+                .tls
+                .as_ref()
+                .is_some_and(|t| matches!(t.mode, Some(GatewayListenersTlsMode::Passthrough)));
+            if spec.protocol == "HTTPS" && passthrough {
+                refuse(
+                    "UnsupportedProtocol",
+                    "tls.mode Passthrough is not supported; only Terminate is".into(),
+                );
+            }
+        }
+        other => refuse(
+            "UnsupportedProtocol",
+            format!("protocol {other:?} is not supported; TCP, HTTP and HTTPS are"),
+        ),
+    }
+
+    let mut supported_kinds = Vec::new();
+    if let Some(kind) = kind {
+        let name = kind.as_str();
+        supported_kinds.push(name.to_owned());
+        if let Some(kinds) = spec
+            .allowed_routes
+            .as_ref()
+            .and_then(|a| a.kinds.as_ref())
+            .filter(|k| !k.is_empty())
+        {
+            let is_ours = |k: &&gateway_api::gateways::v1::GatewayListenersAllowedRoutesKinds| {
+                k.kind == name && k.group.as_deref().unwrap_or(ROUTE_GROUP) == ROUTE_GROUP
+            };
+            if !kinds.iter().any(|k| is_ours(&k)) {
+                supported_kinds.clear();
+            }
+            if kinds.iter().any(|k| !is_ours(&k)) {
+                resolved_refs = Err(Reject::new(
+                    "InvalidRouteKinds",
+                    format!("allowedRoutes.kinds lists kinds other than {name}"),
+                ));
+            }
+        }
+    }
+
+    // Only an accepted HTTPS listener of a served Gateway has its certificates resolved. A
+    // certificate problem is the one that stops the listener, so it replaces an
+    // `InvalidRouteKinds` found above.
+    let mut certificates = Vec::new();
+    if spec.protocol == "HTTPS" && accepted.is_ok() && served {
+        match certs::resolve(spec.tls.as_ref(), gateway_ns, secrets) {
+            Ok(c) => certificates = c,
+            Err(reject) => resolved_refs = Err(reject),
         }
     }
 
@@ -170,6 +258,7 @@ fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel
         name: spec.name.clone(),
         port,
         protocol: spec.protocol.clone(),
+        hostname,
         accepted,
         conflicted: None,
         resolved_refs,
@@ -181,6 +270,7 @@ fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel
         ),
         attached_routes: 0,
         backends: Vec::new(),
+        certificates,
     }
 }
 
@@ -213,7 +303,8 @@ fn route_namespaces(rule: Option<&GatewayListenersAllowedRoutesNamespaces>) -> R
 mod tests {
     use super::super::build;
     use super::super::fixtures::*;
-    use super::super::{GatewayModel, Model, Reject};
+    use super::super::{GatewayModel, HostMatch, Model, Reject};
+    use gateway_api::gateways::v1::{GatewayListenersTls, GatewayListenersTlsMode};
 
     fn model_of(s: &super::Snapshot) -> Model {
         build(s, &settings(&["infra"]))
@@ -284,25 +375,308 @@ mod tests {
     }
 
     #[test]
-    fn other_protocols_are_unsupported() {
+    fn tls_and_udp_listeners_are_unsupported() {
         let g = one(&snap(
             gateway("infra", "gw")
                 .listener("pg", 5432, "TCP")
-                .listener("a", 80, "HTTP")
-                .listener("b", 443, "HTTPS")
                 .listener("c", 853, "TLS")
                 .listener("d", 53, "UDP"),
         ));
         assert_eq!(g.accepted, Ok(()));
         for l in &g.listeners[1..] {
             assert_eq!(reason(&l.accepted), "UnsupportedProtocol", "{}", l.name);
+            let message = &l.accepted.as_ref().unwrap_err().message;
+            assert_eq!(
+                message,
+                &format!(
+                    "protocol {:?} is not supported; TCP, HTTP and HTTPS are",
+                    l.protocol
+                )
+            );
             assert!(l.supported_kinds.is_empty());
         }
     }
 
     #[test]
+    fn http_listener_is_accepted_and_supports_http_routes() {
+        let g = one(&snap(gateway("infra", "gw").listener("web", 80, "HTTP")));
+        assert_eq!(g.accepted, Ok(()));
+        let l = &g.listeners[0];
+        assert_eq!(l.accepted, Ok(()));
+        assert_eq!(l.resolved_refs, Ok(()));
+        assert_eq!(l.conflicted, None);
+        assert_eq!(l.supported_kinds, ["HTTPRoute"]);
+        assert_eq!(l.hostname, HostMatch::Any);
+        assert_eq!((l.port, l.attached_routes), (80, 0));
+    }
+
+    #[test]
+    fn https_listener_is_accepted() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("tls", 443, "HTTPS")
+                .hostname("app.example.com")
+                .tls(GatewayListenersTls {
+                    mode: Some(GatewayListenersTlsMode::Terminate),
+                    ..Default::default()
+                }),
+        ));
+        assert_eq!(g.accepted, Ok(()));
+        let l = &g.listeners[0];
+        assert_eq!(l.accepted, Ok(()));
+        assert_eq!(l.conflicted, None);
+        assert_eq!(l.supported_kinds, ["HTTPRoute"]);
+        assert_eq!(l.hostname, HostMatch::Exact("app.example.com".into()));
+    }
+
+    #[test]
+    fn https_with_passthrough_is_refused() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("ok", 80, "HTTP")
+                .listener("tls", 443, "HTTPS")
+                .tls(GatewayListenersTls {
+                    mode: Some(GatewayListenersTlsMode::Passthrough),
+                    ..Default::default()
+                }),
+        ));
+        let reject = g.listeners[1].accepted.as_ref().unwrap_err();
+        assert_eq!(reject.reason, "UnsupportedProtocol");
+        assert_eq!(
+            reject.message,
+            "tls.mode Passthrough is not supported; only Terminate is"
+        );
+    }
+
+    #[test]
+    fn hostname_is_lower_cased() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 80, "HTTP")
+                .hostname("App.Example.COM")
+                .listener("b", 81, "HTTP")
+                .hostname("*.Example.com"),
+        ));
+        assert_eq!(
+            g.listeners[0].hostname,
+            HostMatch::Exact("app.example.com".into())
+        );
+        assert_eq!(
+            g.listeners[1].hostname,
+            HostMatch::Wildcard(".example.com".into())
+        );
+    }
+
+    #[test]
+    fn tcp_listener_ignores_its_hostname() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("pg", 5432, "TCP")
+                .hostname("not a hostname!"),
+        ));
+        assert_eq!(g.listeners[0].accepted, Ok(()));
+        assert_eq!(g.listeners[0].hostname, HostMatch::Any);
+    }
+
+    #[test]
+    fn invalid_hostname_refuses_the_listener() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("ok", 80, "HTTP")
+                .listener("bad", 81, "HTTP")
+                .hostname("ex'ample.com")
+                .listener("ip", 82, "HTTPS")
+                .hostname("10.0.0.1"),
+        ));
+        for l in &g.listeners[1..] {
+            assert_eq!(reason(&l.accepted), "UnsupportedValue", "{}", l.name);
+        }
+        assert_eq!(g.listeners[0].accepted, Ok(()));
+    }
+
+    #[test]
+    fn http_listeners_with_different_hostnames_share_a_port() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 80, "HTTP")
+                .hostname("a.example.com")
+                .listener("b", 80, "HTTP")
+                .hostname("b.example.com")
+                .listener("w", 80, "HTTP")
+                .hostname("*.example.com")
+                .listener("any", 80, "HTTP"),
+        ));
+        for l in &g.listeners {
+            assert_eq!(l.conflicted, None, "{}", l.name);
+        }
+        assert_eq!(g.accepted, Ok(()));
+    }
+
+    #[test]
+    fn http_listeners_with_the_same_hostname_conflict() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a1", 80, "HTTP")
+                .hostname("a.example.com")
+                .listener("a2", 80, "HTTP")
+                .hostname("A.example.com")
+                .listener("b", 80, "HTTP")
+                .hostname("b.example.com"),
+        ));
+        for l in &g.listeners[..2] {
+            let c = l.conflicted.as_ref().unwrap();
+            assert_eq!(c.reason, "HostnameConflict");
+            assert_eq!(
+                c.message,
+                "several listeners use port 80 with hostname a.example.com"
+            );
+        }
+        assert_eq!(g.listeners[2].conflicted, None);
+        assert_eq!(g.accepted, Ok(()));
+    }
+
+    #[test]
+    fn two_http_listeners_without_hostname_conflict() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 80, "HTTP")
+                .listener("b", 80, "HTTP"),
+        ));
+        for l in &g.listeners {
+            let c = l.conflicted.as_ref().unwrap();
+            assert_eq!(c.reason, "HostnameConflict");
+            assert_eq!(
+                c.message,
+                "several listeners use port 80 with hostname (any)"
+            );
+        }
+        assert_eq!(reason(&g.accepted), "ListenersNotValid");
+    }
+
+    #[test]
+    fn refused_listener_takes_no_part_in_hostname_conflicts() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("any", 80, "HTTP")
+                .listener("bad", 80, "HTTP")
+                .hostname("ex'ample.com"),
+        ));
+        assert_eq!(reason(&g.listeners[1].accepted), "UnsupportedValue");
+        // Both would answer for any host if the refused one counted; it does not.
+        assert_eq!(g.listeners[0].accepted, Ok(()));
+        assert_eq!(g.listeners[0].conflicted, None);
+        assert_eq!(g.listeners[1].conflicted, None);
+        assert_eq!(g.accepted, Ok(()));
+    }
+
+    #[test]
+    fn https_listeners_share_a_port_by_hostname() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 443, "HTTPS")
+                .hostname("a.example.com")
+                .listener("b", 443, "HTTPS")
+                .hostname("b.example.com")
+                .listener("c", 443, "HTTPS")
+                .hostname("b.example.com"),
+        ));
+        assert_eq!(g.listeners[0].conflicted, None);
+        assert!(g.listeners[1].conflicted.is_some());
+        assert!(g.listeners[2].conflicted.is_some());
+    }
+
+    #[test]
+    fn http_and_https_on_one_port_conflict() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 80, "HTTP")
+                .hostname("a.example.com")
+                .listener("b", 80, "HTTPS")
+                .hostname("b.example.com"),
+        ));
+        for l in &g.listeners {
+            assert_eq!(l.conflicted.as_ref().unwrap().reason, "ProtocolConflict");
+        }
+    }
+
+    #[test]
+    fn tcp_and_http_on_one_port_conflict() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 80, "TCP")
+                .listener("b", 80, "HTTP"),
+        ));
+        for l in &g.listeners {
+            assert_eq!(l.conflicted.as_ref().unwrap().reason, "ProtocolConflict");
+        }
+    }
+
+    #[test]
+    fn two_tcp_listeners_on_one_port_still_conflict() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 5432, "TCP")
+                .listener("b", 5432, "TCP"),
+        ));
+        for l in &g.listeners {
+            assert_eq!(l.conflicted.as_ref().unwrap().reason, "HostnameConflict");
+        }
+    }
+
+    #[test]
+    fn allowed_kinds_with_an_unsupported_kind_keep_the_supported_one() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("pg", 5432, "TCP")
+                .allowed_kinds(&[
+                    ("gateway.networking.k8s.io", "TCPRoute"),
+                    ("gateway.networking.k8s.io", "HTTPRoute"),
+                    ("gateway.networking.k8s.io", "TCPRoute"),
+                ]),
+        ));
+        let l = &g.listeners[0];
+        assert_eq!(reason(&l.resolved_refs), "InvalidRouteKinds");
+        assert_eq!(l.supported_kinds, ["TCPRoute"]);
+        assert_eq!(l.accepted, Ok(()));
+    }
+
+    #[test]
+    fn allowed_kinds_of_another_group_are_invalid() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("web", 80, "HTTP")
+                .allowed_kinds(&[("example.com", "HTTPRoute")]),
+        ));
+        let l = &g.listeners[0];
+        assert_eq!(reason(&l.resolved_refs), "InvalidRouteKinds");
+        assert!(l.supported_kinds.is_empty());
+    }
+
+    #[test]
+    fn http_listener_with_http_route_kind_is_fine() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("web", 80, "HTTP")
+                .allowed_kinds(&[("gateway.networking.k8s.io", "HTTPRoute")]),
+        ));
+        assert_eq!(g.listeners[0].resolved_refs, Ok(()));
+        assert_eq!(g.listeners[0].supported_kinds, ["HTTPRoute"]);
+    }
+
+    #[test]
+    fn http_listener_serves_once_a_route_is_attached() {
+        let mut g = one(&snap(gateway("infra", "gw").listener("web", 80, "HTTP")));
+        let l = &mut g.listeners[0];
+        assert!(!l.serving());
+        l.attached_routes = 1;
+        assert!(l.serving());
+        l.conflicted = Some(Reject::new("HostnameConflict", "x"));
+        assert!(!l.serving());
+    }
+
+    #[test]
     fn gateway_with_no_valid_listener_is_not_accepted() {
-        let g = one(&snap(gateway("infra", "gw").listener("a", 80, "HTTP")));
+        let g = one(&snap(gateway("infra", "gw").listener("a", 80, "UDP")));
         assert_eq!(reason(&g.accepted), "ListenersNotValid");
     }
 
@@ -376,7 +750,7 @@ mod tests {
         let g = one(&snap(
             gateway("infra", "gw")
                 .listener("ok", 5432, "TCP")
-                .listener("bad", 0, "HTTP"),
+                .listener("bad", 0, "UDP"),
         ));
         assert_eq!(reason(&g.listeners[1].accepted), "PortUnavailable");
         assert!(g.listeners[1].supported_kinds.is_empty());

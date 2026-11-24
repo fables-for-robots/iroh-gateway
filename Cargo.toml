@@ -10,6 +10,7 @@ repository = "https://github.com/fables-for-robots/iroh-gateway"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ciborium = "0.2"
 fastrand = "2"
@@ -32,6 +33,7 @@ tempfile = "3"
 thiserror = "2"
 toml = "0.9"
 tokio = { version = "1.50", features = ["io-util", "macros", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.30", default-features = false, features = ["signal"] }

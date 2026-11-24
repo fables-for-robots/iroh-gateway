@@ -25,7 +25,7 @@ diagnostics() {
   echo "=== e2e failed; cluster state follows ===" >&2
   kubectl get pods -A -o wide >&2 || true
   for resource in gateways.gateway.networking.k8s.io tcproutes.gateway.networking.k8s.io \
-    edges.gateway.fables-for-robots.ch; do
+    httproutes.gateway.networking.k8s.io edges.gateway.fables-for-robots.ch; do
     k get "$resource" -o wide >&2 || true
     k describe "$resource" >&2 || true
   done
@@ -52,6 +52,78 @@ step() { echo "--- $*"; }
 send_line() {
   k exec probe -- sh -c \
     "(echo '$1'; sleep 1) | nc -w 3 edge.$ns.svc 8080" 2>/dev/null || true
+}
+
+# Calls "$@" every 2 s until it succeeds, for at most $1 seconds; fails if it never does.
+retry() {
+  local seconds="$1"
+  shift
+  local deadline=$((SECONDS + seconds))
+  until "$@"; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# What the last check saw, for the failure message.
+got=
+
+# Runs curl in the curl pod with these arguments, each request limited to 5 s. What it prints,
+# its errors included, goes to $got; the status is curl's, or kubectl's if the exec fails.
+curl_pod() {
+  got="$(k exec curl -- curl -sS --max-time 5 "$@" 2>&1)"
+}
+
+# True when curl in the curl pod succeeds and prints exactly $1; the rest are curl's arguments.
+curl_prints() {
+  local want="$1"
+  shift
+  curl_pod "$@" && [ "$got" = "$want" ]
+}
+
+# True when curl in the curl pod fails because the certificate does not verify (curl's exit
+# code 60); the arguments are curl's.
+curl_rejects_certificate() {
+  if curl_pod "$@"; then
+    return 1
+  fi
+  [[ "$got" == *"curl: (60)"* ]]
+}
+
+# True when the conditions Accepted of the parent entries of HTTPRoute $1 read $2, for example
+# "True" for one parent, "True True" for two.
+route_accepted() {
+  got="$(k get httproutes.gateway.networking.k8s.io "$1" \
+    -o jsonpath='{.status.parents[*].conditions[?(@.type=="Accepted")].status}' 2>&1)" &&
+    [ "$got" = "$2" ]
+}
+
+# Writes the Secret app-tls of type kubernetes.io/tls from certificate $1 and key $2, creating
+# or replacing it.
+app_tls_secret() {
+  k create secret tls app-tls --cert="$1" --key="$2" --dry-run=client -o yaml | k apply -f -
+}
+
+# A self-signed certificate for app.example.test with an ECDSA P-256 key (PKCS#8): $1.crt, $1.key.
+self_signed() {
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 7 \
+    -subj "/CN=app.example.test" -addext "subjectAltName = DNS:app.example.test" \
+    -keyout "$1.key" -out "$1.crt"
+}
+
+# True when the operator's certificate directory holds exactly one certificate file of app-tls
+# and every entry in it has mode 0600 (-rw-------).
+certificate_files_private() {
+  got="$(k exec deploy/iroh-gateway-operator -c operator -- \
+    ls -l /run/iroh-gateway/haproxy/certs 2>&1)" || return 1
+  local certificates others
+  # grep -c prints 0 when nothing matches, and then fails.
+  certificates="$(printf '%s\n' "$got" |
+    grep -cE '^-rw-------[.+]? .* iroh-gateway\.app-tls\.[0-9a-f]{16}\.pem$' || true)"
+  others="$(printf '%s\n' "$got" | grep -v '^total ' | grep -cvE '^-rw-------[.+]? ' || true)"
+  [ "$certificates" = 1 ] && [ "$others" = 0 ]
 }
 
 step "Gateway API CRDs"
@@ -168,6 +240,12 @@ spec:
     - name: public
       protocol: TCP
       port: 8080
+    - name: http
+      protocol: TCP
+      port: 8081
+    - name: https
+      protocol: TCP
+      port: 8443
 YAML
 k rollout status deployment/edge --timeout=120s
 
@@ -257,6 +335,209 @@ if [ -z "$closed" ]; then
   echo "the port still echoes 30 s after the TCPRoute was deleted" >&2
   exit 1
 fi
+
+step "web backend and curl pod"
+kubectl apply -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: $ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - "mkdir -p /www && echo 'hello from web' >/www/index.html && exec httpd -f -p 8080 -h /www"
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: $ns
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 8080
+YAML
+k rollout status deployment/web --timeout=120s
+k run curl --image=curlimages/curl:8.11.1 --image-pull-policy=IfNotPresent --restart=Never \
+  --command -- sleep 3600
+k wait --for=condition=Ready pod/curl --timeout=120s
+
+step "HTTP: an HTTPRoute for app.example.test reaches the web backend"
+kubectl apply -f - <<YAML
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: $ns
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: tcp-8080
+      protocol: TCP
+      port: 8080
+    - name: http
+      protocol: HTTP
+      port: 8081
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app
+  namespace: $ns
+spec:
+  parentRefs:
+    - name: public
+      sectionName: http
+  hostnames:
+    - app.example.test
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080
+YAML
+if ! retry 60 curl_prints "hello from web" \
+  -H 'Host: app.example.test' "http://edge.$ns.svc:8081/"; then
+  echo "expected 'hello from web' for http://app.example.test:8081/, got '$got'" >&2
+  exit 1
+fi
+echo "got: $got"
+if ! retry 30 route_accepted app True; then
+  echo "expected HTTPRoute app Accepted 'True', got '$got'" >&2
+  exit 1
+fi
+
+step "HTTP: a host no route names gets 404"
+if ! retry 10 curl_prints 404 -o /dev/null -w '%{http_code}' \
+  -H 'Host: other.example.test' "http://edge.$ns.svc:8081/"; then
+  echo "expected status 404 for http://other.example.test:8081/, got '$got'" >&2
+  exit 1
+fi
+
+step "HTTP: a RequestRedirect to https answers 301 with the same host, path and query"
+kubectl apply -f - <<YAML
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: secure
+  namespace: $ns
+spec:
+  parentRefs:
+    - name: public
+      sectionName: http
+  hostnames:
+    - secure.example.test
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+YAML
+want="301 https://secure.example.test/x?y=1"
+if ! retry 60 curl_prints "$want" -o /dev/null -w '%{http_code} %header{location}' \
+  -H 'Host: secure.example.test' "http://edge.$ns.svc:8081/x?y=1"; then
+  echo "expected '$want' (status and Location), got '$got'" >&2
+  exit 1
+fi
+
+step "HTTPS: the route on an HTTPS listener with a certificate from a Secret"
+self_signed "$tmp/first"
+self_signed "$tmp/second"
+# The CA files curl checks the edge's certificate against, inside the curl pod.
+k exec -i curl -- sh -c 'cat >/tmp/first.crt' <"$tmp/first.crt"
+k exec -i curl -- sh -c 'cat >/tmp/second.crt' <"$tmp/second.crt"
+app_tls_secret "$tmp/first.crt" "$tmp/first.key"
+kubectl apply -f - <<YAML
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: $ns
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: tcp-8080
+      protocol: TCP
+      port: 8080
+    - name: http
+      protocol: HTTP
+      port: 8081
+    - name: https
+      protocol: HTTPS
+      port: 8443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-tls
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app
+  namespace: $ns
+spec:
+  parentRefs:
+    - name: public
+      sectionName: http
+    - name: public
+      sectionName: https
+  hostnames:
+    - app.example.test
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080
+YAML
+# SNI and Host are app.example.test; the connection goes to the edge's Service.
+https=(--connect-to "app.example.test:8443:edge.$ns.svc:8443" "https://app.example.test:8443/")
+if ! retry 60 curl_prints "hello from web" --cacert /tmp/first.crt "${https[@]}"; then
+  echo "expected 'hello from web' for https://app.example.test:8443/, got '$got'" >&2
+  exit 1
+fi
+echo "got: $got"
+if ! retry 30 route_accepted app "True True"; then
+  echo "expected HTTPRoute app Accepted 'True True' (two listeners), got '$got'" >&2
+  exit 1
+fi
+
+step "HTTPS: a new certificate in the Secret is served within 30 s"
+app_tls_secret "$tmp/second.crt" "$tmp/second.key"
+if ! retry 30 curl_prints "hello from web" --cacert /tmp/second.crt "${https[@]}"; then
+  echo "expected 'hello from web' with the new certificate within 30 s, got '$got'" >&2
+  exit 1
+fi
+# A connection that reached the old HAProxy worker just before the switch could still pass.
+if ! retry 10 curl_rejects_certificate --cacert /tmp/first.crt "${https[@]}"; then
+  echo "expected the old certificate to be refused (curl exit code 60), got '$got'" >&2
+  exit 1
+fi
+echo "refused with the old certificate: $got"
+
+step "certificate files in the operator pod are private"
+# The old certificate's file goes once the new configuration has loaded.
+if ! retry 20 certificate_files_private; then
+  echo "expected one iroh-gateway.app-tls.<hash>.pem and only -rw------- entries, got:" >&2
+  echo "$got" >&2
+  exit 1
+fi
+echo "$got"
 
 step "deleting the operator pod is prompt (the image's stop signal reaches the operator)"
 # Well under the 60 s grace period: a pod that is only killed after the grace period fails here.

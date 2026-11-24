@@ -3,25 +3,41 @@
 //! [`build`] takes a [`Snapshot`] of the watched resources and the operator's [`Settings`] and
 //! returns a [`Model`]. It does no I/O and reads no clock, so equal inputs give equal models.
 
+mod certs;
 mod edges;
 #[cfg(test)]
 pub(crate) mod fixtures;
 mod gateways;
+mod http;
+mod http_routes;
 mod routes;
 
 use std::collections::BTreeSet;
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::net::IpAddr;
 
 use gateway_api::gatewayclasses::v1::GatewayClass;
 use gateway_api::gateways::v1::Gateway;
-use gateway_api::tcproutes::v1::TcpRoute;
+use gateway_api::httproutes::v1::{
+    HttpRoute, HttpRouteParentRefs, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+};
+use gateway_api::tcproutes::v1::{
+    TcpRoute, TcpRouteParentRefs, TcpRouteStatusParents, TcpRouteStatusParentsParentRef,
+};
 use iroh_gateway_proto::transport::Relay;
-use k8s_openapi::api::core::v1::{Namespace, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::ResourceExt;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::crd::Edge;
 
+pub use certs::Certificate;
+pub use http::{
+    HeaderMods, HostMatch, HttpAction, HttpBackend, HttpMatch, HttpPort, HttpRouteRule, HttpRule,
+    PathMatch, Redirect,
+};
 pub(crate) use routes::parent_key;
 
 /// A namespaced object, by name.
@@ -67,9 +83,149 @@ pub struct Snapshot {
     pub gateway_classes: Vec<GatewayClass>,
     pub gateways: Vec<Gateway>,
     pub tcp_routes: Vec<TcpRoute>,
+    pub http_routes: Vec<HttpRoute>,
     pub edges: Vec<Edge>,
     pub services: Vec<Service>,
     pub namespaces: Vec<Namespace>,
+    pub secrets: Vec<Secret>,
+}
+
+/// The kinds of route the operator attaches to listeners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RouteKind {
+    Tcp,
+    Http,
+}
+
+impl RouteKind {
+    /// The resource's `kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteKind::Tcp => "TCPRoute",
+            RouteKind::Http => "HTTPRoute",
+        }
+    }
+}
+
+/// A `parentRef`, in a route's spec or in its status, as written. Absent fields are not serialised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<i32>,
+}
+
+/// One entry of a route's `status.parents`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentStatus {
+    pub parent_ref: ParentRef,
+    pub controller_name: String,
+    pub conditions: Vec<Condition>,
+}
+
+/// What the model and the status writer need from a route resource.
+pub trait RouteResource:
+    kube::Resource<DynamicType = ()> + Clone + DeserializeOwned + Debug + Send + Sync + 'static
+{
+    const KIND: RouteKind;
+    /// `spec.parentRefs`, in order.
+    fn parent_refs(&self) -> Vec<ParentRef>;
+    /// `status.parents`, in order.
+    fn status_parents(&self) -> Vec<ParentStatus>;
+}
+
+/// `From<&$t> for ParentRef` for the generated `parentRef` types, which all have the same fields.
+macro_rules! parent_ref_from {
+    ($($t:ty),*) => {$(
+        impl From<&$t> for ParentRef {
+            fn from(p: &$t) -> Self {
+                Self {
+                    group: p.group.clone(),
+                    kind: p.kind.clone(),
+                    namespace: p.namespace.clone(),
+                    name: p.name.clone(),
+                    section_name: p.section_name.clone(),
+                    port: p.port,
+                }
+            }
+        }
+    )*};
+}
+
+parent_ref_from!(
+    TcpRouteParentRefs,
+    TcpRouteStatusParentsParentRef,
+    HttpRouteParentRefs,
+    HttpRouteStatusParentsParentRef
+);
+
+/// `From<&$t> for ParentStatus` for the generated status entry types.
+macro_rules! parent_status_from {
+    ($($t:ty),*) => {$(
+        impl From<&$t> for ParentStatus {
+            fn from(p: &$t) -> Self {
+                Self {
+                    parent_ref: ParentRef::from(&p.parent_ref),
+                    controller_name: p.controller_name.clone(),
+                    conditions: p.conditions.clone(),
+                }
+            }
+        }
+    )*};
+}
+
+parent_status_from!(TcpRouteStatusParents, HttpRouteStatusParents);
+
+impl RouteResource for TcpRoute {
+    const KIND: RouteKind = RouteKind::Tcp;
+
+    fn parent_refs(&self) -> Vec<ParentRef> {
+        self.spec
+            .parent_refs
+            .iter()
+            .flatten()
+            .map(ParentRef::from)
+            .collect()
+    }
+
+    fn status_parents(&self) -> Vec<ParentStatus> {
+        self.status
+            .iter()
+            .flat_map(|s| &s.parents)
+            .map(ParentStatus::from)
+            .collect()
+    }
+}
+
+impl RouteResource for HttpRoute {
+    const KIND: RouteKind = RouteKind::Http;
+
+    fn parent_refs(&self) -> Vec<ParentRef> {
+        self.spec
+            .parent_refs
+            .iter()
+            .flatten()
+            .map(ParentRef::from)
+            .collect()
+    }
+
+    fn status_parents(&self) -> Vec<ParentStatus> {
+        self.status
+            .iter()
+            .flat_map(|s| &s.parents)
+            .map(ParentStatus::from)
+            .collect()
+    }
 }
 
 /// Why something was refused: a Gateway API reason and a human readable message.
@@ -96,7 +252,8 @@ pub struct Model {
     pub gateways: Vec<GatewayModel>,
     /// Every `Edge`, by key.
     pub edges: Vec<EdgeModel>,
-    /// Every `TCPRoute` with a `parentRef` naming one of our gateways, by key.
+    /// Every `TCPRoute` and `HTTPRoute` with a `parentRef` naming one of our gateways, by kind,
+    /// then key.
     pub routes: Vec<RouteModel>,
 }
 
@@ -118,6 +275,9 @@ pub struct GatewayModel {
     pub addresses: Vec<GatewayAddress>,
     /// How many more addresses the edges have than `addresses` lists.
     pub addresses_dropped: usize,
+    /// The ports that serve HTTP or HTTPS, ascending: one per port with a serving HTTP or HTTPS
+    /// listener.
+    pub http_ports: Vec<HttpPort>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -167,6 +327,8 @@ pub struct ListenerModel {
     pub name: String,
     pub port: u16,
     pub protocol: String,
+    /// The hosts the listener answers for; always `Any` for TCP.
+    pub hostname: HostMatch,
     pub accepted: Result<(), Reject>,
     pub conflicted: Option<Reject>,
     pub resolved_refs: Result<(), Reject>,
@@ -175,6 +337,9 @@ pub struct ListenerModel {
     pub allowed_namespaces: RouteNamespaces,
     pub attached_routes: i32,
     pub backends: Vec<Backend>,
+    /// The certificates of its `certificateRefs`, in order; empty unless it is an accepted HTTPS
+    /// listener of a Gateway in a served namespace and every reference is usable.
+    pub certificates: Vec<Certificate>,
 }
 
 /// The namespaces a listener admits routes from.
@@ -205,10 +370,19 @@ pub struct LabelRequirement {
 }
 
 impl ListenerModel {
-    /// Accepted, not conflicted, and with at least one backend. Only serving listeners get an
-    /// HAProxy frontend and an open port on the edges.
+    /// Accepted, not conflicted, and ready for traffic: a TCP listener needs a backend, an HTTP
+    /// one a route (which can answer without a backend, like a redirect), an HTTPS one a route
+    /// and its certificates. Only serving listeners get an HAProxy frontend and an open port on
+    /// the edges.
     pub fn serving(&self) -> bool {
-        self.accepted.is_ok() && self.conflicted.is_none() && !self.backends.is_empty()
+        if self.accepted.is_err() || self.conflicted.is_some() {
+            return false;
+        }
+        match self.protocol.as_str() {
+            "HTTP" => self.attached_routes > 0,
+            "HTTPS" => self.attached_routes > 0 && !self.certificates.is_empty(),
+            _ => !self.backends.is_empty(),
+        }
     }
 }
 
@@ -249,6 +423,7 @@ pub struct ParentKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteModel {
+    pub kind: RouteKind,
     pub key: ObjRef,
     pub generation: i64,
     pub parents: Vec<RouteParent>,
@@ -277,13 +452,225 @@ pub fn build(snapshot: &Snapshot, settings: &Settings) -> Model {
     let edges = edges::edges(snapshot, settings, &gateways);
     edges::bind(&mut gateways, &edges);
 
-    // Routes pass: attach TCPRoutes to listeners, fill `attached_routes` and `backends`.
-    let routes = routes::routes(snapshot, &mut gateways);
+    // Routes pass: attach TCPRoutes and HTTPRoutes to listeners, fill `attached_routes`, and
+    // `backends` for TCP.
+    let mut routes = routes::routes(snapshot, &mut gateways);
+    let (http_routes, attached) = http_routes::routes(snapshot, &mut gateways);
+    routes.extend(http_routes);
+    routes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
+
+    // HTTP pass: the rules of each port, in the order to try them.
+    http::ports(&mut gateways, attached);
 
     Model {
         classes,
         gateways,
         edges,
         routes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_api::httproutes::v1::{
+        HttpRouteParentRefs, HttpRouteStatus, HttpRouteStatusParents,
+        HttpRouteStatusParentsParentRef,
+    };
+    use gateway_api::tcproutes::v1::{
+        TcpRouteParentRefs, TcpRouteStatus, TcpRouteStatusParents, TcpRouteStatusParentsParentRef,
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+
+    use super::fixtures::{http_route, tcp_route};
+    use super::{ParentRef, ParentStatus, RouteKind, RouteResource};
+
+    fn full() -> ParentRef {
+        ParentRef {
+            group: Some("gateway.networking.k8s.io".into()),
+            kind: Some("Gateway".into()),
+            namespace: Some("gw".into()),
+            name: "public".into(),
+            section_name: Some("web".into()),
+            port: Some(443),
+        }
+    }
+
+    fn name_only(name: &str) -> ParentRef {
+        ParentRef {
+            group: None,
+            kind: None,
+            namespace: None,
+            name: name.into(),
+            section_name: None,
+            port: None,
+        }
+    }
+
+    fn condition(reason: &str) -> Condition {
+        Condition {
+            type_: "Accepted".into(),
+            status: "True".into(),
+            reason: reason.into(),
+            message: format!("because {reason}"),
+            observed_generation: Some(3),
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::from_second(7).unwrap()),
+        }
+    }
+
+    #[test]
+    fn route_kinds_name_their_resources() {
+        assert_eq!(RouteKind::Tcp.as_str(), "TCPRoute");
+        assert_eq!(RouteKind::Http.as_str(), "HTTPRoute");
+        assert!(RouteKind::Tcp < RouteKind::Http);
+        assert_eq!(
+            <gateway_api::tcproutes::v1::TcpRoute as RouteResource>::KIND,
+            RouteKind::Tcp
+        );
+        assert_eq!(
+            <gateway_api::httproutes::v1::HttpRoute as RouteResource>::KIND,
+            RouteKind::Http
+        );
+    }
+
+    #[test]
+    fn parent_ref_serialises_like_the_api() {
+        assert_eq!(
+            serde_json::to_string(&name_only("gw")).unwrap(),
+            r#"{"name":"gw"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&full()).unwrap(),
+            r#"{"group":"gateway.networking.k8s.io","kind":"Gateway","namespace":"gw","name":"public","sectionName":"web","port":443}"#
+        );
+        // And reads back what the API server sends.
+        let read: ParentRef = serde_json::from_str(
+            r#"{"port":443,"sectionName":"web","name":"public","namespace":"gw","kind":"Gateway","group":"gateway.networking.k8s.io"}"#,
+        )
+        .unwrap();
+        assert_eq!(read, full());
+        let read: ParentRef = serde_json::from_str(r#"{"name":"gw"}"#).unwrap();
+        assert_eq!(read, name_only("gw"));
+    }
+
+    #[test]
+    fn tcp_and_http_routes_expose_their_parent_refs() {
+        let want = vec![full(), name_only("other")];
+
+        let mut tcp = tcp_route("apps", "r");
+        assert_eq!(tcp.parent_refs(), []);
+        tcp.spec.parent_refs = Some(vec![
+            TcpRouteParentRefs {
+                group: Some("gateway.networking.k8s.io".into()),
+                kind: Some("Gateway".into()),
+                namespace: Some("gw".into()),
+                name: "public".into(),
+                section_name: Some("web".into()),
+                port: Some(443),
+            },
+            TcpRouteParentRefs {
+                name: "other".into(),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(tcp.parent_refs(), want);
+
+        let mut http = http_route("apps", "r");
+        assert_eq!(http.parent_refs(), []);
+        http.spec.parent_refs = Some(vec![
+            HttpRouteParentRefs {
+                group: Some("gateway.networking.k8s.io".into()),
+                kind: Some("Gateway".into()),
+                namespace: Some("gw".into()),
+                name: "public".into(),
+                section_name: Some("web".into()),
+                port: Some(443),
+            },
+            HttpRouteParentRefs {
+                name: "other".into(),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(http.parent_refs(), want);
+    }
+
+    #[test]
+    fn status_parents_roundtrip() {
+        let want = vec![
+            ParentStatus {
+                parent_ref: full(),
+                controller_name: "example.com/a".into(),
+                conditions: vec![condition("One")],
+            },
+            ParentStatus {
+                parent_ref: name_only("other"),
+                controller_name: "example.com/b".into(),
+                conditions: vec![condition("Two"), condition("Three")],
+            },
+        ];
+
+        let mut tcp = tcp_route("apps", "r");
+        assert_eq!(tcp.status_parents(), []);
+        tcp.status = Some(TcpRouteStatus {
+            parents: vec![
+                TcpRouteStatusParents {
+                    conditions: vec![condition("One")],
+                    controller_name: "example.com/a".into(),
+                    parent_ref: TcpRouteStatusParentsParentRef {
+                        group: Some("gateway.networking.k8s.io".into()),
+                        kind: Some("Gateway".into()),
+                        namespace: Some("gw".into()),
+                        name: "public".into(),
+                        section_name: Some("web".into()),
+                        port: Some(443),
+                    },
+                },
+                TcpRouteStatusParents {
+                    conditions: vec![condition("Two"), condition("Three")],
+                    controller_name: "example.com/b".into(),
+                    parent_ref: TcpRouteStatusParentsParentRef {
+                        name: "other".into(),
+                        ..Default::default()
+                    },
+                },
+            ],
+        });
+        assert_eq!(tcp.status_parents(), want);
+        // Serialised, an entry reads as the API's own type does.
+        assert_eq!(
+            serde_json::to_value(&want).unwrap(),
+            serde_json::to_value(&tcp.status.as_ref().unwrap().parents).unwrap()
+        );
+
+        let mut http = http_route("apps", "r");
+        assert_eq!(http.status_parents(), []);
+        http.status = Some(HttpRouteStatus {
+            parents: vec![
+                HttpRouteStatusParents {
+                    conditions: vec![condition("One")],
+                    controller_name: "example.com/a".into(),
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        group: Some("gateway.networking.k8s.io".into()),
+                        kind: Some("Gateway".into()),
+                        namespace: Some("gw".into()),
+                        name: "public".into(),
+                        section_name: Some("web".into()),
+                        port: Some(443),
+                    },
+                },
+                HttpRouteStatusParents {
+                    conditions: vec![condition("Two"), condition("Three")],
+                    controller_name: "example.com/b".into(),
+                    parent_ref: HttpRouteStatusParentsParentRef {
+                        name: "other".into(),
+                        ..Default::default()
+                    },
+                },
+            ],
+        });
+        assert_eq!(http.status_parents(), want);
+        assert_eq!(
+            serde_json::to_value(&want).unwrap(),
+            serde_json::to_value(&http.status.as_ref().unwrap().parents).unwrap()
+        );
     }
 }

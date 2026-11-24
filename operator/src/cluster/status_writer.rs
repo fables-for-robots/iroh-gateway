@@ -11,9 +11,8 @@ use gateway_api::gatewayclasses::v1::GatewayClass;
 use gateway_api::gateways::v1::{
     Gateway, GatewayStatusAddresses, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
-use gateway_api::tcproutes::v1::{
-    TcpRoute, TcpRouteParentRefs, TcpRouteStatusParents, TcpRouteStatusParentsParentRef,
-};
+use gateway_api::httproutes::v1::HttpRoute;
+use gateway_api::tcproutes::v1::TcpRoute;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{Patch, PatchParams};
@@ -23,7 +22,10 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::crd::{Edge, EdgeStatus};
-use crate::model::{AddressKind, ObjRef, ParentKey, Snapshot, parent_key};
+use crate::model::{
+    AddressKind, ObjRef, ParentKey, ParentRef, ParentStatus, RouteKind, RouteResource, Snapshot,
+    parent_key,
+};
 use crate::status::conditions::merge;
 use crate::status::{
     ClassStatus, DesiredStatus, EdgeStatusOut, GatewayStatusOut, ListenerStatusOut, RouteStatusOut,
@@ -80,8 +82,14 @@ impl StatusWriter {
                         .await
                         .map(drop)
                 }
-                Target::TcpRoute(key) => {
+                Target::Route(RouteKind::Tcp, key) => {
                     Api::<TcpRoute>::namespaced(self.client.clone(), &key.namespace)
+                        .patch_status(&key.name, &params, &body)
+                        .await
+                        .map(drop)
+                }
+                Target::Route(RouteKind::Http, key) => {
+                    Api::<HttpRoute>::namespaced(self.client.clone(), &key.namespace)
                         .patch_status(&key.name, &params, &body)
                         .await
                         .map(drop)
@@ -137,7 +145,7 @@ impl StatusSink for StatusWriter {
 enum Target {
     GatewayClass(String),
     Gateway(ObjRef),
-    TcpRoute(ObjRef),
+    Route(RouteKind, ObjRef),
     Edge(ObjRef),
 }
 
@@ -146,7 +154,7 @@ impl std::fmt::Display for Target {
         match self {
             Target::GatewayClass(name) => write!(f, "GatewayClass {name}"),
             Target::Gateway(key) => write!(f, "Gateway {key}"),
-            Target::TcpRoute(key) => write!(f, "TCPRoute {key}"),
+            Target::Route(kind, key) => write!(f, "{} {key}", kind.as_str()),
             Target::Edge(key) => write!(f, "Edge {key}"),
         }
     }
@@ -162,9 +170,9 @@ struct StatusPatch {
 ///
 /// GatewayClasses, Gateways and Edges are written only when they are in the model. One that
 /// left the model but still carries status from this operator (for example a Gateway whose
-/// class now names another controller) is left alone here. TCPRoutes are the exception, since
-/// other controllers write the same list: every route in the snapshot loses the entries of ours
-/// that are no longer desired.
+/// class now names another controller) is left alone here. Routes of every kind are the
+/// exception, since other controllers write the same list: every route in the snapshot loses the
+/// entries of ours that are no longer desired.
 fn patches(
     desired: &DesiredStatus,
     snapshot: &Snapshot,
@@ -198,16 +206,8 @@ fn patches(
             });
         }
     }
-    for route in &snapshot.tcp_routes {
-        let key = ObjRef::of(route);
-        let want = desired.routes.iter().find(|r| r.key == key);
-        if let Some(body) = route_patch(route, want, controller, now) {
-            out.push(StatusPatch {
-                target: Target::TcpRoute(key),
-                body,
-            });
-        }
-    }
+    route_patches(&snapshot.tcp_routes, desired, controller, now, &mut out);
+    route_patches(&snapshot.http_routes, desired, controller, now, &mut out);
     for want in &desired.edges {
         if let Some(edge) = snapshot.edges.iter().find(|e| ObjRef::of(*e) == want.key)
             && let Some(body) = edge_patch(edge, want, now)
@@ -219,6 +219,29 @@ fn patches(
         }
     }
     out
+}
+
+/// The patches for `routes`, each matched with the desired status of its own kind and key.
+fn route_patches<R: RouteResource>(
+    routes: &[R],
+    desired: &DesiredStatus,
+    controller: &str,
+    now: &Time,
+    out: &mut Vec<StatusPatch>,
+) {
+    for route in routes {
+        let key = ObjRef::of(route);
+        let want = desired
+            .routes
+            .iter()
+            .find(|r| r.kind == R::KIND && r.key == key);
+        if let Some(body) = route_patch(route, want, controller, now) {
+            out.push(StatusPatch {
+                target: Target::Route(R::KIND, key),
+                body,
+            });
+        }
+    }
 }
 
 /// `value` as JSON with every `lastTransitionTime` removed.
@@ -320,63 +343,40 @@ fn listener_status(
     }
 }
 
-/// The key of a status entry's `parentRef`, defaults filled in as for the route's own.
-fn status_key(parent: &TcpRouteStatusParentsParentRef, route_ns: &str) -> Option<ParentKey> {
-    let as_spec = TcpRouteParentRefs {
-        group: parent.group.clone(),
-        kind: parent.kind.clone(),
-        name: parent.name.clone(),
-        namespace: parent.namespace.clone(),
-        port: parent.port,
-        section_name: parent.section_name.clone(),
-    };
-    parent_key(&as_spec, route_ns)
-}
-
-/// The route's own `parentRef` that `key` was made from, as the user wrote it.
-fn echo(route: &TcpRoute, route_ns: &str, key: &ParentKey) -> TcpRouteStatusParentsParentRef {
+/// The route's own `parentRef` that `key` was made from, as the user wrote it. A status entry's
+/// `parentRef` gets its key the same way, with [`parent_key`], so the API server filling in
+/// `group` and `kind` does not make an entry of ours look like another.
+fn echo(route: &impl RouteResource, route_ns: &str, key: &ParentKey) -> ParentRef {
     let written = route
-        .spec
-        .parent_refs
-        .iter()
-        .flatten()
+        .parent_refs()
+        .into_iter()
         .find(|p| parent_key(p, route_ns).as_ref() == Some(key));
-    match written {
-        Some(p) => TcpRouteStatusParentsParentRef {
-            group: p.group.clone(),
-            kind: p.kind.clone(),
-            name: p.name.clone(),
-            namespace: p.namespace.clone(),
-            port: p.port,
-            section_name: p.section_name.clone(),
-        },
-        // The model takes its keys from the route itself, so this is not expected.
-        None => TcpRouteStatusParentsParentRef {
-            group: Some(key.group.clone()),
-            kind: Some(key.kind.clone()),
-            name: key.name.clone(),
-            namespace: Some(key.namespace.clone()),
-            port: key.port.map(i32::from),
-            section_name: key.section_name.clone(),
-        },
-    }
+    // The model takes its keys from the route itself, so the fallback is not expected.
+    written.unwrap_or_else(|| ParentRef {
+        group: Some(key.group.clone()),
+        kind: Some(key.kind.clone()),
+        namespace: Some(key.namespace.clone()),
+        name: key.name.clone(),
+        section_name: key.section_name.clone(),
+        port: key.port.map(i32::from),
+    })
 }
 
 /// `status.parents` rebuilt: entries of other controllers unchanged and in place, ours updated
 /// in place, ours that are no longer desired removed, and new ones of ours appended.
-fn route_patch(
-    route: &TcpRoute,
+fn route_patch<R: RouteResource>(
+    route: &R,
     want: Option<&RouteStatusOut>,
     controller: &str,
     now: &Time,
 ) -> Option<Value> {
     let ns = route.namespace().unwrap_or_default();
-    let existing: &[TcpRouteStatusParents] = route.status.as_ref().map_or(&[], |s| &s.parents);
-    let is_ours = |entry: &TcpRouteStatusParents, key: &ParentKey| {
+    let existing = route.status_parents();
+    let is_ours = |entry: &ParentStatus, key: &ParentKey| {
         entry.controller_name == controller
-            && status_key(&entry.parent_ref, &ns).as_ref() == Some(key)
+            && parent_key(&entry.parent_ref, &ns).as_ref() == Some(key)
     };
-    let mut ours: Vec<(&ParentKey, TcpRouteStatusParents)> = want
+    let mut ours: Vec<(&ParentKey, ParentStatus)> = want
         .map(|w| {
             w.parents
                 .iter()
@@ -385,10 +385,10 @@ fn route_patch(
                         .iter()
                         .find(|e| is_ours(e, key))
                         .map_or(&[], |e| &e.conditions);
-                    let entry = TcpRouteStatusParents {
-                        conditions: merge(old, conditions, w.generation, now.clone()),
-                        controller_name: controller.to_owned(),
+                    let entry = ParentStatus {
                         parent_ref: echo(route, &ns, key),
+                        controller_name: controller.to_owned(),
+                        conditions: merge(old, conditions, w.generation, now.clone()),
                     };
                     (key, entry)
                 })
@@ -397,7 +397,7 @@ fn route_patch(
         .unwrap_or_default();
 
     let mut parents = Vec::with_capacity(existing.len() + ours.len());
-    for entry in existing {
+    for entry in &existing {
         if entry.controller_name != controller {
             parents.push(entry.clone());
         } else if let Some(i) = ours.iter().position(|(key, _)| is_ours(entry, key)) {
@@ -436,11 +436,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use gateway_api::gateways::v1::GatewayStatus;
-    use gateway_api::tcproutes::v1::TcpRouteStatus;
+    use gateway_api::httproutes::v1::{HttpRouteStatus, HttpRouteStatusParents};
+    use gateway_api::tcproutes::v1::{
+        TcpRouteStatus, TcpRouteStatusParents, TcpRouteStatusParentsParentRef,
+    };
 
     use super::*;
     use crate::crd::EdgeListenerStatus;
-    use crate::model::fixtures::{CONTROLLER, RouteExt, class, edge, gateway, tcp_route};
+    use crate::model::fixtures::{
+        CONTROLLER, HttpRouteExt, RouteExt, class, edge, gateway, http_route, tcp_route,
+    };
     use crate::model::{GatewayAddress, build};
     use crate::status::{Cond, Facts, compute};
 
@@ -483,6 +488,7 @@ mod tests {
 
     fn want_route(gen_: i64, parents: &[(&str, &str)]) -> RouteStatusOut {
         RouteStatusOut {
+            kind: RouteKind::Tcp,
             key: ObjRef::new("apps", "r"),
             generation: gen_,
             parents: parents
@@ -586,6 +592,174 @@ mod tests {
         );
         let want = want_route(1, &[("a", "Same")]);
         assert!(route_patch(&route, Some(&want), CONTROLLER, &at(100)).is_none());
+    }
+
+    fn want_http(gen_: i64, parents: &[(&str, &str)]) -> RouteStatusOut {
+        RouteStatusOut {
+            kind: RouteKind::Http,
+            ..want_route(gen_, parents)
+        }
+    }
+
+    /// `entry`, as an HTTPRoute's status entry.
+    fn http_entry(controller: &str, gateway: &str, reason: &str) -> HttpRouteStatusParents {
+        let tcp = serde_json::to_value(entry(controller, gateway, reason)).unwrap();
+        serde_json::from_value(tcp).unwrap()
+    }
+
+    fn with_http_status(mut route: HttpRoute, parents: Vec<HttpRouteStatusParents>) -> HttpRoute {
+        route.status = Some(HttpRouteStatus { parents });
+        route.metadata.resource_version = Some("42".into());
+        route
+    }
+
+    /// The desired status of `routes` alone, nothing else in it.
+    fn desired_routes(routes: Vec<RouteStatusOut>) -> DesiredStatus {
+        DesiredStatus {
+            classes: vec![],
+            gateways: vec![],
+            routes,
+            edges: vec![],
+        }
+    }
+
+    fn http_snapshot(routes: Vec<HttpRoute>) -> Snapshot {
+        Snapshot {
+            http_routes: routes,
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn http_route_gets_our_parent_entry() {
+        let route = with_http_status(http_route("apps", "r").parent("a").section("db"), vec![]);
+        let mut want = want_http(1, &[]);
+        want.parents = vec![(
+            ParentKey {
+                section_name: Some("db".into()),
+                ..key("apps", "a")
+            },
+            vec![cond("Accepted", true, "Accepted")],
+        )];
+        let mut out = patches(
+            &desired_routes(vec![want]),
+            &http_snapshot(vec![route]),
+            CONTROLLER,
+            &at(100),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        let patch = out.remove(0);
+        assert_eq!(
+            patch.target,
+            Target::Route(RouteKind::Http, ObjRef::new("apps", "r"))
+        );
+        assert_eq!(patch.target.to_string(), "HTTPRoute apps/r");
+        assert_eq!(
+            parents_of(&patch.body),
+            [triple(CONTROLLER, "a", "Accepted")]
+        );
+        assert_eq!(
+            patch.body["status"]["parents"][0]["parentRef"],
+            json!({ "name": "a", "sectionName": "db" })
+        );
+        assert_eq!(patch.body["metadata"]["resourceVersion"], "42");
+    }
+
+    #[test]
+    fn stale_entry_of_ours_is_removed_from_an_http_route() {
+        let route = with_http_status(
+            http_route("apps", "r").parent("a"),
+            vec![
+                http_entry(CONTROLLER, "a", "Old"),
+                http_entry(OTHER, "x", "Theirs"),
+            ],
+        );
+        let out = patches(
+            &desired_routes(vec![]),
+            &http_snapshot(vec![route]),
+            CONTROLLER,
+            &at(100),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].target,
+            Target::Route(RouteKind::Http, ObjRef::new("apps", "r"))
+        );
+        assert_eq!(parents_of(&out[0].body), [triple(OTHER, "x", "Theirs")]);
+        assert_eq!(out[0].body["metadata"]["resourceVersion"], "42");
+    }
+
+    #[test]
+    fn foreign_entries_on_an_http_route_stay_in_place() {
+        let route = with_http_status(
+            http_route("apps", "r").parent("a").parent("b").parent("c"),
+            vec![
+                http_entry(OTHER, "x", "Theirs"),
+                http_entry(CONTROLLER, "a", "Old"),
+                http_entry(OTHER, "y", "Theirs"),
+                http_entry(CONTROLLER, "stale", "Old"),
+            ],
+        );
+        let want = want_http(2, &[("a", "New"), ("b", "New")]);
+        let patch = route_patch(&route, Some(&want), CONTROLLER, &at(100)).unwrap();
+        assert_eq!(
+            parents_of(&patch),
+            [
+                triple(OTHER, "x", "Theirs"),
+                triple(CONTROLLER, "a", "New"),
+                triple(OTHER, "y", "Theirs"),
+                triple(CONTROLLER, "b", "New"),
+            ]
+        );
+        assert_eq!(patch["metadata"]["resourceVersion"], "42");
+        let theirs: HttpRouteStatusParents =
+            serde_json::from_value(patch["status"]["parents"][0].clone()).unwrap();
+        assert_eq!(theirs, http_entry(OTHER, "x", "Theirs"));
+    }
+
+    #[test]
+    fn unchanged_http_route_needs_no_patch() {
+        let route = with_http_status(
+            http_route("apps", "r").parent("a"),
+            vec![
+                http_entry(CONTROLLER, "a", "Same"),
+                http_entry(OTHER, "x", "Theirs"),
+            ],
+        );
+        let want = want_http(1, &[("a", "Same")]);
+        assert!(route_patch(&route, Some(&want), CONTROLLER, &at(100)).is_none());
+        let out = patches(
+            &desired_routes(vec![want]),
+            &http_snapshot(vec![route]),
+            CONTROLLER,
+            &at(100),
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn tcp_and_http_routes_with_the_same_name_are_told_apart() {
+        let mut want = want_route(1, &[("a", "Accepted")]);
+        want.key = ObjRef::new("apps", "web");
+        let snapshot = Snapshot {
+            tcp_routes: vec![with_status(tcp_route("apps", "web").parent("a"), vec![])],
+            http_routes: vec![with_http_status(
+                http_route("apps", "web").parent("a"),
+                vec![],
+            )],
+            ..Snapshot::default()
+        };
+        let out = patches(&desired_routes(vec![want]), &snapshot, CONTROLLER, &at(100));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].target,
+            Target::Route(RouteKind::Tcp, ObjRef::new("apps", "web"))
+        );
+        assert_eq!(out[0].target.to_string(), "TCPRoute apps/web");
+        assert_eq!(
+            parents_of(&out[0].body),
+            [triple(CONTROLLER, "a", "Accepted")]
+        );
     }
 
     fn gateway_want() -> GatewayStatusOut {

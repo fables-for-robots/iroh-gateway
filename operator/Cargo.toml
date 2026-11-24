@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 fastrand.workspace = true
 futures.workspace = true
@@ -40,6 +41,7 @@ iroh = { workspace = true, features = ["test-utils"] }
 iroh-gateway-edge = { path = "../edge" }
 tokio = { workspace = true, features = ["io-util", "time", "test-util"] }
 rcgen.workspace = true
+tokio-rustls.workspace = true
 
 [[bin]]
 name = "iroh-gateway-operator"

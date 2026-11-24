@@ -1,22 +1,36 @@
-//! Render a [`Model`] into the HAProxy configuration and one [`EdgePlan`] per accepted edge.
+//! Render a [`Model`] into the HAProxy configuration, the files it names, and one [`EdgePlan`]
+//! per accepted edge.
 //!
 //! Everything here is pure and its output is byte-for-byte stable for equal models: the engine
 //! reloads HAProxy only when the text changes.
+//!
+//! Strings from cluster resources (host names, paths, header names and values) reach the
+//! configuration only through [`quote`] and [`quote_format`], or, where a word cannot be quoted
+//! (a header name inside a sample fetch's parentheses), with every character outside
+//! `[A-Za-z0-9_-]` replaced. They never stand inside an anonymous `{ … }` ACL: every condition
+//! of a rule is a named ACL.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::{Display, Write as _};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use iroh_gateway_proto::control::{ListenerKey, Protocol};
 use sha2::{Digest, Sha256};
 
-use crate::model::{GatewayModel, Model, ObjRef};
+use crate::haproxy::{CERT_DIR, SecretFile};
+use crate::model::{
+    Backend, GatewayModel, HeaderMods, HostMatch, HttpAction, HttpPort, HttpRule, Model, ObjRef,
+    PathMatch, Redirect,
+};
 
 /// What the model asks of HAProxy and of the edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub haproxy_cfg: String,
+    /// The files `haproxy_cfg` names under `<runtime_dir>/certs`, each named after its content,
+    /// so that equal configurations mean equal files. Sorted by name, without repeats.
+    pub files: Vec<SecretFile>,
     /// One per accepted edge of an accepted Gateway, sorted by key.
     pub edges: Vec<EdgePlan>,
 }
@@ -27,7 +41,8 @@ pub struct EdgePlan {
     pub endpoint_id: iroh::EndpointId,
     pub address: Option<String>,
     pub gateway: ObjRef,
-    /// The Gateway's serving TCP ports and what HAProxy serves behind each.
+    /// The Gateway's serving ports and what HAProxy serves behind each: its TCP ports and its
+    /// HTTP and HTTPS ports, all under `Protocol::Tcp`, which is what the edge opens.
     pub sockets: HashMap<ListenerKey, PortPlan>,
 }
 
@@ -36,8 +51,14 @@ pub struct EdgePlan {
 pub struct PortPlan {
     pub socket: PathBuf,
     /// The first 16 hex characters of SHA-256 over the exact text of the port's `frontend` and
-    /// `backend` sections: equal fingerprints, equal traffic behind the socket.
+    /// `backend` sections: equal fingerprints, equal traffic behind the socket. An HTTPS port's
+    /// `bind` line names its certificate list after the list's content, which names each
+    /// certificate after its own, so a new certificate is a new fingerprint.
     pub fingerprint: String,
+    /// An HTTP or HTTPS port, which serves many routes and hosts; `false` for a TCP port. While
+    /// a change is applied, and after HAProxy refused one, a port that is shared in the loaded
+    /// plan and in the new one keeps forwarding to its socket whatever its fingerprint.
+    pub shared: bool,
 }
 
 pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
@@ -60,6 +81,10 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
          \x20   timeout connect 5s\n\
          \x20   timeout client 1h\n\
          \x20   timeout server 1h\n\
+         \x20   timeout tunnel 1h\n\
+         \x20   timeout http-request 10s\n\
+         \x20   timeout http-keep-alive 60s\n\
+         \x20   timeout client-hs 10s\n\
          \n\
          frontend idle\n\
          \x20   bind unix@{dir}/s/idle.sock mode 600\n\
@@ -73,15 +98,37 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
         .collect();
     gateways.sort_by(|a, b| a.key.cmp(&b.key));
 
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
     let mut sockets: HashMap<&ObjRef, HashMap<ListenerKey, PortPlan>> = HashMap::new();
     for gateway in &gateways {
         let per_gateway = sockets.entry(&gateway.key).or_default();
-        let mut listeners: Vec<_> = gateway.listeners.iter().filter(|l| l.serving()).collect();
+        // The port's own sections, which its fingerprint covers, after a comment that says
+        // whose port it is.
+        let mut add = |port: u16, id: &str, section: String, shared: bool| {
+            let _ = write!(cfg, "\n# {} port {port}\n", gateway.key);
+            cfg.push_str(&section);
+            let digest = hex::encode(Sha256::digest(&section));
+            per_gateway.insert(
+                ListenerKey {
+                    protocol: Protocol::Tcp,
+                    port,
+                },
+                PortPlan {
+                    socket: socket(id),
+                    fingerprint: digest[..16].to_owned(),
+                    shared,
+                },
+            );
+        };
+        // HTTP and HTTPS listeners are served through `http_ports`.
+        let mut listeners: Vec<_> = gateway
+            .listeners
+            .iter()
+            .filter(|l| l.serving() && l.protocol == "TCP")
+            .collect();
         listeners.sort_by_key(|l| l.port);
         for listener in listeners {
             let id = port_id(&gateway.key, listener.port);
-            let _ = write!(cfg, "\n# {} port {}\n", gateway.key, listener.port);
-            // The port's own sections, which its fingerprint covers.
             let mut section = format!(
                 "frontend fe_{id}\n\
                  \x20   bind unix@{dir}/s/{id}.sock accept-proxy mode 600\n\
@@ -89,43 +136,15 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
                  \n\
                  backend be_{id}\n"
             );
-            let weights: Vec<u32> = listener.backends.iter().map(|b| b.weight).collect();
-            for (i, (backend, weight)) in listener
-                .backends
-                .iter()
-                .zip(scale_weights(&weights))
-                .enumerate()
-            {
-                if weight == 0 {
-                    continue;
-                }
-                let _ = match backend.ip {
-                    IpAddr::V4(ip) => {
-                        writeln!(
-                            section,
-                            "    server s{i} {ip}:{} weight {weight}",
-                            backend.port
-                        )
-                    }
-                    IpAddr::V6(ip) => writeln!(
-                        section,
-                        "    server s{i} [{ip}]:{} weight {weight}",
-                        backend.port
-                    ),
-                };
-            }
-            cfg.push_str(&section);
-            let digest = hex::encode(Sha256::digest(&section));
-            per_gateway.insert(
-                ListenerKey {
-                    protocol: Protocol::Tcp,
-                    port: listener.port,
-                },
-                PortPlan {
-                    socket: socket(&id),
-                    fingerprint: digest[..16].to_owned(),
-                },
-            );
+            servers(&mut section, &listener.backends);
+            add(listener.port, &id, section, false);
+        }
+        let mut ports: Vec<&HttpPort> = gateway.http_ports.iter().collect();
+        ports.sort_by_key(|p| p.port);
+        for port in ports {
+            let id = port_id(&gateway.key, port.port);
+            let section = http_sections(&id, &dir, port, &mut files);
+            add(port.port, &id, section, true);
         }
     }
 
@@ -148,8 +167,257 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
 
     Rendered {
         haproxy_cfg: cfg,
+        files: files
+            .into_iter()
+            .map(|(name, contents)| SecretFile { name, contents })
+            .collect(),
         edges,
     }
+}
+
+/// One `server` line per backend of positive weight, weights scaled by [`scale_weights`].
+fn servers(section: &mut String, backends: &[Backend]) {
+    let weights: Vec<u32> = backends.iter().map(|b| b.weight).collect();
+    for (i, (backend, weight)) in backends.iter().zip(scale_weights(&weights)).enumerate() {
+        if weight == 0 {
+            continue;
+        }
+        let _ = match backend.ip {
+            IpAddr::V4(ip) => writeln!(
+                section,
+                "    server s{i} {ip}:{} weight {weight}",
+                backend.port
+            ),
+            IpAddr::V6(ip) => writeln!(
+                section,
+                "    server s{i} [{ip}]:{} weight {weight}",
+                backend.port
+            ),
+        };
+    }
+}
+
+/// The `frontend` and `backend` sections of an HTTP or HTTPS port; an HTTPS port's certificates
+/// and their list go into `files`.
+fn http_sections(
+    id: &str,
+    dir: &impl Display,
+    port: &HttpPort,
+    files: &mut BTreeMap<String, String>,
+) -> String {
+    let (tls, proto) = match &port.tls {
+        None => (String::new(), "http"),
+        Some(certificates) => {
+            let mut list = String::new();
+            for c in certificates {
+                let _ = writeln!(list, "{dir}/{CERT_DIR}/{}", c.file_name);
+                files.insert(c.file_name.clone(), c.pem.clone());
+            }
+            let name = format!("{id}.{}.list", &hex::encode(Sha256::digest(&list))[..16]);
+            let tls = format!(
+                " ssl crt-list {dir}/{CERT_DIR}/{name} strict-sni ssl-min-ver TLSv1.2 \
+                 alpn h2,http/1.1"
+            );
+            files.insert(name, list);
+            (tls, "https")
+        }
+    };
+    let mut s = format!(
+        "frontend fe_{id}\n\
+         \x20   mode http\n\
+         \x20   bind unix@{dir}/s/{id}.sock accept-proxy mode 600{tls}\n\
+         \x20   option httplog\n\
+         \x20   http-request set-header X-Forwarded-For %[src]\n\
+         \x20   http-request set-header X-Forwarded-Proto {proto}\n\
+         \x20   http-request set-header X-Forwarded-Host %[req.hdr(host)]\n\
+         \x20   http-request set-header X-Forwarded-Port %[dst_port]\n\
+         \x20   http-request del-header Forwarded\n\
+         \x20   http-request del-header X-Real-IP\n"
+    );
+    for (r, rule) in port.rules.iter().enumerate() {
+        use_backend(&mut s, id, r, rule);
+    }
+    let _ = writeln!(s, "    default_backend be_{id}_none");
+
+    for (n, backend) in port.backends.iter().enumerate() {
+        if !port.rules.iter().any(|r| r.backend == n) {
+            continue;
+        }
+        let _ = write!(s, "\nbackend be_{id}_{n}\n    mode http\n");
+        header_mods(&mut s, "http-request", &backend.request_headers);
+        // `http-after-response`, not `http-response`: it also applies to the responses HAProxy
+        // makes itself, a redirect's and a 500's.
+        header_mods(&mut s, "http-after-response", &backend.response_headers);
+        match &backend.action {
+            HttpAction::Forward(backends) => servers(&mut s, backends),
+            HttpAction::Fail => s.push_str("    http-request return status 500\n"),
+            HttpAction::Redirect(r) => {
+                let location = location(r, port.tls.is_some(), port.port);
+                let _ = writeln!(
+                    s,
+                    "    http-request redirect location {} code {}",
+                    quote(&location),
+                    r.status
+                );
+            }
+        }
+    }
+    let _ = write!(
+        s,
+        "\nbackend be_{id}_none\n    mode http\n    http-request return status 404\n"
+    );
+    s
+}
+
+/// The ACLs of rule number `r`, each on a line of its own, and then its `use_backend` line.
+///
+/// Every condition is a named ACL, never an anonymous `{ … }` one: HAProxy finds the end of an
+/// anonymous ACL by comparing words after unquoting, so a value of exactly `}` would end it.
+/// The ACLs are `r<r>_host`, `r<r>_path`, `r<r>_method` and `r<r>_h<j>` for header `j`, in that
+/// order, each declared only when it applies. A path prefix other than `/` declares `r<r>_path`
+/// twice, for the path itself and for what lies below it; HAProxy ORs the declarations of one
+/// name. A rule without conditions is `use_backend` without `if`.
+fn use_backend(s: &mut String, id: &str, r: usize, rule: &HttpRule) {
+    let mut names = Vec::new();
+    let mut acl = |s: &mut String, name: String, test: String| {
+        let _ = writeln!(s, "    acl {name} {test}");
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    match &rule.host {
+        HostMatch::Any => {}
+        HostMatch::Exact(h) => acl(
+            s,
+            format!("r{r}_host"),
+            format!("req.hdr(host),host_only,lower -m str -- {}", quote(h)),
+        ),
+        HostMatch::Wildcard(suffix) => acl(
+            s,
+            format!("r{r}_host"),
+            format!("req.hdr(host),host_only,lower -m end -- {}", quote(suffix)),
+        ),
+    }
+    match &rule.path {
+        PathMatch::Prefix(p) if p == "/" => {}
+        PathMatch::Exact(p) => acl(
+            s,
+            format!("r{r}_path"),
+            format!("path -m str -- {}", quote(p)),
+        ),
+        PathMatch::Prefix(p) => {
+            acl(
+                s,
+                format!("r{r}_path"),
+                format!("path -m str -- {}", quote(p)),
+            );
+            acl(
+                s,
+                format!("r{r}_path"),
+                format!("path -m beg -- {}", quote(&format!("{p}/"))),
+            );
+        }
+    }
+    if let Some(m) = &rule.method {
+        acl(s, format!("r{r}_method"), format!("method {}", quote(m)));
+    }
+    for (j, (name, value)) in rule.headers.iter().enumerate() {
+        acl(
+            s,
+            format!("r{r}_h{j}"),
+            format!("req.fhdr({}) -m str -- {}", header_name(name), quote(value)),
+        );
+    }
+    let _ = write!(s, "    use_backend be_{id}_{}", rule.backend);
+    if !names.is_empty() {
+        let _ = write!(s, " if {}", names.join(" "));
+    }
+    s.push('\n');
+}
+
+/// A header name as a sample fetch argument, which cannot be quoted: every character outside
+/// `[A-Za-z0-9_-]` replaced by `_`.
+fn header_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The `http-request` or `http-after-response` rules of `mods`: set, add, then remove.
+fn header_mods(s: &mut String, directive: &str, mods: &HeaderMods) {
+    for (name, value) in &mods.set {
+        let _ = writeln!(
+            s,
+            "    {directive} set-header {} {}",
+            quote(name),
+            quote_format(value)
+        );
+    }
+    for (name, value) in &mods.add {
+        let _ = writeln!(
+            s,
+            "    {directive} add-header {} {}",
+            quote(name),
+            quote_format(value)
+        );
+    }
+    for name in &mods.remove {
+        let _ = writeln!(s, "    {directive} del-header {}", quote(name));
+    }
+}
+
+/// Where a redirect sends a request to a port that is `tls` or not and listens on `port`, as a
+/// log-format string that keeps the request's path and query.
+fn location(r: &Redirect, tls: bool, port: u16) -> String {
+    let scheme = r
+        .scheme
+        .as_deref()
+        .unwrap_or(if tls { "https" } else { "http" });
+    let host = match &r.hostname {
+        Some(h) => h.replace('%', "%%"),
+        None => "%[req.hdr(host),host_only]".to_owned(),
+    };
+    let port = match (r.port, &r.scheme) {
+        (Some(p), _) => Some(p),
+        (None, Some(_)) => None,
+        (None, None) => Some(port),
+    };
+    let default = if scheme == "https" { 443 } else { 80 };
+    let port = port
+        .filter(|&p| p != default)
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    format!("{scheme}://{host}{port}%[pathq]")
+}
+
+/// `s` as one HAProxy configuration word: in single quotes, each `'` written as `'\''`, control
+/// characters dropped. Inside single quotes HAProxy expands nothing.
+///
+/// `s` must not be empty: HAProxy takes an empty word for the end of a line's arguments.
+pub(crate) fn quote(s: &str) -> String {
+    debug_assert!(!s.is_empty(), "quote needs a non-empty string");
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\'' => out.push_str(r"'\''"),
+            c if c.is_ascii_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// `quote`, for arguments HAProxy reads as a log-format string: each `%` doubled first.
+pub(crate) fn quote_format(s: &str) -> String {
+    quote(&s.replace('%', "%%"))
 }
 
 /// First 16 hex characters of sha256("<namespace>/<name>:<port>").
@@ -180,7 +448,10 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::model::{Backend, EdgeModel, GatewayModel, ListenerModel, Reject};
+    use crate::model::{
+        Backend, Certificate, EdgeModel, GatewayModel, HeaderMods, HostMatch, HttpAction,
+        HttpBackend, HttpPort, HttpRule, ListenerModel, PathMatch, Redirect, Reject,
+    };
 
     const DIR: &str = "/run/igw";
 
@@ -202,6 +473,7 @@ mod tests {
             name: format!("l{port}"),
             port,
             protocol: "TCP".into(),
+            hostname: HostMatch::Any,
             accepted: Ok(()),
             conflicted: None,
             resolved_refs: Ok(()),
@@ -209,6 +481,7 @@ mod tests {
             allowed_namespaces: Default::default(),
             attached_routes: 1,
             backends,
+            certificates: Vec::new(),
         }
     }
 
@@ -221,6 +494,7 @@ mod tests {
             edges: Vec::new(),
             addresses: Vec::new(),
             addresses_dropped: 0,
+            http_ports: Vec::new(),
         }
     }
 
@@ -290,6 +564,7 @@ mod tests {
                 PortPlan {
                     socket: PathBuf::from("/run/igw/s/7903a80c6832446b.sock"),
                     fingerprint: digest[..16].to_owned(),
+                    shared: false,
                 }
             )])
         );
@@ -519,5 +794,727 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(render_in(&m), first);
         }
+    }
+
+    // ---- HTTP and HTTPS ----
+
+    /// The base64 line of every fake key below; a test checks it never shows.
+    const KEY_LINE: &str = "c2VjcmV0LWtleS1tYXRlcmlhbA";
+
+    /// A certificate of Secret gw/<name> with a fake PEM and the file name `gw.<name>.<hash>.pem`.
+    fn cert(name: &str, hash: &str) -> Certificate {
+        Certificate {
+            secret: ObjRef::new("gw", name),
+            file_name: format!("gw.{name}.{hash}.pem"),
+            pem: format!(
+                "-----BEGIN CERTIFICATE-----\nQ0VSVC17bmFtZX0=\n-----END CERTIFICATE-----\n\
+                 -----BEGIN PRIVATE KEY-----\n{KEY_LINE}{hash}\n-----END PRIVATE KEY-----\n"
+            ),
+        }
+    }
+
+    fn exact(h: &str) -> HostMatch {
+        HostMatch::Exact(h.into())
+    }
+
+    fn prefix(p: &str) -> PathMatch {
+        PathMatch::Prefix(p.into())
+    }
+
+    fn http_rule(host: HostMatch, path: PathMatch, backend: usize) -> HttpRule {
+        HttpRule {
+            host,
+            path,
+            method: None,
+            headers: Vec::new(),
+            backend,
+        }
+    }
+
+    fn http_backend(action: HttpAction) -> HttpBackend {
+        HttpBackend {
+            route: ObjRef::new("gw", "r"),
+            rule: 0,
+            request_headers: HeaderMods::default(),
+            response_headers: HeaderMods::default(),
+            action,
+        }
+    }
+
+    fn forward(backends: Vec<Backend>) -> HttpBackend {
+        http_backend(HttpAction::Forward(backends))
+    }
+
+    fn http_port(
+        port: u16,
+        tls: Option<Vec<Certificate>>,
+        rules: Vec<HttpRule>,
+        backends: Vec<HttpBackend>,
+    ) -> HttpPort {
+        HttpPort {
+            port,
+            tls,
+            rules,
+            backends,
+        }
+    }
+
+    /// A port with one rule for everything, to one backend.
+    fn simple_port(port: u16, tls: Option<Vec<Certificate>>) -> HttpPort {
+        http_port(
+            port,
+            tls,
+            vec![http_rule(HostMatch::Any, prefix("/"), 0)],
+            vec![forward(vec![backend("10.0.0.1", 8080, 1)])],
+        )
+    }
+
+    /// A gateway with the given HTTP ports and no listeners.
+    fn http_gateway(key: ObjRef, ports: Vec<HttpPort>) -> GatewayModel {
+        let mut g = gateway(key, Vec::new());
+        g.http_ports = ports;
+        g
+    }
+
+    /// The rendering of gw/public with `ports` and one edge.
+    fn render_ports(ports: Vec<HttpPort>) -> Rendered {
+        let g = gw("gw", "public");
+        render_in(&model(
+            vec![http_gateway(g.clone(), ports)],
+            vec![edge("e1", 1, &g)],
+        ))
+    }
+
+    /// The lines of `cfg` that start with `prefix` after their indent, without the indent.
+    fn lines_of<'a>(cfg: &'a str, prefix: &str) -> Vec<&'a str> {
+        cfg.lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with(prefix))
+            .collect()
+    }
+
+    /// The fingerprint of the text from `frontend fe_<id>` up to the next `# ` comment or the end.
+    fn fingerprint_of(cfg: &str, id: &str) -> String {
+        let start = cfg.find(&format!("frontend fe_{id}\n")).unwrap();
+        let rest = &cfg[start..];
+        // The section ends in a newline; the next port's comment follows after a blank line.
+        let section = &rest[..rest.find("\n# ").unwrap_or(rest.len())];
+        hex::encode(Sha256::digest(section))[..16].to_owned()
+    }
+
+    #[test]
+    fn quote_examples() {
+        assert_eq!(quote("plain"), "'plain'");
+        assert_eq!(quote("it's"), r"'it'\''s'");
+        assert_eq!(quote("a b #c $HOME \"d\" \\e"), "'a b #c $HOME \"d\" \\e'");
+        assert_eq!(quote("a\nb\r\0c\x7f"), "'abc'");
+        assert_eq!(quote_format("100% it's"), r"'100%% it'\''s'");
+        // More of the same.
+        assert_eq!(quote("''"), r"''\'''\'''");
+        assert_eq!(quote("end\\"), "'end\\'");
+        assert_eq!(quote("gr\u{fc}\u{df}e"), "'gr\u{fc}\u{df}e'");
+        assert_eq!(quote("%[src]"), "'%[src]'");
+        assert_eq!(quote_format("%[src]"), "'%%[src]'");
+        assert_eq!(quote_format("${HOME}"), "'${HOME}'");
+        assert_eq!(quote_format("a\tb%"), "'ab%%'");
+    }
+
+    /// The model of `testdata/http.cfg`.
+    fn http_golden_port() -> HttpPort {
+        let a = || exact("a.example.com");
+        let mut api = http_rule(a(), prefix("/api"), 1);
+        api.method = Some("GET".into());
+        api.headers = vec![("x-env".into(), "prod".into())];
+        let mut filtered = forward(vec![
+            backend("10.0.0.1", 8080, 1),
+            backend("10.0.0.2", 8080, 3),
+        ]);
+        filtered.request_headers = HeaderMods {
+            set: vec![("x-a".into(), "100%".into())],
+            add: vec![("x-b".into(), "2".into())],
+            remove: vec!["x-c".into()],
+        };
+        filtered.response_headers = HeaderMods {
+            set: vec![("x-d".into(), "4".into())],
+            add: vec![("x-e".into(), "5".into())],
+            remove: vec!["server".into()],
+        };
+        http_port(
+            80,
+            None,
+            vec![
+                http_rule(a(), PathMatch::Exact("/x".into()), 0),
+                api,
+                http_rule(HostMatch::Wildcard(".example.com".into()), prefix("/"), 2),
+                http_rule(HostMatch::Any, prefix("/fail"), 3),
+                http_rule(HostMatch::Any, prefix("/"), 0),
+            ],
+            vec![
+                filtered,
+                forward(vec![backend("fd00::12", 8080, 1)]),
+                HttpBackend {
+                    response_headers: HeaderMods {
+                        set: vec![(
+                            "strict-transport-security".into(),
+                            "max-age=31536000".into(),
+                        )],
+                        ..Default::default()
+                    },
+                    ..http_backend(HttpAction::Redirect(Redirect {
+                        scheme: Some("https".into()),
+                        hostname: None,
+                        port: None,
+                        status: 301,
+                    }))
+                },
+                http_backend(HttpAction::Fail),
+            ],
+        )
+    }
+
+    #[test]
+    fn http_port_matches_the_golden_file() {
+        let r = render_ports(vec![http_golden_port()]);
+        let golden = include_str!("testdata/http.cfg");
+        assert_eq!(r.haproxy_cfg, golden);
+        assert!(r.files.is_empty());
+        assert_eq!(r.edges.len(), 1);
+        let id = "473034e7d07ecf67";
+        assert_eq!(port_id(&gw("gw", "public"), 80), id);
+        let section = &golden[golden.find(&format!("frontend fe_{id}")).unwrap()..];
+        let digest = hex::encode(Sha256::digest(section));
+        assert_eq!(
+            r.edges[0].sockets,
+            HashMap::from([(
+                tcp(80),
+                PortPlan {
+                    socket: PathBuf::from(format!("/run/igw/s/{id}.sock")),
+                    fingerprint: digest[..16].to_owned(),
+                    shared: true,
+                }
+            )])
+        );
+    }
+
+    #[test]
+    fn https_port_matches_the_golden_file() {
+        let (a, b) = (
+            cert("site-a", "1111111111111111"),
+            cert("site-b", "2222222222222222"),
+        );
+        let mut port = simple_port(443, Some(vec![a.clone(), b.clone()]));
+        // The golden file's server is on 8443.
+        port.backends = vec![forward(vec![backend("10.0.0.1", 8443, 1)])];
+        let r = render_ports(vec![port]);
+        assert_eq!(r.haproxy_cfg, include_str!("testdata/https.cfg"));
+        let list = "/run/igw/certs/gw.site-a.1111111111111111.pem\n\
+                    /run/igw/certs/gw.site-b.2222222222222222.pem\n";
+        let list_name = format!(
+            "a43c3fd7a81ccec0.{}.list",
+            &hex::encode(Sha256::digest(list))[..16]
+        );
+        assert_eq!(list_name, "a43c3fd7a81ccec0.a372a6265b8479fc.list");
+        assert_eq!(
+            r.files,
+            [
+                SecretFile {
+                    name: list_name,
+                    contents: list.to_owned(),
+                },
+                SecretFile {
+                    name: a.file_name.clone(),
+                    contents: a.pem.clone(),
+                },
+                SecretFile {
+                    name: b.file_name.clone(),
+                    contents: b.pem.clone(),
+                },
+            ]
+        );
+        assert_eq!(
+            r.edges[0].sockets[&tcp(443)].fingerprint,
+            fingerprint_of(&r.haproxy_cfg, "a43c3fd7a81ccec0")
+        );
+    }
+
+    /// The lines of the frontend from the first `acl` or `use_backend` line up to
+    /// `default_backend`, without their indent.
+    fn rule_lines(cfg: &str) -> Vec<&str> {
+        cfg.lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with("acl ") || l.starts_with("use_backend "))
+            .collect()
+    }
+
+    #[test]
+    fn prefix_gives_two_path_acls_and_root_prefix_none() {
+        let r = render_ports(vec![http_port(
+            80,
+            None,
+            vec![
+                http_rule(HostMatch::Any, prefix("/foo"), 0),
+                http_rule(exact("a.example.com"), prefix("/"), 1),
+                http_rule(HostMatch::Any, prefix("/"), 1),
+            ],
+            vec![
+                forward(vec![backend("10.0.0.1", 80, 1)]),
+                forward(vec![backend("10.0.0.2", 80, 1)]),
+            ],
+        )]);
+        let id = port_id(&gw("gw", "public"), 80);
+        assert_eq!(
+            rule_lines(&r.haproxy_cfg),
+            [
+                "acl r0_path path -m str -- '/foo'".to_owned(),
+                "acl r0_path path -m beg -- '/foo/'".to_owned(),
+                format!("use_backend be_{id}_0 if r0_path"),
+                "acl r1_host req.hdr(host),host_only,lower -m str -- 'a.example.com'".to_owned(),
+                format!("use_backend be_{id}_1 if r1_host"),
+                format!("use_backend be_{id}_1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_without_conditions_has_no_if() {
+        let r = render_ports(vec![simple_port(80, None)]);
+        let id = port_id(&gw("gw", "public"), 80);
+        assert_eq!(
+            rule_lines(&r.haproxy_cfg),
+            [format!("use_backend be_{id}_0")]
+        );
+        assert!(
+            r.haproxy_cfg
+                .contains(&format!("\n    use_backend be_{id}_0\n"))
+        );
+    }
+
+    #[test]
+    fn header_name_with_odd_characters_is_made_safe() {
+        let mut rule = http_rule(HostMatch::Any, prefix("/"), 0);
+        rule.headers = vec![("x)y z".into(), "v".into())];
+        let mut port = simple_port(80, None);
+        port.rules = vec![rule];
+        let r = render_ports(vec![port]);
+        let id = port_id(&gw("gw", "public"), 80);
+        assert_eq!(
+            rule_lines(&r.haproxy_cfg),
+            [
+                "acl r0_h0 req.fhdr(x_y_z) -m str -- 'v'".to_owned(),
+                format!("use_backend be_{id}_0 if r0_h0"),
+            ]
+        );
+        assert!(!r.haproxy_cfg.contains("x)y"));
+    }
+
+    #[test]
+    fn conditions_are_named_acls() {
+        // Values that are HAProxy syntax on their own.
+        let words = ["}", "{", "||", "!", "if", "unless", "--", "-m", "-i", "or"];
+        let mut rules = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            let mut r = http_rule(
+                if i % 2 == 0 {
+                    exact("a.example.com")
+                } else {
+                    HostMatch::Wildcard(".example.com".into())
+                },
+                if i % 3 == 0 {
+                    PathMatch::Exact(format!("/{w}"))
+                } else {
+                    prefix(&format!("/{w}"))
+                },
+                0,
+            );
+            r.method = Some("GET".into());
+            r.headers = vec![("x-a".into(), (*w).into()), ("x-b".into(), "{ }".into())];
+            rules.push(r);
+        }
+        rules.push(http_rule(HostMatch::Any, prefix("/"), 0));
+        let mut port = simple_port(80, None);
+        port.rules = rules;
+        port.backends[0].request_headers.set = vec![("x-c".into(), "}".into())];
+        let r = render_ports(vec![port]);
+        let cfg = &r.haproxy_cfg;
+        for (i, w) in words.iter().enumerate() {
+            assert!(
+                cfg.contains(&format!(
+                    "    acl r{i}_h0 req.fhdr(x-a) -m str -- {}\n",
+                    quote(w)
+                )),
+                "{w}\n{cfg}"
+            );
+        }
+        // Braces only inside quoted words, never as words of their own.
+        let mut stripped = cfg.clone();
+        for q in ["'{ }'", "'}'", "'{'", "'/}'", "'/{'", "'/}/'", "'/{/'"] {
+            stripped = stripped.replace(q, "<quoted>");
+        }
+        assert!(!stripped.contains('{'), "{stripped}");
+        assert!(!stripped.contains('}'), "{stripped}");
+        // Every `use_backend` line is the keyword, the backend, and ACL names.
+        let id = port_id(&gw("gw", "public"), 80);
+        let lines = lines_of(cfg, "use_backend");
+        assert_eq!(lines.len(), words.len() + 1);
+        for (i, line) in lines[..words.len()].iter().enumerate() {
+            assert_eq!(
+                *line,
+                format!("use_backend be_{id}_0 if r{i}_host r{i}_path r{i}_method r{i}_h0 r{i}_h1")
+            );
+        }
+        assert_eq!(lines[words.len()], format!("use_backend be_{id}_0"));
+    }
+
+    #[test]
+    fn sixteen_header_matches_are_named_acls_on_one_line() {
+        let mut rule = http_rule(exact("a.example.com"), PathMatch::Exact("/x".into()), 0);
+        rule.method = Some("GET".into());
+        rule.headers = (0..16)
+            .map(|i| (format!("x-h{i:02}"), format!("v{i}")))
+            .collect();
+        let mut port = simple_port(80, None);
+        port.rules = vec![rule];
+        let r = render_ports(vec![port]);
+        let id = port_id(&gw("gw", "public"), 80);
+        let mut want = vec![
+            "acl r0_host req.hdr(host),host_only,lower -m str -- 'a.example.com'".to_owned(),
+            "acl r0_path path -m str -- '/x'".to_owned(),
+            "acl r0_method method 'GET'".to_owned(),
+        ];
+        want.extend((0..16).map(|i| format!("acl r0_h{i} req.fhdr(x-h{i:02}) -m str -- 'v{i}'")));
+        let names: String = (0..16).map(|i| format!(" r0_h{i}")).collect();
+        want.push(format!(
+            "use_backend be_{id}_0 if r0_host r0_path r0_method{names}"
+        ));
+        let got = rule_lines(&r.haproxy_cfg);
+        assert_eq!(got, want);
+        // Well within the 64 words HAProxy reads on a line.
+        assert_eq!(got.last().unwrap().split_whitespace().count(), 3 + 3 + 16);
+    }
+
+    /// The `location` of a port with one redirecting rule, and its status code.
+    fn location(tls: bool, port: u16, redirect: Redirect) -> String {
+        let p = http_port(
+            port,
+            tls.then(|| vec![cert("site", "1111111111111111")]),
+            vec![http_rule(HostMatch::Any, prefix("/"), 0)],
+            vec![http_backend(HttpAction::Redirect(redirect))],
+        );
+        let r = render_ports(vec![p]);
+        let lines = lines_of(&r.haproxy_cfg, "http-request redirect");
+        assert_eq!(lines.len(), 1, "{}", r.haproxy_cfg);
+        lines[0]
+            .strip_prefix("http-request redirect location ")
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn redirect_locations() {
+        let redirect = |scheme: Option<&str>, hostname: Option<&str>, port: Option<u16>| Redirect {
+            scheme: scheme.map(Into::into),
+            hostname: hostname.map(Into::into),
+            port,
+            status: 302,
+        };
+        let cases = [
+            (
+                false,
+                80,
+                redirect(Some("https"), None, None),
+                "'https://%[req.hdr(host),host_only]%[pathq]' code 302",
+            ),
+            (
+                false,
+                8080,
+                redirect(None, None, None),
+                "'http://%[req.hdr(host),host_only]:8080%[pathq]' code 302",
+            ),
+            (
+                true,
+                443,
+                redirect(None, Some("b.example.com"), None),
+                "'https://b.example.com%[pathq]' code 302",
+            ),
+            (
+                false,
+                80,
+                redirect(Some("https"), None, Some(8443)),
+                "'https://%[req.hdr(host),host_only]:8443%[pathq]' code 302",
+            ),
+            (
+                false,
+                80,
+                redirect(Some("http"), None, Some(80)),
+                "'http://%[req.hdr(host),host_only]%[pathq]' code 302",
+            ),
+            // More of the same.
+            (
+                false,
+                80,
+                redirect(None, None, None),
+                "'http://%[req.hdr(host),host_only]%[pathq]' code 302",
+            ),
+            (
+                true,
+                8443,
+                redirect(None, None, None),
+                "'https://%[req.hdr(host),host_only]:8443%[pathq]' code 302",
+            ),
+            (
+                true,
+                8443,
+                redirect(Some("http"), None, None),
+                "'http://%[req.hdr(host),host_only]%[pathq]' code 302",
+            ),
+            (
+                false,
+                80,
+                redirect(Some("https"), None, Some(443)),
+                "'https://%[req.hdr(host),host_only]%[pathq]' code 302",
+            ),
+            (
+                false,
+                80,
+                redirect(None, Some("b.example.com"), Some(8080)),
+                "'http://b.example.com:8080%[pathq]' code 302",
+            ),
+            // A '%' in the host name, which the model never lets through, stays literal.
+            (
+                false,
+                80,
+                redirect(None, Some("b%[src]"), None),
+                "'http://b%%[src]%[pathq]' code 302",
+            ),
+        ];
+        for (tls, port, r, want) in cases {
+            assert_eq!(location(tls, port, r.clone()), want, "{tls} {port} {r:?}");
+        }
+        for status in [301, 302, 303, 307, 308] {
+            let mut r = redirect(None, None, None);
+            r.status = status;
+            assert!(location(false, 80, r).ends_with(&format!(" code {status}")));
+        }
+    }
+
+    #[test]
+    fn backend_no_rule_points_at_is_not_rendered() {
+        let r = render_ports(vec![http_port(
+            80,
+            None,
+            vec![
+                http_rule(exact("a.example.com"), prefix("/"), 2),
+                http_rule(HostMatch::Any, prefix("/"), 0),
+            ],
+            vec![
+                forward(vec![backend("10.0.0.1", 80, 1)]),
+                forward(vec![backend("10.0.0.2", 80, 1)]),
+                forward(vec![backend("10.0.0.3", 80, 1)]),
+            ],
+        )]);
+        let id = port_id(&gw("gw", "public"), 80);
+        assert_eq!(
+            lines_of(&r.haproxy_cfg, "backend "),
+            [
+                format!("backend be_{id}_0"),
+                format!("backend be_{id}_2"),
+                format!("backend be_{id}_none"),
+            ]
+        );
+        assert!(!r.haproxy_cfg.contains("10.0.0.2"));
+        assert!(r.haproxy_cfg.contains("server s0 10.0.0.3:80 weight 256\n"));
+    }
+
+    #[test]
+    fn certificate_shared_by_two_ports_is_one_file() {
+        let (a, b) = (
+            cert("site-a", "1111111111111111"),
+            cert("site-b", "2222222222222222"),
+        );
+        let r = render_ports(vec![
+            simple_port(443, Some(vec![a.clone()])),
+            simple_port(8443, Some(vec![a.clone(), b.clone()])),
+        ]);
+        let names: Vec<&str> = r.files.iter().map(|f| f.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(names, sorted, "sorted, without repeats");
+        let pems: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| n.ends_with(".pem"))
+            .collect();
+        assert_eq!(pems, [a.file_name.as_str(), b.file_name.as_str()]);
+        let lists: Vec<&SecretFile> = r
+            .files
+            .iter()
+            .filter(|f| f.name.ends_with(".list"))
+            .collect();
+        assert_eq!(lists.len(), 2);
+        let g = gw("gw", "public");
+        for (port, certs) in [(443, vec![&a]), (8443, vec![&a, &b])] {
+            let id = port_id(&g, port);
+            let list = lists.iter().find(|f| f.name.starts_with(&id)).unwrap();
+            let want: String = certs
+                .iter()
+                .map(|c| format!("/run/igw/certs/{}\n", c.file_name))
+                .collect();
+            assert_eq!(list.contents, want);
+            assert!(r.haproxy_cfg.contains(&format!(
+                "ssl crt-list /run/igw/certs/{} strict-sni",
+                list.name
+            )));
+        }
+    }
+
+    #[test]
+    fn rotated_certificate_changes_list_name_configuration_and_fingerprint() {
+        let render_with = |c: Certificate| {
+            render_ports(vec![simple_port(443, Some(vec![c])), simple_port(80, None)])
+        };
+        let old = render_with(cert("site", "1111111111111111"));
+        let new = render_with(cert("site", "3333333333333333"));
+        let list = |r: &Rendered| {
+            r.files
+                .iter()
+                .find(|f| f.name.ends_with(".list"))
+                .unwrap()
+                .name
+                .clone()
+        };
+        assert_ne!(list(&old), list(&new));
+        assert_ne!(old.haproxy_cfg, new.haproxy_cfg);
+        assert!(new.haproxy_cfg.contains(&list(&new)));
+        assert!(!new.haproxy_cfg.contains(&list(&old)));
+        let names: Vec<&str> = new.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            !names.contains(&"gw.site.1111111111111111.pem"),
+            "{names:?}"
+        );
+        assert!(names.contains(&"gw.site.3333333333333333.pem"), "{names:?}");
+        let (o, n) = (&old.edges[0].sockets, &new.edges[0].sockets);
+        assert_ne!(o[&tcp(443)].fingerprint, n[&tcp(443)].fingerprint);
+        assert_eq!(o[&tcp(443)].socket, n[&tcp(443)].socket);
+        // The other port is untouched.
+        assert_eq!(o[&tcp(80)], n[&tcp(80)]);
+    }
+
+    #[test]
+    fn http_ports_are_in_the_edge_plan() {
+        let r = render_ports(vec![
+            simple_port(80, None),
+            simple_port(443, Some(vec![cert("site", "1111111111111111")])),
+        ]);
+        let g = gw("gw", "public");
+        assert_eq!(r.edges.len(), 1);
+        let sockets = &r.edges[0].sockets;
+        let mut keys: Vec<ListenerKey> = sockets.keys().copied().collect();
+        keys.sort_by_key(|k| k.port);
+        assert_eq!(keys, [tcp(80), tcp(443)]);
+        for port in [80, 443] {
+            let id = port_id(&g, port);
+            assert_eq!(
+                sockets[&tcp(port)],
+                PortPlan {
+                    socket: PathBuf::from(format!("/run/igw/s/{id}.sock")),
+                    fingerprint: fingerprint_of(&r.haproxy_cfg, &id),
+                    shared: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_and_http_ports_of_one_gateway_render_together() {
+        let a = gw("a", "x");
+        let b = gw("b", "y");
+        let mut first = http_gateway(
+            a.clone(),
+            // Out of order in the model.
+            vec![simple_port(8080, None), simple_port(80, None)],
+        );
+        first.listeners = vec![listener(5432, vec![backend("10.0.0.5", 5432, 1)])];
+        let second = gateway(
+            b.clone(),
+            vec![listener(81, vec![backend("10.0.0.6", 81, 1)])],
+        );
+        let m = model(
+            vec![second, first],
+            vec![edge("e1", 1, &a), edge("e2", 2, &b)],
+        );
+        let r = render_in(&m);
+        let comments = lines_of(&r.haproxy_cfg, "# ");
+        // TCP ports first, then HTTP ports ascending; then the next gateway.
+        assert_eq!(
+            comments,
+            [
+                "# a/x port 5432",
+                "# a/x port 80",
+                "# a/x port 8080",
+                "# b/y port 81"
+            ]
+        );
+        assert!(
+            r.haproxy_cfg
+                .contains(&format!("frontend fe_{}\n    bind", port_id(&a, 5432)))
+        );
+        assert!(
+            r.haproxy_cfg
+                .contains(&format!("frontend fe_{}\n    mode http\n", port_id(&a, 80)))
+        );
+        assert_eq!(r.edges.len(), 2);
+        let mut ports: Vec<u16> = r.edges[0].sockets.keys().map(|k| k.port).collect();
+        ports.sort_unstable();
+        assert_eq!(ports, [80, 5432, 8080]);
+        let ports: Vec<u16> = r.edges[1].sockets.keys().map(|k| k.port).collect();
+        assert_eq!(ports, [81]);
+        // The TCP port's fingerprint covers only its own sections.
+        let id = port_id(&a, 5432);
+        assert_eq!(
+            r.edges[0].sockets[&tcp(5432)].fingerprint,
+            fingerprint_of(&r.haproxy_cfg, &id)
+        );
+    }
+
+    #[test]
+    fn http_listeners_render_from_http_ports() {
+        // A serving HTTP listener gets no TCP frontend of its own; its port renders from the
+        // gateway's `http_ports`, and only if there is one.
+        let g = gw("gw", "public");
+        let mut http = listener(80, vec![backend("10.0.0.9", 80, 1)]);
+        http.protocol = "HTTP".into();
+        http.supported_kinds = vec!["HTTPRoute".into()];
+        assert!(http.serving(), "precondition");
+        let mut without = gateway(g.clone(), vec![http.clone()]);
+        let r = render_in(&model(vec![without.clone()], vec![edge("e1", 1, &g)]));
+        assert_eq!(r.haproxy_cfg, include_str!("testdata/empty.cfg"));
+        assert!(r.edges[0].sockets.is_empty());
+
+        without.http_ports = vec![simple_port(80, None)];
+        let r = render_in(&model(vec![without], vec![edge("e1", 1, &g)]));
+        assert_eq!(lines_of(&r.haproxy_cfg, "frontend fe_").len(), 1);
+        assert!(r.haproxy_cfg.contains("    mode http\n"));
+        // The listener's own backend is not what the port serves.
+        assert!(!r.haproxy_cfg.contains("10.0.0.9"));
+        assert_eq!(
+            r.edges[0].sockets.keys().copied().collect::<Vec<_>>(),
+            [tcp(80)]
+        );
+    }
+
+    #[test]
+    fn debug_of_rendered_hides_key_material() {
+        let c = cert("site", "1111111111111111");
+        let r = render_ports(vec![simple_port(443, Some(vec![c.clone()]))]);
+        let file = r.files.iter().find(|f| f.name == c.file_name).unwrap();
+        assert!(file.contents.contains(KEY_LINE), "precondition");
+        for shown in [format!("{r:?}"), format!("{r:#?}")] {
+            assert!(shown.contains(&c.file_name), "{shown}");
+            assert!(!shown.contains("PRIVATE KEY"), "{shown}");
+            assert!(!shown.contains(KEY_LINE), "{shown}");
+        }
+        // Nor does the configuration name anything but the file.
+        assert!(!r.haproxy_cfg.contains(KEY_LINE));
     }
 }

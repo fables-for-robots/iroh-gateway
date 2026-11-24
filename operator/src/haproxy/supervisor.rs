@@ -1,9 +1,15 @@
 //! Runs HAProxy in master-worker mode and applies new configurations to it: each one is
 //! validated with `haproxy -c` first, loaded through the master socket's `reload`, and taken
-//! back on disk when the reload fails.
+//! back on disk when the reload fails; after a reload HAProxy refused, the previous
+//! configuration is reloaded once.
+//!
+//! The files a configuration names besides itself (certificates with their keys) live in
+//! `<runtime_dir>/certs`. A file is kept as long as a configuration HAProxy runs, or may run,
+//! lists it, and removed once none does.
 
-use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::collections::BTreeSet;
+use std::io::{self, Write as _};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -16,6 +22,8 @@ use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
+
+use super::SecretFile;
 
 /// Default for [`SupervisorOptions::reload_timeout`].
 pub const DEFAULT_RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,11 +45,13 @@ const CFG_NEW: &str = "haproxy.cfg.new";
 const MASTER_SOCK: &str = "master.sock";
 const STATS_SOCK: &str = "stats.sock";
 const SOCKET_DIR: &str = "s";
+/// The directory under the runtime directory that holds the files, mode 0700.
+pub const CERT_DIR: &str = "certs";
 
 pub struct SupervisorOptions {
     /// The HAProxy executable; a bare name is looked up on PATH.
     pub haproxy_bin: PathBuf,
-    /// Holds haproxy.cfg, master.sock, stats.sock and s/.
+    /// Holds haproxy.cfg, master.sock, stats.sock, s/ and certs/.
     pub runtime_dir: PathBuf,
     /// Bound for HAProxy to answer on its master socket at start, and for a reload's reply.
     pub reload_timeout: Duration,
@@ -95,6 +105,10 @@ pub struct Supervisor {
     /// The last configuration HAProxy confirmed loading; written back to `haproxy.cfg` when a
     /// reload fails.
     loaded: String,
+    /// The names in `certs/` that a configuration HAProxy runs or may run lists: those of
+    /// `loaded`, and those of every configuration since whose reload outcome is unknown. Nothing
+    /// else in `certs/` is needed.
+    in_use: BTreeSet<String>,
 }
 
 /// Why [`Supervisor::reload`] got no reply.
@@ -121,7 +135,7 @@ impl Supervisor {
                 dir.display()
             );
         }
-        for d in [dir.clone(), dir.join(SOCKET_DIR)] {
+        for d in [dir.clone(), dir.join(SOCKET_DIR), dir.join(CERT_DIR)] {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -130,6 +144,10 @@ impl Supervisor {
             std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("setting permissions on {}", d.display()))?;
         }
+        // Files an earlier run left: no configuration of this run names them.
+        let certs = dir.join(CERT_DIR);
+        remove_entries(&certs, |_| false)
+            .with_context(|| format!("emptying {}", certs.display()))?;
 
         validate(&opts, cfg).await.map_err(|e| match e {
             ApplyError::Invalid(alerts) => anyhow::anyhow!("invalid configuration:\n{alerts}"),
@@ -181,6 +199,7 @@ impl Supervisor {
             status: None,
             current: Some(cfg.to_owned()),
             loaded: cfg.to_owned(),
+            in_use: BTreeSet::new(),
         };
         if let Err(e) = sup.wait_ready().await {
             sup.stop().await;
@@ -195,47 +214,86 @@ impl Supervisor {
         self.pid
     }
 
-    /// Makes `cfg` the running configuration. Not re-entrant: one call at a time.
+    /// Makes `cfg` the running configuration, with `files` written to `<runtime_dir>/certs`
+    /// before it is validated. Not re-entrant: one call at a time.
     ///
-    /// Cancelling it, a timeout, or a broken connection during the reload leaves the running
-    /// configuration unknown; the next call then reloads whatever text it is given.
-    pub async fn apply(&mut self, cfg: &str) -> Result<Applied, ApplyError> {
+    /// The caller names files after their content, so that equal `cfg` means equal files: a
+    /// file that exists already is not written again, and `cfg` equal to the running text
+    /// touches no file. A name that is empty, starts with `.` or has a character outside
+    /// `[A-Za-z0-9_.-]` fails the call with [`ApplyError::Io`] of kind `InvalidInput` before
+    /// anything is written.
+    ///
+    /// When the master answers `Success=0`, the previous configuration is written back and
+    /// reloaded once before the error is returned: after a failed reload HAProxy's master
+    /// re-executes without its listening sockets on the next failure, so two failures in a row
+    /// would leave every socket refusing connections; a successful reload in between prevents
+    /// that. If that second reload does not answer `Success=1` either, the running
+    /// configuration is unknown and the error names both failures.
+    ///
+    /// Once the outcome is known, every file in `certs/` that no configuration HAProxy runs or
+    /// may run lists is removed: after a success all but `files`; after a refused validation or
+    /// a reload that certainly failed (and, after `Success=0`, a successful reload of the
+    /// previous configuration), all but those of the loaded configuration (and of any
+    /// configuration since whose reload outcome is still unknown); after a reload whose outcome
+    /// is unknown, nothing.
+    ///
+    /// Cancelling it, a timeout, or a broken connection during either reload leaves the running
+    /// configuration unknown; the next call then reloads whatever text it is given. A cancelled
+    /// call removes no file a configuration HAProxy may run lists; files it wrote for `cfg`
+    /// stay until a later call removes them. A call cancelled while it reloads the previous
+    /// configuration leaves `haproxy.cfg` holding that configuration, and the master may not
+    /// have had the successful reload yet: if the next call's configuration fails to load as
+    /// well, that is two failures in a row. [`crate::engine::Engine`] never cancels it.
+    pub async fn apply(&mut self, cfg: &str, files: &[SecretFile]) -> Result<Applied, ApplyError> {
+        check_names(files)?;
         if self.current.as_deref() == Some(cfg) {
             return Ok(Applied::Unchanged);
         }
-        validate(&self.opts, cfg).await?;
+        // Without an await, so that a cancelled call leaves no write half done in the
+        // background, where it could outlive `shutdown` or `Drop`.
+        if let Err(e) = self.write_files(files) {
+            self.remove_unlisted();
+            return Err(e.into());
+        }
+        if let Err(e) = validate(&self.opts, cfg).await {
+            self.remove_unlisted();
+            return Err(e);
+        }
         // Unknown from here until the master's reply says otherwise, so that a cancelled call
-        // leaves it unknown.
+        // leaves it unknown; for the same reason `files` count as in use from here on.
         let previous = self.current.take();
+        let previous_in_use = self.in_use.clone();
+        self.in_use.extend(files.iter().map(|f| f.name.clone()));
         let dir = &self.opts.runtime_dir;
         if let Err(e) = tokio::fs::rename(dir.join(CFG_NEW), dir.join(CFG)).await {
             let _ = tokio::fs::remove_file(dir.join(CFG_NEW)).await;
             self.current = previous;
+            self.in_use = previous_in_use;
+            self.remove_unlisted();
             return Err(e.into());
         }
-        // Whether the master certainly did not load `cfg`: then `previous` still runs.
-        let (failure, not_loaded) = match timeout(self.opts.reload_timeout, self.reload()).await {
-            Ok(Ok(reply)) if reply.starts_with("Success=1") => {
-                self.current = Some(cfg.to_owned());
-                self.loaded = cfg.to_owned();
-                info!("haproxy reloaded");
-                return Ok(Applied::Reloaded);
-            }
-            Ok(Ok(reply)) => {
-                // A complete reply; anything but `Success=0` is not one we understand.
-                let definite = reply.starts_with("Success=0");
-                (ApplyError::ReloadFailed(reply), definite)
-            }
-            Ok(Err(ReloadError::Connect(e))) => (ApplyError::Io(e), true),
-            Ok(Err(ReloadError::Exchange(e))) => (ApplyError::Io(e), false),
-            Err(_) => (
-                ApplyError::ReloadFailed(format!(
-                    "timed out: no complete reply to reload within {:?}",
-                    self.opts.reload_timeout
-                )),
-                false,
-            ),
-        };
+        // Whether the master certainly did not load `cfg`: then `previous` still runs. Whether
+        // it said so with `Success=0`: then it has had a failed reload.
+        let (failure, not_loaded, refused) =
+            match timeout(self.opts.reload_timeout, self.reload()).await {
+                Ok(Ok(reply)) if reply.starts_with("Success=1") => {
+                    self.current = Some(cfg.to_owned());
+                    self.loaded = cfg.to_owned();
+                    self.in_use = files.iter().map(|f| f.name.clone()).collect();
+                    self.remove_unlisted();
+                    info!("haproxy reloaded");
+                    return Ok(Applied::Reloaded);
+                }
+                Ok(Ok(reply)) => {
+                    // A complete reply; anything but `Success=0` is not one we understand.
+                    let definite = reply.starts_with("Success=0");
+                    (ApplyError::ReloadFailed(reply), definite, definite)
+                }
+                // Nothing was sent: the master saw no reload at all.
+                Ok(Err(ReloadError::Connect(e))) => (ApplyError::Io(e), true, false),
+                Ok(Err(ReloadError::Exchange(e))) => (ApplyError::Io(e), false, false),
+                Err(_) => (ApplyError::ReloadFailed(self.timed_out()), false, false),
+            };
         if not_loaded {
             self.current = previous;
         }
@@ -250,6 +308,7 @@ impl Supervisor {
         };
         if let Err(e) = restored {
             let _ = tokio::fs::remove_file(&staged).await;
+            // `files` stay in use: `haproxy.cfg` may still name them.
             return Err(ApplyError::Io(io::Error::new(
                 e.kind(),
                 format!(
@@ -258,7 +317,52 @@ impl Supervisor {
                 ),
             )));
         }
+        if refused {
+            // After a failed reload the master re-executes without its listening sockets on
+            // the next failure (it passes them on with `-x` only after a success), so that every
+            // socket would stop answering. A successful reload of the restored configuration
+            // re-arms it.
+            //
+            // Unknown until the reply, so that a cancelled call leaves it unknown; `files` stay
+            // in use until then. Whatever the master does, `haproxy.cfg` is `loaded` now.
+            self.current = None;
+            match timeout(self.opts.reload_timeout, self.reload()).await {
+                Ok(Ok(reply)) if reply.starts_with("Success=1") => {
+                    self.current = Some(self.loaded.clone());
+                    info!("haproxy reloaded the previous configuration");
+                }
+                second => {
+                    let second = match second {
+                        Ok(Ok(reply)) => reply,
+                        Ok(Err(ReloadError::Connect(e) | ReloadError::Exchange(e))) => {
+                            e.to_string()
+                        }
+                        Err(_) => self.timed_out(),
+                    };
+                    warn!(error = %second, "reloading the previous configuration failed");
+                    // `refused` is set only for a `Success=0` reply.
+                    let first = match failure {
+                        ApplyError::ReloadFailed(reply) => reply,
+                        other => other.to_string(),
+                    };
+                    return Err(ApplyError::ReloadFailed(format!(
+                        "{first}\nand reloading the previous configuration afterwards failed:\n{second}"
+                    )));
+                }
+            }
+        }
+        if not_loaded {
+            self.in_use = previous_in_use;
+            self.remove_unlisted();
+        }
         Err(failure)
+    }
+
+    fn timed_out(&self) -> String {
+        format!(
+            "timed out: no complete reply to reload within {:?}",
+            self.opts.reload_timeout
+        )
     }
 
     /// Resolves when the HAProxy master process ends on its own.
@@ -279,13 +383,14 @@ impl Supervisor {
         status
     }
 
-    /// SIGTERM to the master, wait up to 5 s, then kill. Removes the sockets it created.
+    /// SIGTERM to the master, wait up to 5 s, then kill. Removes the sockets it created and the
+    /// files in `certs/`.
     pub async fn shutdown(mut self) {
         self.stop().await;
         info!("haproxy stopped");
     }
 
-    /// Stops HAProxy if it still runs, reaps the master and removes the sockets.
+    /// Stops HAProxy if it still runs, reaps the master, and removes the sockets and the files.
     async fn stop(&mut self) {
         if self.status.is_none() && matches!(self.child.try_wait(), Ok(None)) {
             // To the master alone: it stops its workers itself.
@@ -297,6 +402,7 @@ impl Supervisor {
         }
         self.exited().await;
         self.remove_sockets();
+        self.remove_files(|_| false);
     }
 
     /// Waits until the master answers and passes a request on to a worker, which a worker
@@ -354,6 +460,49 @@ impl Supervisor {
         }
     }
 
+    /// Writes each of `files` that `certs/` lacks: created with mode 0600 under a temporary
+    /// name, then renamed to its own.
+    fn write_files(&self, files: &[SecretFile]) -> io::Result<()> {
+        let dir = self.opts.runtime_dir.join(CERT_DIR);
+        for file in files {
+            let path = dir.join(&file.name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            // A dot name, which no file of a configuration has.
+            let staged = dir.join(format!(".{}.tmp", file.name));
+            let written = remove_if_exists(&staged)
+                .and_then(|()| write_new(&staged, &file.contents))
+                .and_then(|()| std::fs::rename(&staged, &path));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&staged);
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("writing {}: {e}", path.display()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes what `certs/` holds besides the files in use.
+    fn remove_unlisted(&self) {
+        self.remove_files(|name| self.in_use.contains(name));
+    }
+
+    /// Removes each entry of `certs/` whose name `keep` refuses.
+    fn remove_files(&self, keep: impl Fn(&str) -> bool) {
+        let dir = self.opts.runtime_dir.join(CERT_DIR);
+        // A missing directory holds no file.
+        if let Err(e) = remove_entries(&dir, keep)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            warn!(dir = %dir.display(), error = %e, "removing certificate files failed");
+        }
+    }
+
     fn remove_sockets(&self) {
         let dir = &self.opts.runtime_dir;
         let mut paths = vec![dir.join(MASTER_SOCK), dir.join(STATS_SOCK)];
@@ -381,7 +530,75 @@ impl Drop for Supervisor {
         // The workers leave when their master dies; killing the group also covers the time
         // until they notice. `kill_on_drop` then kills and reaps the master.
         self.kill_group();
+        self.remove_files(|_| false);
     }
+}
+
+/// Refuses a name that is empty, starts with `.` or has a character outside `[A-Za-z0-9_.-]`:
+/// one that could leave `certs/`, clash with a temporary file, or mean something else where a
+/// configuration names it.
+fn check_names(files: &[SecretFile]) -> io::Result<()> {
+    let bad = |name: &str| {
+        name.is_empty()
+            || name.starts_with('.')
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    };
+    match files.iter().find(|f| bad(&f.name)) {
+        Some(f) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid certificate file name {:?}", f.name),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Creates `path` with mode 0600, failing if it exists, and writes `contents` to it.
+fn write_new(path: &Path, contents: &str) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(contents.as_bytes())
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Removes each entry of `dir` whose name `keep` refuses, directories with their contents.
+/// Tries them all; returns the first error.
+fn remove_entries(dir: &Path, keep: impl Fn(&str) -> bool) -> io::Result<()> {
+    let mut first = None;
+    for entry in std::fs::read_dir(dir)? {
+        let removed = entry.and_then(|entry| {
+            if entry.file_name().to_str().is_some_and(&keep) {
+                return Ok(());
+            }
+            let path = entry.path();
+            let result = if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match result {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io::Error::new(
+                    e.kind(),
+                    format!("removing {}: {e}", path.display()),
+                )),
+                _ => Ok(()),
+            }
+        });
+        if let Err(e) = removed {
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// Writes `cfg` to `haproxy.cfg.new` and runs `haproxy -c` on it. On success the file stays

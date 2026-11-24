@@ -1,24 +1,43 @@
-//! TCPRoutes: which route binds to which listener, and the backends each listener gets.
+//! TCPRoutes: which route binds to which listener, and the backends each listener gets; and the
+//! parent and backend checks, and the snapshot lookups, that every route kind shares.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use gateway_api::tcproutes::v1::{TcpRoute, TcpRouteParentRefs, TcpRouteRulesBackendRefs};
+use gateway_api::tcproutes::v1::TcpRoute;
 use k8s_openapi::api::core::v1::Service;
 use kube::ResourceExt;
 
-use super::gateways::{ROUTE_GROUP, ROUTE_KIND};
+use super::gateways::ROUTE_GROUP;
 use super::{
-    Backend, GatewayModel, LabelRequirement, LabelSelector, ObjRef, ParentKey, Reject, RouteModel,
-    RouteNamespaces, RouteParent, Snapshot, generation,
+    Backend, GatewayModel, LabelRequirement, LabelSelector, ObjRef, ParentKey, ParentRef, Reject,
+    RouteKind, RouteModel, RouteNamespaces, RouteParent, RouteResource, Snapshot, generation,
 };
 
 const GATEWAY_KIND: &str = "Gateway";
 
-type Labels = BTreeMap<String, String>;
+pub(super) type Labels = BTreeMap<String, String>;
 
 /// A listener slot: index of the gateway in the model, index of the listener in that gateway.
-type Slot = (usize, usize);
+pub(super) type Slot = (usize, usize);
+
+/// The labels of every namespace in the snapshot, by name.
+pub(super) fn namespace_labels(snapshot: &Snapshot) -> BTreeMap<String, Labels> {
+    snapshot
+        .namespaces
+        .iter()
+        .map(|n| (n.name_any(), n.metadata.labels.clone().unwrap_or_default()))
+        .collect()
+}
+
+/// The services of the snapshot by key; of two with one key, the first.
+pub(super) fn services_by_key(snapshot: &Snapshot) -> BTreeMap<ObjRef, &Service> {
+    let mut services: BTreeMap<ObjRef, &Service> = BTreeMap::new();
+    for svc in &snapshot.services {
+        services.entry(ObjRef::of(svc)).or_insert(svc);
+    }
+    services
+}
 
 /// Every route that names one of our gateways, by key. Fills `attached_routes` and `backends`
 /// of the listeners the routes win.
@@ -30,15 +49,8 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
         .collect();
     routes.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let namespaces: BTreeMap<String, Labels> = snapshot
-        .namespaces
-        .iter()
-        .map(|n| (n.name_any(), n.metadata.labels.clone().unwrap_or_default()))
-        .collect();
-    let mut services: BTreeMap<ObjRef, &Service> = BTreeMap::new();
-    for svc in &snapshot.services {
-        services.entry(ObjRef::of(svc)).or_insert(svc);
-    }
+    let namespaces = namespace_labels(snapshot);
+    let services = services_by_key(snapshot);
 
     let resolved: Vec<Resolved> = routes
         .iter()
@@ -76,6 +88,7 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
         .enumerate()
         .filter(|(_, ((_, parents), _))| !parents.is_empty())
         .map(|(i, (((key, r), parents), resolved))| RouteModel {
+            kind: TcpRoute::KIND,
             key: key.clone(),
             generation: generation(*r),
             parents: parents
@@ -114,8 +127,8 @@ fn attachments(
 ) -> Vec<Attachment> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for parent in route.spec.parent_refs.iter().flatten() {
-        let Some(parent) = parent_key(parent, route_ns) else {
+    for parent in route.parent_refs() {
+        let Some(parent) = parent_key(&parent, route_ns) else {
             continue;
         };
         if !seen.insert(parent.clone()) {
@@ -133,7 +146,7 @@ fn attachments(
 }
 
 /// The key of a `parentRef` to a Gateway, defaults filled in; `None` for other kinds.
-pub(crate) fn parent_key(parent: &TcpRouteParentRefs, route_ns: &str) -> Option<ParentKey> {
+pub(crate) fn parent_key(parent: &ParentRef, route_ns: &str) -> Option<ParentKey> {
     let group = parent.group.as_deref().unwrap_or(ROUTE_GROUP);
     let kind = parent.kind.as_deref().unwrap_or(GATEWAY_KIND);
     if group != ROUTE_GROUP || kind != GATEWAY_KIND {
@@ -150,9 +163,28 @@ pub(crate) fn parent_key(parent: &TcpRouteParentRefs, route_ns: &str) -> Option<
     })
 }
 
-/// The listeners of `gw` that the route may compete for, or why there are none.
+/// The listeners of `gw` that the TCPRoute may compete for, or why there are none.
 fn attach(
     route: &TcpRoute,
+    route_ns: &str,
+    parent: &ParentKey,
+    gw: &GatewayModel,
+    namespaces: &BTreeMap<String, Labels>,
+) -> Result<Vec<usize>, Reject> {
+    let kept = admitted(TcpRoute::KIND, route_ns, parent, gw, namespaces)?;
+    if route.spec.rules.len() > 1 {
+        return Err(Reject::new(
+            "UnsupportedValue",
+            "a TCPRoute may have one rule",
+        ));
+    }
+    Ok(kept)
+}
+
+/// The listeners of `gw` a route of `kind` from `route_ns` may attach to through `parent`:
+/// `NoMatchingParent` or `NotAllowedByListeners` otherwise.
+pub(super) fn admitted(
+    kind: RouteKind,
     route_ns: &str,
     parent: &ParentKey,
     gw: &GatewayModel,
@@ -183,7 +215,7 @@ fn attach(
             gw.accepted.is_ok()
                 && l.accepted.is_ok()
                 && l.conflicted.is_none()
-                && l.supported_kinds.iter().any(|k| k == ROUTE_KIND)
+                && l.supported_kinds.iter().any(|k| k == kind.as_str())
                 && admits(
                     &l.allowed_namespaces,
                     &gw.key.namespace,
@@ -196,16 +228,10 @@ fn attach(
         return Err(Reject::new(
             "NotAllowedByListeners",
             format!(
-                "no accepted listener of gateway {} admits TCPRoutes from namespace {route_ns:?}",
-                gw.key
+                "no accepted listener of gateway {} admits {}s from namespace {route_ns:?}",
+                gw.key,
+                kind.as_str()
             ),
-        ));
-    }
-
-    if route.spec.rules.len() > 1 {
-        return Err(Reject::new(
-            "UnsupportedValue",
-            "a TCPRoute may have one rule",
         ));
     }
     Ok(kept)
@@ -267,7 +293,15 @@ fn resolve(route: &TcpRoute, route_ns: &str, services: &BTreeMap<ObjRef, &Servic
     let mut backends = Vec::new();
     let mut resolved_refs = Ok(());
     for b in route.spec.rules.iter().flat_map(|r| &r.backend_refs) {
-        match backend(b, route_ns, services) {
+        let b = BackendRef {
+            group: b.group.as_deref(),
+            kind: b.kind.as_deref(),
+            namespace: b.namespace.as_deref(),
+            name: &b.name,
+            port: b.port,
+            weight: b.weight,
+        };
+        match backend(&b, route_ns, services) {
             Ok(Some(backend)) => backends.push(backend),
             Ok(None) => {}
             Err(reject) => {
@@ -283,14 +317,24 @@ fn resolve(route: &TcpRoute, route_ns: &str, services: &BTreeMap<ObjRef, &Servic
     }
 }
 
+/// A route's `backendRef`, whatever the route's kind, as written.
+pub(super) struct BackendRef<'a> {
+    pub group: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub namespace: Option<&'a str>,
+    pub name: &'a str,
+    pub port: Option<i32>,
+    pub weight: Option<i32>,
+}
+
 /// One `backendRef`: a backend, `None` if it has weight 0, or why it was refused.
-fn backend(
-    b: &TcpRouteRulesBackendRefs,
+pub(super) fn backend(
+    b: &BackendRef<'_>,
     route_ns: &str,
     services: &BTreeMap<ObjRef, &Service>,
 ) -> Result<Option<Backend>, Reject> {
-    let group = b.group.as_deref().unwrap_or("");
-    let kind = b.kind.as_deref().unwrap_or("Service");
+    let group = b.group.unwrap_or("");
+    let kind = b.kind.unwrap_or("Service");
     if !group.is_empty() || kind != "Service" {
         return Err(Reject::new(
             "InvalidKind",
@@ -300,7 +344,7 @@ fn backend(
             ),
         ));
     }
-    if let Some(ns) = b.namespace.as_deref().filter(|ns| *ns != route_ns) {
+    if let Some(ns) = b.namespace.filter(|ns| *ns != route_ns) {
         return Err(Reject::new(
             "RefNotPermitted",
             format!(
@@ -319,7 +363,7 @@ fn backend(
             format!("backend {:?} needs a port between 1 and 65535", b.name),
         ));
     };
-    let key = ObjRef::new(route_ns, &b.name);
+    let key = ObjRef::new(route_ns, b.name);
     let Some(svc) = services.get(&key) else {
         return Err(Reject::new(
             "BackendNotFound",

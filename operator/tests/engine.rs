@@ -14,10 +14,11 @@ use common::*;
 use iroh::{EndpointId, SecretKey};
 use iroh_gateway_edge::{Edge, EdgeHandle};
 use iroh_gateway_operator::engine::{Engine, EngineEvent, EngineOptions};
-use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::{Rendered, port_id, render};
+use iroh_gateway_operator::haproxy::{CERT_DIR, SecretFile, SupervisorOptions};
 use iroh_gateway_operator::model::{
-    Backend, EdgeModel, GatewayModel, ListenerModel, Model, ObjRef,
+    Backend, EdgeModel, GatewayModel, HeaderMods, HostMatch, HttpAction, HttpBackend, HttpPort,
+    HttpRule, ListenerModel, Model, ObjRef, PathMatch,
 };
 use iroh_gateway_operator::status::Facts;
 use iroh_gateway_operator::tunnel::{ListenerState, bind_endpoint};
@@ -91,6 +92,7 @@ impl World {
             name: format!("l{port}"),
             port,
             protocol: "TCP".into(),
+            hostname: HostMatch::Any,
             accepted: Ok(()),
             conflicted: None,
             resolved_refs: Ok(()),
@@ -103,6 +105,7 @@ impl World {
                 port: backend.port(),
                 weight: 1,
             }],
+            certificates: Vec::new(),
         }
     }
 
@@ -124,6 +127,7 @@ impl World {
                         .collect(),
                     addresses: vec![],
                     addresses_dropped: 0,
+                    http_ports: Vec::new(),
                 })
                 .collect(),
             edges: edges
@@ -582,6 +586,35 @@ async fn start_fails_and_leaves_nothing_when_haproxy_cannot_start() {
 }
 
 #[tokio::test]
+async fn start_refuses_an_initial_configuration_with_files() {
+    let w = World::new().await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let initial = with_cert(
+        &w,
+        w.plan(&[("gw", &[p])], &[at("e", "gw", &edge)]),
+        "a.pem",
+    );
+    assert_eq!(initial.files.len(), 1, "precondition");
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let err = Engine::start(endpoint, w.options(), initial)
+        .await
+        .err()
+        .expect("start succeeded with files in the initial configuration");
+    assert!(
+        format!("{err:#}").contains("the initial configuration must not name files"),
+        "{err:#}"
+    );
+    // Nothing was started: no socket, no file, and the edge never opens p.
+    assert_eq!(sockets_in(w.dir.path()), Vec::<PathBuf>::new());
+    assert!(!w.dir.path().join(CERT_DIR).join("a.pem").exists());
+    stays_refused(p, Duration::from_millis(500)).await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_reload_is_retried() {
     let w = World::new().await;
     let p = free_tcp_port();
@@ -607,6 +640,126 @@ async fn failed_reload_is_retried() {
     assert!(w.socket("gw", q).exists());
     // Succeeded: no retry is pending any more.
     assert!(timeout(RETRY * 3, changed(&mut engine)).await.is_err());
+    engine.shutdown().await;
+}
+
+/// Applies `rendered`, which must fail, and returns how long until the engine asks for a retry.
+async fn failed_then_waited(engine: &mut Engine, rendered: Rendered) -> Duration {
+    engine.apply(rendered).await;
+    assert!(engine.facts().haproxy.is_err());
+    let failed_at = Instant::now();
+    timeout(STEP, changed(engine))
+        .await
+        .expect("no retry after a failed reload");
+    failed_at.elapsed()
+}
+
+#[tokio::test]
+async fn retry_after_failed_reloads_backs_off_and_resets() {
+    let base = Duration::from_millis(200);
+    let w = World::new().await;
+    let p = free_tcp_port();
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let mut opts = w.options();
+    opts.retry = base;
+    let mut engine = Engine::start(endpoint, opts, w.plan(&[("gw", &[p])], &[]))
+        .await
+        .unwrap();
+    let master = w.dir.path().join("master.sock");
+    let away = w.dir.path().join("master.away");
+    let q = free_tcp_port();
+    let next = || w.plan(&[("gw", &[p, q])], &[]);
+    std::fs::rename(&master, &away).unwrap();
+    let mut gaps = Vec::new();
+    for _ in 0..3 {
+        gaps.push(failed_then_waited(&mut engine, next()).await);
+    }
+    // 200 ms, 400 ms, 800 ms: each at least its due time, and each longer than the one before.
+    for (gap, due) in gaps.iter().zip([base, base * 2, base * 4]) {
+        assert!(*gap >= due - Duration::from_millis(20), "{gaps:?}");
+    }
+    assert!(gaps[0] < gaps[1] && gaps[1] < gaps[2], "{gaps:?}");
+
+    // A success resets the delay: the next failure is retried after the base delay again.
+    std::fs::rename(&away, &master).unwrap();
+    engine.apply(next()).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    std::fs::rename(&master, &away).unwrap();
+    let gap = failed_then_waited(&mut engine, w.plan(&[("gw", &[q])], &[])).await;
+    assert!(gap >= base - Duration::from_millis(20), "{gap:?}");
+    assert!(gap < base * 2, "the delay was not reset: {gap:?}");
+    std::fs::rename(&away, &master).unwrap();
+    engine.shutdown().await;
+}
+
+/// `rendered` with a frontend that binds `<dir>/s/tls.sock` with `ssl crt <dir>/certs/<name>`,
+/// and the file that line names.
+fn with_cert(w: &World, mut rendered: Rendered, name: &str) -> Rendered {
+    let d = w.dir.path().display();
+    rendered.haproxy_cfg.push_str(&format!(
+        "\nfrontend tls\n\
+         \x20   bind unix@{d}/s/tls.sock ssl crt {d}/{CERT_DIR}/{name} mode 600\n\
+         \x20   tcp-request connection reject\n"
+    ));
+    rendered.files.push(SecretFile {
+        name: name.to_owned(),
+        contents: certificate_with_key(),
+    });
+    rendered
+}
+
+#[tokio::test]
+async fn engine_passes_files_to_haproxy() {
+    let w = World::new().await;
+    let p = free_tcp_port();
+    let mut engine = w.start(w.plan(&[("gw", &[p])], &[])).await;
+    let rendered = with_cert(&w, w.plan(&[("gw", &[p])], &[]), "a.pem");
+    // Without its file, the configuration is refused.
+    let mut without = rendered.clone();
+    without.files.clear();
+    engine.apply(without).await;
+    let err = engine.facts().haproxy.unwrap_err();
+    assert!(err.contains("a.pem"), "{err}");
+
+    engine.apply(rendered.clone()).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(
+        std::fs::read_to_string(w.dir.path().join(CERT_DIR).join("a.pem")).unwrap(),
+        rendered.files[0].contents
+    );
+    assert!(w.dir.path().join("s").join("tls.sock").exists());
+    engine.shutdown().await;
+    assert!(!w.dir.path().join(CERT_DIR).join("a.pem").exists());
+}
+
+#[tokio::test]
+async fn retry_after_a_failed_reload_passes_the_files_again() {
+    let w = World::new().await;
+    let p = free_tcp_port();
+    let mut engine = w.start(w.plan(&[("gw", &[p])], &[])).await;
+    let master = w.dir.path().join("master.sock");
+    let away = w.dir.path().join("master.away");
+    std::fs::rename(&master, &away).unwrap();
+    let rendered = with_cert(&w, w.plan(&[("gw", &[p])], &[]), "a.pem");
+    let cert = w.dir.path().join(CERT_DIR).join("a.pem");
+    engine.apply(rendered.clone()).await;
+    assert!(engine.facts().haproxy.is_err());
+    // The reload certainly failed, so the file the refused configuration named is gone.
+    assert!(!cert.exists());
+
+    timeout(STEP, changed(&mut engine))
+        .await
+        .expect("no retry after a failed reload");
+    std::fs::rename(&away, &master).unwrap();
+    engine.apply(rendered.clone()).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(
+        std::fs::read_to_string(&cert).unwrap(),
+        rendered.files[0].contents
+    );
+    assert!(w.dir.path().join("s").join("tls.sock").exists());
     engine.shutdown().await;
 }
 
@@ -843,6 +996,247 @@ async fn failed_apply_that_moves_an_edge_closes_its_port() {
     assert_eq!(engine.facts().haproxy, Ok(()));
     wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
     assert_eq!(tag_on(p).await, b"B");
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+// ---- HTTP ports ----
+
+/// An HTTP server on loopback that answers every request with 200 and the body `tag`.
+async fn http_backend(tag: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    tag.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.write_all(tag).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// An HTTP port `port` that sends every request to `backend`.
+fn http_port(port: u16, backend: SocketAddr) -> HttpPort {
+    HttpPort {
+        port,
+        tls: None,
+        rules: vec![HttpRule {
+            host: HostMatch::Any,
+            path: PathMatch::Prefix("/".into()),
+            method: None,
+            headers: Vec::new(),
+            backend: 0,
+        }],
+        backends: vec![HttpBackend {
+            route: key("r"),
+            rule: 0,
+            request_headers: HeaderMods::default(),
+            response_headers: HeaderMods::default(),
+            action: HttpAction::Forward(vec![Backend {
+                service: key("web"),
+                ip: "127.0.0.1".parse().unwrap(),
+                port: backend.port(),
+                weight: 1,
+            }]),
+        }],
+    }
+}
+
+impl World {
+    /// [`World::plan`] of gateway `gw` with TCP ports `tcp` and the HTTP ports `http`.
+    fn http_plan(&self, tcp: &[u16], http: Vec<HttpPort>, edges: &[EdgeSpec<'_>]) -> Rendered {
+        let mut model = self.model(&[("gw", tcp)], edges);
+        model.gateways[0].http_ports = http;
+        render(&model, self.dir.path())
+    }
+}
+
+/// A GET to `port`: the body of the answer, or `None` when the visitor is cut off.
+async fn http_get(port: u16) -> Option<Vec<u8>> {
+    let mut v = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    v.write_all(b"GET / HTTP/1.1\r\nHost: a.example.com\r\nConnection: close\r\n\r\n")
+        .await
+        .ok()?;
+    let mut raw = Vec::new();
+    let _ = timeout(STEP, v.read_to_end(&mut raw))
+        .await
+        .expect("no answer in time");
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    Some(raw[at + 4..].to_vec())
+}
+
+#[tokio::test]
+async fn http_port_keeps_serving_while_its_rules_change() {
+    let w = World::new().await;
+    let (a, b) = (http_backend(b"A").await, http_backend(b"B").await);
+    let tools = short_dir();
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let edges = [at("e", "gw", &edge)];
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let mut opts = w.options();
+    opts.supervisor.haproxy_bin = slow_check_haproxy(tools.path());
+    let mut engine = Engine::start(
+        endpoint,
+        opts,
+        w.http_plan(&[], vec![http_port(p, a)], &edges),
+    )
+    .await
+    .unwrap();
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(http_get(p).await.as_deref(), Some(&b"A"[..]));
+
+    // The port's rules change, so its fingerprint does; its socket stays.
+    let next = w.http_plan(&[], vec![http_port(p, b)], &edges);
+    let before = w.http_plan(&[], vec![http_port(p, a)], &edges);
+    let (old, new) = (
+        &before.edges[0].sockets[&tcp(p)],
+        &next.edges[0].sockets[&tcp(p)],
+    );
+    assert_eq!(old.socket, new.socket);
+    assert_ne!(old.fingerprint, new.fingerprint);
+    std::fs::write(tools.path().join("slow"), "").unwrap();
+    let during = async {
+        // Well inside the second `haproxy -c` takes: the old configuration still runs.
+        sleep(Duration::from_millis(400)).await;
+        http_get(p).await
+    };
+    let ((), seen) = tokio::join!(engine.apply(next), during);
+    assert_eq!(
+        seen.as_deref(),
+        Some(&b"A"[..]),
+        "a visitor during the reload was not served by the old rules"
+    );
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(http_get(p).await.as_deref(), Some(&b"B"[..]));
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_port_keeps_serving_after_a_refused_configuration() {
+    let w = World::new().await;
+    let (a, b) = (http_backend(b"A").await, http_backend(b"B").await);
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let edges = [at("e", "gw", &edge)];
+    let mut engine = w
+        .start(w.http_plan(&[], vec![http_port(p, a)], &edges))
+        .await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(http_get(p).await.as_deref(), Some(&b"A"[..]));
+
+    let mut bad = w.http_plan(&[], vec![http_port(p, b)], &edges);
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    assert!(engine.facts().haproxy.is_err());
+    // Still asked of the edge, and served by the rules HAProxy last loaded.
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(http_get(p).await.as_deref(), Some(&b"A"[..]));
+    // And after a second change while the configuration is still refused.
+    let mut worse = w.http_plan(&[], vec![http_port(p, w.echo)], &edges);
+    worse.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(worse).await;
+    assert!(engine.facts().haproxy.is_err());
+    assert_eq!(http_get(p).await.as_deref(), Some(&b"A"[..]));
+
+    engine
+        .apply(w.http_plan(&[], vec![http_port(p, b)], &edges))
+        .await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(http_get(p).await.as_deref(), Some(&b"B"[..]));
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_port_still_closes_when_its_backend_changes_in_a_failed_apply() {
+    let w = World::with_tagged(&[("gw", b"T")]).await;
+    let other = tagged_echo(b"U").await;
+    let a = http_backend(b"A").await;
+    let edge = w.edge().await;
+    let (t, h) = (free_tcp_port(), free_tcp_port());
+    let edges = [at("e", "gw", &edge)];
+    let mut engine = w
+        .start(w.http_plan(&[t], vec![http_port(h, a)], &edges))
+        .await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[t, h])).await;
+    assert_eq!(tag_on(t).await, b"T");
+
+    // The TCP port gets another backend behind the same socket; the HTTP port stays as it is.
+    let mut model = w.model(&[("gw", &[t])], &edges);
+    model.gateways[0].listeners[0].backends[0].port = other.port();
+    model.gateways[0].http_ports = vec![http_port(h, a)];
+    let mut bad = render(&model, w.dir.path());
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    assert!(engine.facts().haproxy.is_err());
+    refused(t).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[h])).await;
+    assert_eq!(http_get(h).await.as_deref(), Some(&b"A"[..]));
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn port_that_changes_kind_is_cut() {
+    let w = World::with_tagged(&[("gw", b"T")]).await;
+    let a = http_backend(b"A").await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let edges = [at("e", "gw", &edge)];
+    let tcp_plan = w.http_plan(&[p], vec![], &edges);
+    let http_plan = w.http_plan(&[], vec![http_port(p, a)], &edges);
+    // One key and one socket in both plans; one TCP, the other HTTP.
+    let (as_tcp, as_http) = (
+        &tcp_plan.edges[0].sockets[&tcp(p)],
+        &http_plan.edges[0].sockets[&tcp(p)],
+    );
+    assert_eq!(as_tcp.socket, as_http.socket);
+    assert!(!as_tcp.shared && as_http.shared);
+
+    // TCP loaded, HTTP refused: cut.
+    let mut engine = w.start(tcp_plan.clone()).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(tag_on(p).await, b"T");
+    let mut bad = http_plan.clone();
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    assert!(engine.facts().haproxy.is_err());
+    refused(p).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[])).await;
+
+    // HTTP loaded, TCP refused: cut too.
+    engine.apply(http_plan).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    assert_eq!(http_get(p).await.as_deref(), Some(&b"A"[..]));
+    let mut bad = tcp_plan;
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    assert!(engine.facts().haproxy.is_err());
+    refused(p).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[])).await;
     engine.shutdown().await;
     edge.shutdown().await;
 }

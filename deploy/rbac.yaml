@@ -3,9 +3,9 @@ kind: ClusterRole
 metadata:
   name: iroh-gateway-operator
 rules:
-  # Everything the operator watches. Secrets are deliberately absent here.
+  # Everything the operator watches cluster-wide. Secrets are deliberately absent here.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "tcproutes"]
+    resources: ["gatewayclasses", "gateways", "tcproutes", "httproutes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.fables-for-robots.ch"]
     resources: ["edges"]
@@ -15,7 +15,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # Status is written as a JSON merge patch, and only so.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status", "tcproutes/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "tcproutes/status", "httproutes/status"]
     verbs: ["patch"]
   - apiGroups: ["gateway.fables-for-robots.ch"]
     resources: ["edges/status"]
@@ -34,8 +34,15 @@ subjects:
     name: iroh-gateway-operator
     namespace: iroh-gateway
 ---
-# The operator's own key lives in a Secret it creates on first start. It may read only that
-# Secret; a create cannot be limited to a name.
+# The operator's own key lives in a Secret it creates on first start. It may get only that
+# Secret by name; a create cannot be limited to a name.
+#
+# HTTPS listeners take their certificates from Secrets of type kubernetes.io/tls in the Gateway's
+# own namespace, which the operator watches in every namespace it serves Gateways in. It asks
+# only for that type, but `list` and `watch` cannot be limited to a type: with
+# them the operator can read every Secret of this namespace. Serving Gateways in another
+# namespace (--gateway-namespaces) needs the same `list` and `watch` rule in a Role there, and
+# grants the same; without it the operator waits, warning every 30 s, and applies nothing.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -49,6 +56,9 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

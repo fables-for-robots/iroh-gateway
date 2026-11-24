@@ -1,7 +1,7 @@
 # iroh-gateway — Design
 
 Date: 2026-11-23
-Status: approved design, pre-implementation
+Status: approved design; build steps 1 to 3 are built (see "Build order")
 
 ## Overview
 
@@ -297,27 +297,75 @@ control.
   `certificateRefs` to `kubernetes.io/tls` Secrets), `TCP`, `UDP`.
 - `HTTPRoute`: hostnames; matches on path (`Exact`, `PathPrefix`), headers
   (exact) and method; weighted `backendRefs`; rule filters
-  `RequestRedirect`, `RequestHeaderModifier`, `ResponseHeaderModifier`.
+  `RequestRedirect` (scheme, hostname, port, status code),
+  `RequestHeaderModifier`, `ResponseHeaderModifier`.
 - `TCPRoute` and `UDPRoute`: weighted `backendRefs`.
 - Backends are `Service` references only.
 
 Rules:
 
+- An `HTTPRoute` that uses anything the operator cannot honour is refused
+  whole: `Accepted=False`, reason `UnsupportedValue`, with a message naming
+  the rule and the first such thing. Nothing is silently ignored, because an
+  ignored match would send requests somewhere the author did not intend.
+  Besides everything outside the list above (regular expressions,
+  `queryParams`, `URLRewrite`, mirroring, CORS, extension filters, redirect
+  paths, `backendRef` filters, timeouts, retries), this refuses: two filters
+  of one type in a rule; a redirect beside `backendRefs`; a filter that
+  carries another filter type's settings; a redirect status code other than
+  301, 302, 303, 307 or 308; a header name outside `[A-Za-z0-9_-]`; an empty
+  header value, in a match or a header filter; an empty `hostnames` entry
+  (for a route it would widen the route to every host of the listener); a
+  path with a space, `#` or `?`, which can never match (HAProxy answers 400
+  to a request target with a space or `#`, and the query is not part of the
+  path); more than 16 header matches in one match; a control character in a
+  path, header value or hostname.
+- A `RequestHeaderModifier` beside a redirect is accepted and has no effect,
+  since no request is forwarded. A `ResponseHeaderModifier` applies to every
+  answer of its rule, a redirect and a 500 included.
+- Paths are matched as the request sends them, without normalising `..` or
+  repeated slashes: `/public/../admin` matches a `/public` prefix. A `Host`
+  with a trailing dot matches no listener or route hostname, only rules for
+  any host. A listener's `tls.options`, and
+  `tls` on an `HTTP` listener, are ignored.
+- An `HTTPRoute` with no rules attaches and answers 404.
 - Route precedence follows the Gateway API specification (hostname
   specificity, then exact path, longest prefix, method, header count, then
-  oldest route, then name).
+  oldest route, then namespace and name). Of two rules with the same host
+  and match, only the first counts.
 - `allowedRoutes` (namespaces `Same`/`All`/`Selector`, kinds) is enforced.
+  A `kinds` list that names a kind the listener's protocol does not support
+  gives `ResolvedRefs=False`, reason `InvalidRouteKinds`, while the listener
+  keeps working with the kinds it supports.
 - All cross-namespace `backendRefs` and `certificateRefs` are refused with
   `ResolvedRefs=False`, reason `RefNotPermitted`. `ReferenceGrant` comes
   later; refusing is the safe subset.
 - One protocol family per port on a Gateway. `HTTPS` listeners with
   different hostnames may share a port; so may `HTTP` listeners. Any other
   mix on one port is `Conflicted`.
+- Listeners that share a port share one rule list, but a more specific
+  listener owns its hostname against the routes of less specific listeners
+  on that port: a route host reached through a listener gives no rule when
+  another listener of the port, accepted and not conflicted (serving or
+  not), has a more specific hostname (in the precedence order of hosts) that
+  the host falls under. With listeners `*.example.com` and
+  `foo.example.com`, a route of the wildcard listener that names
+  `foo.example.com` gets no rule for it, and keeps its rules for
+  `*.example.com` and other hosts. The route stays `Accepted`. What remains:
+  a request for `foo.example.com` that matches none of that listener's
+  rules can still be answered by a rule for `*.example.com` or for any host
+  on the same port (closing that needs negated host conditions). Listener
+  isolation, an optional feature of the Gateway API, is therefore still not
+  provided.
 - A listener may not use the edge's iroh port.
 - A TCP listener carries one `TCPRoute`. If several attach, the oldest
   wins and the others are not accepted.
-- An edge opens a listener's port only once the listener has a route with at
-  least one usable backend. Until then visitors get a refused connection.
+- An edge opens a `TCP` listener's port only once the listener has a route
+  with at least one usable backend. An `HTTP` or `HTTPS` port opens once a
+  route is attached to one of its listeners, because a route can answer
+  without a backend (a redirect, or 500 for a rule whose backends are all
+  unusable); an `HTTPS` listener also needs usable certificates. Until then
+  visitors get a refused connection.
 - A backend that cannot be used is left out and its share of traffic goes
   to the others. (The Gateway API asks for that share to be refused. This
   is a known deviation for now.)
@@ -391,13 +439,53 @@ status:
 - Text that comes from an edge (its version, its bind errors) is cut to 256
   bytes and stripped of control characters before it is written to status.
 
+### Certificates
+
+An `HTTPS` listener takes its certificates from `kubernetes.io/tls` Secrets
+in the Gateway's namespace; a reference to another namespace is
+`RefNotPermitted`. Certificates are checked only for accepted `HTTPS`
+listeners of Gateways in a served namespace, with rustls, before anything
+reaches HAProxy:
+
+- `tls.crt` must hold at least one certificate and no private key (a
+  `tls.crt` with a key is refused with a message saying so), and every
+  certificate in it must parse (`certificate <n> in tls.crt cannot be
+  read`); `tls.key` exactly one private key.
+- The key must be one rustls with ring can sign with: RSA of 2048 to 4096
+  bits, ECDSA P-256 or P-384, or Ed25519; and it must belong to the first
+  certificate.
+- Every other problem gives the listener `ResolvedRefs=False`, reason
+  `InvalidCertificateRef`; either way the listener is `Programmed=False` and
+  serves nothing. A message is built from the Secret's name and fixed text,
+  never from its data. One unusable certificate affects only the listener
+  that refers to it.
+
+The certificate files are not a copy of the Secret. The operator writes only
+the certificates and the one private key it parsed and checked, re-encoded
+as PEM, so HAProxy reads exactly what was checked; comments and other blocks
+in the Secret are not passed on. An EC key in SEC1 form is written as
+PKCS#8, wrapped with the algorithm of the curve ring confirmed, and checked
+again in that form: OpenSSL does not read a SEC1 key without its optional
+curve parameters, which ring accepts. A file is named after the Secret and the
+first 16 hex characters of the SHA-256 of its content
+(`<namespace>.<name>.<hash>.pem`), and each `HTTPS` port lists its files in
+a crt-list named after its content in turn. A renewed certificate therefore
+changes the configuration text, and the existing rule "reload when the text
+changes" covers rotation. A certificate that passes these checks but that
+HAProxy still refuses fails the whole reload; the `Programmed=False`
+message of every accepted Gateway then carries HAProxy's message, which
+names the file.
+
 ### Where Gateways may live
 
 The operator honours `Gateway` and `Edge` resources only in namespaces named
 in its configuration (chart value `gatewayNamespaces`, default: its own
-namespace). Its Secret read access is granted per namespace by `Role`, only
-there. Routes and Services are read cluster-wide. This keeps a
-cluster-wide Secret read out of the operator's permissions.
+namespace). It watches Secrets only in those namespaces, and requests only
+those of type `kubernetes.io/tls`. Its Secret read access is granted per
+namespace by `Role`, only there; routes and Services are read cluster-wide.
+This keeps a cluster-wide Secret read out of the operator's permissions.
+Within a gateway namespace, though, `list` and `watch` cannot be limited to
+a Secret type, so the operator can read every Secret of that namespace.
 
 ### Status
 
@@ -502,12 +590,23 @@ An edge that sends a stream or datagram for a listener id not in its current
 - One frontend per (Gateway, port), bound to a unix socket with
   `accept-proxy`. HAProxy binds no TCP port for traffic, so nothing in the
   cluster can bypass the tunnel or forge a PROXY header.
-- `HTTPS` ports bind with all certificates of the listeners on that port,
-  strict SNI, TLS 1.2 minimum, ALPN `h2,http/1.1`. Certificates are written
-  from Secrets to a memory-backed directory, mode 0600.
+- `HTTPS` ports bind with all certificates of the serving listeners on that
+  port, through a crt-list, strict SNI, TLS 1.2 minimum, ALPN
+  `h2,http/1.1`. The files (see "Certificates") are written to
+  `<runtime-dir>/haproxy/certs`, a directory of mode 0700 in a memory-backed
+  volume, each file of mode 0600, before the configuration is validated.
+  Files no loaded configuration names are removed after a successful apply,
+  and all of them when HAProxy stops.
 - `HTTP`/`HTTPS` frontends select a backend by host and match rules, emitted
   in precedence order. Each route rule becomes its own backend section,
-  which carries that rule's filters and its weighted servers.
+  which carries that rule's filters and its weighted servers. A request no
+  rule matches gets 404.
+- Every string from a route is quoted before it reaches the configuration,
+  and each match condition is a named ACL declared on its own line; no
+  resource string stands inside an anonymous `{ … }` ACL, where a value of
+  `}` would end it. A route cannot change the configuration's structure.
+  Header names, which cannot be quoted inside a sample fetch, only ever
+  contain `[A-Za-z0-9_-]`.
 - `TCP` ports are TCP-mode frontends with one backend. The visitor address
   is logged but not passed on to the backend.
 - HAProxy runs in `<runtime-dir>/haproxy`, a directory the operator creates
@@ -515,8 +614,14 @@ An edge that sends a stream or datagram for a listener id not in its current
   else, as an `emptyDir` does. Unix socket paths are short, so the runtime
   directory's path may be at most 60 bytes.
 - Global limits: `maxconn 8192`; `timeout client` and `timeout server` of
-  1 h, so a connection that is idle for an hour is closed.
-- `X-Forwarded-For` and `X-Forwarded-Proto` are set. WebSockets work.
+  1 h, so a connection that is idle for an hour is closed; a TLS handshake
+  must complete within 10 s (`timeout client-hs`).
+- `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` (the request's
+  `Host`) and `X-Forwarded-Port` (the port the visitor connected to) are
+  set, replacing whatever the visitor sent; `Forwarded` and `X-Real-IP` from
+  the visitor are removed. WebSockets work.
+- Response header filters are `http-after-response` rules, so they also
+  apply to the answers HAProxy makes itself: redirects and 500s.
 - Access logs go to stdout.
 
 ### Backends
@@ -537,6 +642,15 @@ resources ──▶ model (gateways, ports, rules, backends, statuses)
 model ──▶ haproxy.cfg + certificate files + edge listener lists + UDP table
 ```
 
+Nothing is applied before every watch has listed once. While some have not
+(a CRD is missing, or the operator may not list Secrets in a gateway
+namespace), the operator logs every 30 s which lists are missing. Routes
+are watched so that one the operator's types cannot read is left out of the
+snapshot and logged by namespace and name, instead of failing the whole
+list. `Gateway`s, `GatewayClass`es and `Edge`s are not: an unreadable one
+holds up the first list, and afterwards its kind stays as last read, since
+a stale but serving state is safer than dropping a Gateway.
+
 Applying a new render:
 
 1. Changes are coalesced for a short interval.
@@ -547,25 +661,40 @@ Applying a new render:
    a hard-stop limit passes.
 4. If invalid, the running configuration stays, the affected Gateways go
    `Programmed=False` with the validator's message, and a metric counts it.
-5. If the reload itself fails or its outcome is lost, the operator no longer
-   assumes which configuration is live and tries the same render again
-   every 5 s.
+5. If HAProxy answers that the reload failed, the previous configuration is
+   written back and reloaded once: after a failed reload, HAProxy's master
+   re-executes without its listening sockets on the next failure, so two
+   failures in a row would leave every socket refusing connections. If that
+   reload does not succeed either, or the outcome of a reload is lost, the
+   operator no longer assumes which configuration is live.
+6. After a failed reload the operator tries again after 5 s, then after
+   twice as long each time, up to 5 minutes; a successful apply resets the
+   delay.
 
 Edge listener lists and the UDP table are applied after HAProxy is ready
 for them, so an edge never opens a port that has nothing behind it. Ports
-that the new render removes or re-points stop accepting streams before
-HAProxy is reloaded.
+that the new render removes or re-points, and `TCP` ports whose backend
+changes, stop accepting streams before HAProxy is reloaded.
 
-After an apply that failed, an edge keeps a port only if nothing behind it
-changed: the same listener, the same socket and the same frontend and
-backend text as the last configuration HAProxy loaded. Otherwise the port
-closes until an apply succeeds. A port must never keep serving a backend
-the cluster no longer assigns to it.
+During an apply and after one that failed, an edge keeps a port only if it
+keeps the same listener and the same socket as the last configuration
+HAProxy loaded, and either the same frontend and backend text or, for an
+`HTTP` or `HTTPS` port, is such a port in both. A `TCP` port whose backend
+changed closes until an apply succeeds: it must never keep serving a backend
+the cluster no longer assigns to it. An `HTTP` or `HTTPS` port serves many
+routes and hosts, so it keeps forwarding to HAProxy's socket, which serves
+the rules HAProxy last loaded: a route that was changed or deleted stays
+served by its old rules until a configuration loads, with
+`Programmed=False` on the Gateway meanwhile. Closing it instead would take
+every host of the port down for one route's change. It closes when it
+leaves the plan, changes socket, or becomes a `TCP` port.
 
 **Known limit: long-lived connections.** Any change to a serving listener's
-route or backends, in any namespace, reloads HAProxy. A connection that is
+routes, backends or certificates, in any namespace, reloads HAProxy. A connection that is
 still open 30 minutes after a reload (`hard-stop-after 30m`), or after 50
-further reloads (`mworker-max-reloads 50`), is closed. SSH and database
+further reloads (`mworker-max-reloads 50`), is closed. A refused reload
+counts twice, since the previous configuration is reloaded after it; the
+retry delay grows so that a failure that persists reloads rarely. SSH and database
 sessions notice this. The real fix is to change backends through HAProxy's
 runtime API without reloading; that is later work.
 
@@ -580,9 +709,11 @@ runtime API without reloading; that is later work.
   CRD, a `GatewayClass`, an optional `NetworkPolicy`, metrics Service.
   Gateway API CRDs are a prerequisite, not bundled. Until the chart exists
   (build step 5) the same objects ship as plain manifests in `deploy/`.
-- **Operator permissions.** In its own namespace the operator may `get` only
-  its identity Secret, by name, and `create` Secrets. On status
-  subresources it may only `patch`.
+- **Operator permissions.** In its own namespace the operator may `get` its
+  identity Secret, by name, and `create` Secrets. In every gateway
+  namespace a `Role` lets it `list` and `watch` Secrets, for certificates;
+  that cannot be limited to a type, so it can read every Secret there. On
+  status subresources it may only `patch`.
 - **Operator resources.** Memory request 128 Mi, limit 1 Gi, sized for one
   edge (see the tunnel protocol's memory bound).
 - **Edge.** Static Linux binaries for x86_64 and aarch64, a hardened systemd
@@ -594,7 +725,8 @@ runtime API without reloading; that is later work.
 - **Toolchain.** Rust 1.100 (`rust-version = "1.100"`). nixpkgs 26.05 ships
   1.95 and unstable 1.99, so the flake takes the toolchain from
   `oxalica/rust-overlay`, pinned by a `rust-toolchain.toml`.
-- **Flake** dev shell: that toolchain, `haproxy`, `kind`, `kubectl`, `helm`.
+- **Flake** dev shell: that toolchain, `haproxy`, `kind`, `kubectl`, `helm`,
+  and `openssl`, which the HTTPS tests use to make RSA and SEC1 keys.
 - **License** AGPL-3.0-or-later, as the sibling projects.
 
 ## Observability
@@ -619,21 +751,22 @@ HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
   `kube-apiserver` and `etcd` (envtest) with the upstream Gateway API CRDs
   installed, so the API server's own validation rules apply to every status
   the operator writes. No nodes, no pods.
-- **End to end.** A kind cluster with the chart installed and an edge
-  process outside it: HTTP, HTTPS with a test certificate, TCP and UDP
-  requests through the edge to in-cluster echo services, and status
-  assertions on `Gateway`, routes and `Edge`.
+- **End to end.** A kind cluster with the manifests installed (the chart
+  once it exists) and the edge as a pod: TCP, HTTP, an HTTP redirect, HTTPS
+  with a test certificate and its rotation, and later UDP, requests through
+  the edge to in-cluster services, and status assertions on `Gateway`,
+  routes and `Edge`.
 
 ## Build order
 
-Each step ends in something that runs.
+Each step ends in something that runs. Steps 1 to 3 are built.
 
 1. Tunnel with static configuration: `proto`, edge, operator-side endpoint,
-   TCP forwarding to a fixed target. No Kubernetes.
+   TCP forwarding to a fixed target. No Kubernetes. (Built.)
 2. Controller skeleton: `Edge` CRD, `GatewayClass`, `Gateway`, `TCPRoute`,
-   HAProxy supervision, status. Raw TCP works in a cluster.
+   HAProxy supervision, status. Raw TCP works in a cluster. (Built.)
 3. HTTP and HTTPS: `HTTPRoute`, TLS termination, redirects and header
-   filters.
+   filters. (Built.)
 4. UDP: datagram protocol with fragmentation, `UDPRoute`.
 5. Packaging and docs: chart, image, edge releases, NixOS module, README
    with a walkthrough including cert-manager and external-dns.

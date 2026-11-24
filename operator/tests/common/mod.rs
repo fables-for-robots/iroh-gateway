@@ -36,6 +36,17 @@ pub fn short_dir() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// A fresh self-signed certificate for `app.example.com` followed by its private key, as PEM:
+/// what HAProxy's `crt` reads.
+pub fn certificate_with_key() -> String {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["app.example.com".to_owned()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    format!("{}{}", cert.pem(), key.serialize_pem())
+}
+
 pub fn free_tcp_port() -> u16 {
     let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     s.local_addr().unwrap().port()

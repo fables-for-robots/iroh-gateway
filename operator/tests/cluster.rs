@@ -14,7 +14,8 @@ use std::time::Duration;
 use common::envtest::Envtest;
 use common::{edge_options, free_tcp_port, refused, short_dir};
 use gateway_api::gatewayclasses::v1::GatewayClass;
-use gateway_api::gateways::v1::Gateway;
+use gateway_api::gateways::v1::{Gateway, GatewayStatusListeners};
+use gateway_api::httproutes::v1::HttpRoute;
 use gateway_api::tcproutes::v1::TcpRoute;
 use iroh::SecretKey;
 use iroh_gateway_edge::{Edge as EdgeProcess, EdgeHandle};
@@ -84,7 +85,7 @@ impl Operator {
         )
         .await
         .unwrap();
-        let stores = Stores::start(client.clone());
+        let stores = Stores::start(client.clone(), &settings.gateway_namespaces);
         let writer = StatusWriter::new(client.clone(), CONTROLLER.into());
         let opts = ControllerOptions::new(settings, dir.path());
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
@@ -772,6 +773,551 @@ async fn seventeen_edges_give_sixteen_addresses() {
     operator.stop().await;
 }
 
+/// Gateway `public` in `NS` of class `iroh` with `listeners`.
+async fn gateway_with(client: &Client, listeners: Value) {
+    create::<Gateway>(
+        &api(client, NS),
+        json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": { "name": "public", "namespace": NS },
+            "spec": { "gatewayClassName": "iroh", "listeners": listeners },
+        }),
+    )
+    .await;
+}
+
+/// Service `web` in `NS`, on port 80.
+async fn web_service(client: &Client) {
+    create::<Service>(
+        &api(client, NS),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "web", "namespace": NS },
+            "spec": { "ports": [{ "port": 80 }] },
+        }),
+    )
+    .await;
+}
+
+/// Rules that send everything to Service `web`.
+fn web_rules() -> Value {
+    json!([{ "backendRefs": [{ "name": "web", "port": 80 }] }])
+}
+
+/// HTTPRoute `web` in `NS`, attached to Gateway `public`, with `rules`.
+async fn http_route(client: &Client, rules: Value) {
+    create::<HttpRoute>(
+        &api(client, NS),
+        json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": { "name": "web", "namespace": NS },
+            "spec": { "parentRefs": [{ "name": "public" }], "rules": rules },
+        }),
+    )
+    .await;
+}
+
+/// GatewayClass, namespace `gw`, Gateway `public` with one HTTP listener `web` on `port`,
+/// Service `web`, HTTPRoute `web` with `rules` and an Edge for `edge`.
+async fn http_world(env: &Envtest, edge: &EdgeHandle, port: u16, rules: Value) {
+    let client = &env.client;
+    env.namespace(NS).await;
+    class(client).await;
+    gateway_with(
+        client,
+        json!([{ "name": "web", "port": port, "protocol": "HTTP" }]),
+    )
+    .await;
+    web_service(client).await;
+    http_route(client, rules).await;
+    edge_object(client, NS, edge).await;
+}
+
+/// Ok when condition `type_` has `status` and `reason`.
+fn has_reason(
+    conditions: &[Condition],
+    type_: &str,
+    status: &str,
+    reason: &str,
+) -> Result<(), String> {
+    match condition(conditions, type_) {
+        Some(c) if c.status == status && c.reason == reason => Ok(()),
+        _ => Err(format!(
+            "wanted {type_}={status} {reason} in {conditions:?}"
+        )),
+    }
+}
+
+/// Listener `name` of Gateway `public`, once the Gateway is accepted.
+async fn listener(client: &Client, name: &str) -> Result<GatewayStatusListeners, String> {
+    let gw: Gateway = get(client, NS, "public").await;
+    let status = gw.status.unwrap_or_default();
+    has(
+        &status.conditions.unwrap_or_default(),
+        &[("Accepted", "True")],
+    )?;
+    let listeners = status.listeners.unwrap_or_default();
+    listeners
+        .iter()
+        .find(|l| l.name == name)
+        .cloned()
+        .ok_or_else(|| format!("no listener {name} in {listeners:?}"))
+}
+
+/// Ok when listener `name` has `attached` routes, supports exactly the route `kind` and has the
+/// `wanted` conditions.
+async fn listener_is(
+    client: &Client,
+    name: &str,
+    attached: i32,
+    kind: &str,
+    wanted: &[(&str, &str)],
+) -> Result<(), String> {
+    let l = listener(client, name).await?;
+    if l.attached_routes != attached {
+        return Err(format!("attachedRoutes {} of {name}", l.attached_routes));
+    }
+    let kinds: Vec<(Option<String>, String)> = l
+        .supported_kinds
+        .unwrap_or_default()
+        .into_iter()
+        .map(|k| (k.group, k.kind))
+        .collect();
+    if kinds
+        != [(
+            Some("gateway.networking.k8s.io".to_owned()),
+            kind.to_owned(),
+        )]
+    {
+        return Err(format!("supportedKinds {kinds:?} of {name}"));
+    }
+    has(&l.conditions, wanted)
+}
+
+/// The conditions of our only parent entry of HTTPRoute `web`.
+async fn http_route_parent(client: &Client) -> Result<Vec<Condition>, String> {
+    let route: HttpRoute = get(client, NS, "web").await;
+    let parents = route.status.map(|s| s.parents).unwrap_or_default();
+    let [parent] = parents.as_slice() else {
+        return Err(format!("parents {parents:?}"));
+    };
+    if parent.controller_name != CONTROLLER {
+        return Err(format!("controllerName {}", parent.controller_name));
+    }
+    if parent.parent_ref.name != "public" {
+        return Err(format!("parentRef {:?}", parent.parent_ref));
+    }
+    Ok(parent.conditions.clone())
+}
+
+/// Ok once `port` refuses connections.
+async fn closed(port: u16) -> Result<(), String> {
+    match connects(port).await {
+        Ok(()) => Err(format!("port {port} accepts")),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Waits until the HTTP listener `web` on `port` and HTTPRoute `web` are accepted and
+/// programmed, and the port serves.
+async fn http_programmed(client: &Client, port: u16) {
+    eventually("HTTP listener programmed", || async {
+        let gw: Gateway = get(client, NS, "public").await;
+        has(
+            &gw.status.and_then(|s| s.conditions).unwrap_or_default(),
+            &[("Accepted", "True"), ("Programmed", "True")],
+        )?;
+        listener_is(
+            client,
+            "web",
+            1,
+            "HTTPRoute",
+            &[
+                ("Accepted", "True"),
+                ("ResolvedRefs", "True"),
+                ("Programmed", "True"),
+            ],
+        )
+        .await
+    })
+    .await;
+    eventually("HTTPRoute parent accepted", || async {
+        has(
+            &http_route_parent(client).await?,
+            &[("Accepted", "True"), ("ResolvedRefs", "True")],
+        )
+    })
+    .await;
+    eventually("the HTTP port accepts", || connects(port)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn http_route_and_gateway_become_programmed() {
+    let env = Envtest::start().await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_port();
+    http_world(&env, &edge, port, web_rules()).await;
+    http_programmed(&env.client, port).await;
+    eventually("Edge programmed", || async {
+        let e: Edge = get(&env.client, NS, "e1").await;
+        has(
+            &e.status.unwrap_or_default().conditions,
+            &[("Connected", "True"), ("Programmed", "True")],
+        )
+    })
+    .await;
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn deleting_the_http_route_closes_the_port() {
+    let env = Envtest::start().await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_port();
+    http_world(&env, &edge, port, web_rules()).await;
+    http_programmed(&env.client, port).await;
+
+    api::<HttpRoute>(&env.client, NS)
+        .delete("web", &DeleteParams::default())
+        .await
+        .unwrap();
+    eventually("HTTP listener without routes", || async {
+        listener_is(&env.client, "web", 0, "HTTPRoute", &[("Accepted", "True")]).await
+    })
+    .await;
+    eventually("the HTTP port closed", || closed(port)).await;
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn unsupported_http_route_is_refused_with_a_reason() {
+    let env = Envtest::start().await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_port();
+    let rules = json!([{
+        "filters": [{
+            "type": "URLRewrite",
+            "urlRewrite": { "hostname": "elsewhere.example.com" },
+        }],
+        "backendRefs": [{ "name": "web", "port": 80 }],
+    }]);
+    http_world(&env, &edge, port, rules).await;
+
+    eventually("HTTPRoute refused", || async {
+        let conditions = http_route_parent(&env.client).await?;
+        has_reason(&conditions, "Accepted", "False", "UnsupportedValue")
+    })
+    .await;
+    eventually("HTTP listener without routes", || async {
+        listener_is(&env.client, "web", 0, "HTTPRoute", &[("Accepted", "True")]).await
+    })
+    .await;
+    // The edge was told nothing: give it time to open the port if it were going to.
+    sleep(Duration::from_secs(1)).await;
+    assert!(connects(port).await.is_err(), "port {port} opened");
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+/// Two different free ports, in no particular order.
+fn two_free_ports() -> (u16, u16) {
+    let a = free_tcp_port();
+    loop {
+        let b = free_tcp_port();
+        if b != a {
+            return (a, b);
+        }
+    }
+}
+
+/// A fresh self-signed certificate for `app.example.com` and its private key, as PEM.
+fn tls_pair() -> (String, String) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["app.example.com".to_owned()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    (cert.pem(), key.serialize_pem())
+}
+
+/// Secret `name` in `NS` of `type_` with `tls.crt` and `tls.key`.
+async fn tls_secret(client: &Client, name: &str, type_: &str, crt: &str, key: &str) {
+    create::<Secret>(
+        &api(client, NS),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": name, "namespace": NS },
+            "type": type_,
+            "stringData": { "tls.crt": crt, "tls.key": key },
+        }),
+    )
+    .await;
+}
+
+/// Replaces `tls.crt` and `tls.key` of Secret `name` in `NS`.
+async fn replace_tls(client: &Client, name: &str, crt: &str, key: &str) {
+    let patch = json!({ "stringData": { "tls.crt": crt, "tls.key": key } });
+    api::<Secret>(client, NS)
+        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .unwrap();
+}
+
+/// An HTTPS listener `name` on `port` with the certificate of Secret `secret`.
+fn https_listener(name: &str, port: u16, secret: &str) -> Value {
+    json!({
+        "name": name,
+        "port": port,
+        "protocol": "HTTPS",
+        "tls": { "mode": "Terminate", "certificateRefs": [{ "name": secret }] },
+    })
+}
+
+/// Every condition message of Gateway gw/public and of its listeners.
+async fn gateway_messages(client: &Client) -> Vec<String> {
+    let gw: Gateway = get(client, NS, "public").await;
+    let status = gw.status.unwrap_or_default();
+    let listeners = status.listeners.unwrap_or_default();
+    status
+        .conditions
+        .unwrap_or_default()
+        .iter()
+        .chain(listeners.iter().flat_map(|l| &l.conditions))
+        .map(|c| c.message.clone())
+        .collect()
+}
+
+/// Asserts that no condition message of gw/public or its listeners contains any of `secrets`
+/// or a PEM marker.
+async fn no_secret_in_gateway_status(client: &Client, secrets: &[&str]) {
+    let messages = gateway_messages(client).await;
+    assert!(!messages.is_empty());
+    for m in &messages {
+        assert!(!m.contains("-----") && !m.contains("PRIVATE KEY"), "{m}");
+        for s in secrets {
+            assert!(!m.contains(s), "{m}");
+        }
+    }
+}
+
+/// The base64 lines of a PEM text: every line that is not a marker.
+fn pem_lines(pem: &str) -> Vec<&str> {
+    pem.lines()
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn https_listener_follows_its_secret() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_port();
+    env.namespace(NS).await;
+    class(client).await;
+    let (crt, key) = tls_pair();
+    tls_secret(client, "site-tls", "kubernetes.io/tls", &crt, &key).await;
+    gateway_with(client, json!([https_listener("web", port, "site-tls")])).await;
+    web_service(client).await;
+    http_route(client, web_rules()).await;
+    edge_object(client, NS, &edge).await;
+
+    let valid = &[
+        ("Accepted", "True"),
+        ("ResolvedRefs", "True"),
+        ("Programmed", "True"),
+    ];
+    eventually("HTTPS listener programmed", || {
+        listener_is(client, "web", 1, "HTTPRoute", valid)
+    })
+    .await;
+    eventually("the HTTPS port accepts", || connects(port)).await;
+    no_secret_in_gateway_status(client, &pem_lines(&key)).await;
+
+    let (garbage_crt, garbage_key) = ("garbage-crt-q8x2v7", "garbage-key-q8x2v7");
+    replace_tls(client, "site-tls", garbage_crt, garbage_key).await;
+    eventually("HTTPS listener refused", || async {
+        let l = listener(client, "web").await?;
+        has_reason(
+            &l.conditions,
+            "ResolvedRefs",
+            "False",
+            "InvalidCertificateRef",
+        )?;
+        has(&l.conditions, &[("Programmed", "False")])
+    })
+    .await;
+    eventually("the HTTPS port closed", || closed(port)).await;
+    no_secret_in_gateway_status(client, &[garbage_crt, garbage_key, "q8x2v7"]).await;
+
+    let (crt, key) = tls_pair();
+    replace_tls(client, "site-tls", &crt, &key).await;
+    eventually("HTTPS listener programmed again", || {
+        listener_is(client, "web", 1, "HTTPRoute", valid)
+    })
+    .await;
+    eventually("the HTTPS port accepts again", || connects(port)).await;
+    no_secret_in_gateway_status(client, &pem_lines(&key)).await;
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn secret_of_another_type_is_not_read() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    env.namespace(NS).await;
+    class(client).await;
+    let (crt, key) = tls_pair();
+    tls_secret(client, "site-tls", "Opaque", &crt, &key).await;
+    let (opaque_port, marker_port) = two_free_ports();
+    gateway_with(
+        client,
+        json!([
+            https_listener("opaque", opaque_port, "site-tls"),
+            https_listener("marker", marker_port, "marker-tls"),
+        ]),
+    )
+    .await;
+    let not_found = |l: GatewayStatusListeners| {
+        has_reason(
+            &l.conditions,
+            "ResolvedRefs",
+            "False",
+            "InvalidCertificateRef",
+        )?;
+        let c = condition(&l.conditions, "ResolvedRefs").unwrap();
+        if c.message != "secret gw/site-tls not found" {
+            return Err(format!("message {:?}", c.message));
+        }
+        Ok(())
+    };
+    eventually("the Opaque Secret not found", || async {
+        not_found(listener(client, "opaque").await?)
+    })
+    .await;
+
+    // A TLS Secret created after the Opaque one is seen, and the Opaque one still is not.
+    tls_secret(client, "marker-tls", "kubernetes.io/tls", &crt, &key).await;
+    eventually("the TLS Secret found", || async {
+        let l = listener(client, "marker").await?;
+        has(&l.conditions, &[("ResolvedRefs", "True")])
+    })
+    .await;
+    not_found(listener(client, "opaque").await.unwrap()).unwrap();
+    operator.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn http_route_status_is_not_rewritten_when_nothing_changed() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_port();
+    http_world(&env, &edge, port, web_rules()).await;
+    http_programmed(client, port).await;
+    // Let writes that were already under way land.
+    sleep(Duration::from_secs(1)).await;
+
+    let versions = || async {
+        let gw: Gateway = get(client, NS, "public").await;
+        let route: HttpRoute = get(client, NS, "web").await;
+        let edge: Edge = get(client, NS, "e1").await;
+        [
+            gw.resource_version(),
+            route.resource_version(),
+            edge.resource_version(),
+        ]
+    };
+    let before = versions().await;
+    // Two changes the model does not depend on, so two passes that find nothing to write.
+    for touched in ["1", "2"] {
+        let annotate = json!({ "metadata": { "annotations": { "touched": touched } } });
+        api::<Service>(client, NS)
+            .patch("web", &PatchParams::default(), &Patch::Merge(&annotate))
+            .await
+            .unwrap();
+        sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(versions().await, before);
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn tcp_and_http_listeners_work_side_by_side() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    let edge = operator.edge().await;
+    let (tcp_port, http_port) = two_free_ports();
+    env.namespace(NS).await;
+    class(client).await;
+    gateway_with(
+        client,
+        json!([
+            { "name": "db", "port": tcp_port, "protocol": "TCP" },
+            { "name": "web", "port": http_port, "protocol": "HTTP" },
+        ]),
+    )
+    .await;
+    service(client).await;
+    route(client).await;
+    web_service(client).await;
+    http_route(client, web_rules()).await;
+    edge_object(client, NS, &edge).await;
+
+    let programmed = &[
+        ("Accepted", "True"),
+        ("ResolvedRefs", "True"),
+        ("Programmed", "True"),
+    ];
+    eventually("both listeners programmed", || async {
+        listener_is(client, "db", 1, "TCPRoute", programmed).await?;
+        listener_is(client, "web", 1, "HTTPRoute", programmed).await
+    })
+    .await;
+    eventually("both routes accepted", || async {
+        has(
+            &http_route_parent(client).await?,
+            &[("Accepted", "True"), ("ResolvedRefs", "True")],
+        )?;
+        let route: TcpRoute = get(client, NS, "db").await;
+        let parents = route.status.map(|s| s.parents).unwrap_or_default();
+        let [parent] = parents.as_slice() else {
+            return Err(format!("TCPRoute parents {parents:?}"));
+        };
+        has(
+            &parent.conditions,
+            &[("Accepted", "True"), ("ResolvedRefs", "True")],
+        )
+    })
+    .await;
+    eventually("the TCP port accepts", || connects(tcp_port)).await;
+    eventually("the HTTP port accepts", || connects(http_port)).await;
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
 /// Kills the child when dropped, so a failed test leaves no process behind.
 struct Child(std::process::Child);
 
@@ -1039,7 +1585,9 @@ async fn deploy_manifests_apply_cleanly() {
     }
 
     // Secrets: only the namespaced Role in iroh-gateway may grant them, the ClusterRole not at
-    // all; `get` only for the identity Secret, `create` (which cannot name one) and nothing else.
+    // all; `get` only for the identity Secret, `create` (which cannot name one), `list` and
+    // `watch` of the namespace's Secrets for TLS certificates (which cannot be limited to a type)
+    // and nothing else.
     let strings = |v: &Value| -> Vec<String> {
         v.as_array()
             .into_iter()
@@ -1068,6 +1616,9 @@ async fn deploy_manifests_apply_cleanly() {
                         "{rule}"
                     ),
                     [v] if v == "create" => assert!(rule.get("resourceNames").is_none(), "{rule}"),
+                    [a, b] if a == "list" && b == "watch" => {
+                        assert!(rule.get("resourceNames").is_none(), "{rule}")
+                    }
                     other => panic!("{file}: Secret verbs {other:?} in {rule}"),
                 }
                 secret_verbs.extend(verbs.clone());
@@ -1079,5 +1630,38 @@ async fn deploy_manifests_apply_cleanly() {
         }
     }
     secret_verbs.sort();
-    assert_eq!(secret_verbs, ["create", "get"]);
+    assert_eq!(secret_verbs, ["create", "get", "list", "watch"]);
+
+    // The Gateway API: exactly the kinds the operator watches, and the status of those it writes.
+    let cluster_role = objects
+        .iter()
+        .find(|(f, o)| f == "rbac.yaml" && o["kind"] == "ClusterRole")
+        .map(|(_, o)| o)
+        .unwrap();
+    let gateway_rules: Vec<(Vec<String>, Vec<String>)> = cluster_role["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| strings(&r["apiGroups"]) == ["gateway.networking.k8s.io"])
+        .map(|r| (strings(&r["resources"]), strings(&r["verbs"])))
+        .collect();
+    let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        gateway_rules,
+        [
+            (
+                owned(&["gatewayclasses", "gateways", "tcproutes", "httproutes"]),
+                owned(&["get", "list", "watch"]),
+            ),
+            (
+                owned(&[
+                    "gatewayclasses/status",
+                    "gateways/status",
+                    "tcproutes/status",
+                    "httproutes/status",
+                ]),
+                owned(&["patch"]),
+            ),
+        ]
+    );
 }

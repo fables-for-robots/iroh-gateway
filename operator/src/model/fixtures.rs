@@ -7,13 +7,19 @@ use gateway_api::gateways::v1::{
     Gateway, GatewayAddresses, GatewayListeners, GatewayListenersAllowedRoutes,
     GatewayListenersAllowedRoutesKinds, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersAllowedRoutesNamespacesSelector,
-    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewaySpec,
+    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewayListenersTls,
+    GatewayListenersTlsCertificateRefs, GatewaySpec,
+};
+use gateway_api::httproutes::v1::{
+    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
+    HttpRouteRulesFilters, HttpRouteRulesMatches, HttpRouteSpec,
 };
 use gateway_api::tcproutes::v1::{
     TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteRulesBackendRefs, TcpRouteSpec,
 };
 use iroh_gateway_proto::transport::Relay;
-use k8s_openapi::api::core::v1::{Namespace, Service, ServicePort, ServiceSpec};
+use k8s_openapi::ByteString;
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service, ServicePort, ServiceSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 
 use super::Settings;
@@ -55,7 +61,14 @@ pub fn gateway(ns: &str, name: &str) -> Gateway {
 pub trait GatewayExt: Sized {
     fn class(self, name: &str) -> Self;
     fn listener(self, name: &str, port: i32, protocol: &str) -> Self;
-    /// Applies to the last listener.
+    /// Sets the hostname of the last listener.
+    fn hostname(self, hostname: &str) -> Self;
+    /// Sets `tls` on the last listener.
+    fn tls(self, tls: GatewayListenersTls) -> Self;
+    /// Adds a `certificateRef` to the Secret `name`, group and kind left out, to the last
+    /// listener's `tls`.
+    fn certificate(self, name: &str) -> Self;
+    /// Sets `allowedRoutes.kinds` of the last listener: (group, kind).
     fn allowed_kinds(self, kinds: &[(&str, &str)]) -> Self;
     fn allow_all_namespaces(self) -> Self;
     fn allow_selector(self, labels: &[(&str, &str)]) -> Self;
@@ -93,6 +106,29 @@ impl GatewayExt for Gateway {
             protocol: protocol.into(),
             ..Default::default()
         });
+        self
+    }
+
+    fn hostname(mut self, hostname: &str) -> Self {
+        last(&mut self).hostname = Some(hostname.into());
+        self
+    }
+
+    fn tls(mut self, tls: GatewayListenersTls) -> Self {
+        last(&mut self).tls = Some(tls);
+        self
+    }
+
+    fn certificate(mut self, name: &str) -> Self {
+        last(&mut self)
+            .tls
+            .get_or_insert_with(GatewayListenersTls::default)
+            .certificate_refs
+            .get_or_insert_with(Vec::new)
+            .push(GatewayListenersTlsCertificateRefs {
+                name: name.into(),
+                ..Default::default()
+            });
         self
     }
 
@@ -390,6 +426,156 @@ impl RouteExt for TcpRoute {
     }
 }
 
+/// An HTTPRoute with no parents, hostnames or rules.
+pub fn http_route(ns: &str, name: &str) -> HttpRoute {
+    let mut r = HttpRoute::new(name, HttpRouteSpec::default());
+    r.metadata.namespace = Some(ns.into());
+    r
+}
+
+pub trait HttpRouteExt: Sized {
+    /// A parent gateway in the route's namespace.
+    fn parent(self, gateway: &str) -> Self;
+    fn parent_in(self, ns: &str, gateway: &str) -> Self;
+    /// Applies to the last parent.
+    fn section(self, name: &str) -> Self;
+    /// Adds an entry to `hostnames`.
+    fn hostname(self, hostname: &str) -> Self;
+    /// Starts a new, empty rule.
+    fn rule(self) -> Self;
+    /// Adds a match to the last rule, as do the filter and backend builders; they start a rule
+    /// if there is none.
+    fn matching(self, m: HttpRouteRulesMatches) -> Self;
+    fn filter(self, f: HttpRouteRulesFilters) -> Self;
+    fn backend(self, service: &str, port: i32) -> Self;
+    fn weighted(self, service: &str, port: i32, weight: i32) -> Self;
+    fn backend_in(self, ns: &str, service: &str, port: i32) -> Self;
+    /// Creation time, in seconds after the epoch.
+    fn created(self, seconds: i64) -> Self;
+}
+
+fn last_http_rule(r: &mut HttpRoute) -> &mut HttpRouteRules {
+    let rules = r.spec.rules.get_or_insert_with(Vec::new);
+    if rules.is_empty() {
+        rules.push(HttpRouteRules::default());
+    }
+    rules.last_mut().expect("just ensured")
+}
+
+fn push_http_backend(mut r: HttpRoute, b: HttpRouteRulesBackendRefs) -> HttpRoute {
+    last_http_rule(&mut r)
+        .backend_refs
+        .get_or_insert_with(Vec::new)
+        .push(b);
+    r
+}
+
+impl HttpRouteExt for HttpRoute {
+    fn parent(mut self, gateway: &str) -> Self {
+        self.spec
+            .parent_refs
+            .get_or_insert_with(Vec::new)
+            .push(HttpRouteParentRefs {
+                name: gateway.into(),
+                ..Default::default()
+            });
+        self
+    }
+
+    fn parent_in(self, ns: &str, gateway: &str) -> Self {
+        let mut r = self.parent(gateway);
+        r.spec
+            .parent_refs
+            .as_mut()
+            .and_then(|p| p.last_mut())
+            .expect("just added")
+            .namespace = Some(ns.into());
+        r
+    }
+
+    fn section(mut self, name: &str) -> Self {
+        self.spec
+            .parent_refs
+            .as_mut()
+            .and_then(|p| p.last_mut())
+            .expect("add a parent first")
+            .section_name = Some(name.into());
+        self
+    }
+
+    fn hostname(mut self, hostname: &str) -> Self {
+        self.spec
+            .hostnames
+            .get_or_insert_with(Vec::new)
+            .push(hostname.into());
+        self
+    }
+
+    fn rule(mut self) -> Self {
+        self.spec
+            .rules
+            .get_or_insert_with(Vec::new)
+            .push(HttpRouteRules::default());
+        self
+    }
+
+    fn matching(mut self, m: HttpRouteRulesMatches) -> Self {
+        last_http_rule(&mut self)
+            .matches
+            .get_or_insert_with(Vec::new)
+            .push(m);
+        self
+    }
+
+    fn filter(mut self, f: HttpRouteRulesFilters) -> Self {
+        last_http_rule(&mut self)
+            .filters
+            .get_or_insert_with(Vec::new)
+            .push(f);
+        self
+    }
+
+    fn backend(self, service: &str, port: i32) -> Self {
+        push_http_backend(
+            self,
+            HttpRouteRulesBackendRefs {
+                name: service.into(),
+                port: Some(port),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn weighted(self, service: &str, port: i32, weight: i32) -> Self {
+        push_http_backend(
+            self,
+            HttpRouteRulesBackendRefs {
+                name: service.into(),
+                port: Some(port),
+                weight: Some(weight),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn backend_in(self, ns: &str, service: &str, port: i32) -> Self {
+        push_http_backend(
+            self,
+            HttpRouteRulesBackendRefs {
+                name: service.into(),
+                namespace: Some(ns.into()),
+                port: Some(port),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn created(mut self, seconds: i64) -> Self {
+        self.metadata.creation_timestamp = Some(time(seconds));
+        self
+    }
+}
+
 fn time(seconds: i64) -> Time {
     Time(k8s_openapi::jiff::Timestamp::from_second(seconds).expect("in range"))
 }
@@ -432,4 +618,43 @@ impl ServiceExt for Service {
         spec.external_name = Some("db.example.com".into());
         self
     }
+}
+
+/// A Secret of type `kubernetes.io/tls` with the given `tls.crt` and `tls.key`.
+pub fn tls_secret(ns: &str, name: &str, crt_pem: &str, key_pem: &str) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        type_: Some("kubernetes.io/tls".into()),
+        data: Some(BTreeMap::from([
+            (
+                "tls.crt".to_owned(),
+                ByteString(crt_pem.as_bytes().to_vec()),
+            ),
+            (
+                "tls.key".to_owned(),
+                ByteString(key_pem.as_bytes().to_vec()),
+            ),
+        ])),
+        ..Default::default()
+    }
+}
+
+/// A fresh self-signed certificate for `app.example.com` and its ECDSA P-256 key, as PEM:
+/// (certificate, key).
+pub fn self_signed() -> (String, String) {
+    self_signed_with(&rcgen::PKCS_ECDSA_P256_SHA256)
+}
+
+/// [`self_signed`] with a key of the given algorithm.
+pub fn self_signed_with(alg: &'static rcgen::SignatureAlgorithm) -> (String, String) {
+    let key = rcgen::KeyPair::generate_for(alg).expect("generate a key");
+    let cert = rcgen::CertificateParams::new(vec!["app.example.com".to_owned()])
+        .expect("valid names")
+        .self_signed(&key)
+        .expect("sign");
+    (cert.pem(), key.serialize_pem())
 }

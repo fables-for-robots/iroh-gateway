@@ -30,13 +30,17 @@ use crate::tunnel::{
 
 /// Default for [`EngineOptions::retry`].
 pub const DEFAULT_RETRY: Duration = Duration::from_secs(5);
+/// The longest the retry delay grows to: it doubles after each failed attempt, from
+/// [`EngineOptions::retry`].
+pub const MAX_RETRY: Duration = Duration::from_secs(300);
 
 pub struct EngineOptions {
     pub supervisor: SupervisorOptions,
     /// The operator's relay mode, which every link dials with.
     pub relay: Relay,
-    /// After a reload that failed with its outcome unknown, how long until [`Engine::next_event`]
-    /// asks for another pass.
+    /// After a reload that failed, how long until [`Engine::next_event`] asks for another pass.
+    /// The delay doubles after each further failure, up to [`MAX_RETRY`], and is back to this
+    /// after a success.
     pub retry: Duration,
 }
 
@@ -64,7 +68,10 @@ pub enum EngineEvent {
 pub struct Engine {
     endpoint: Endpoint,
     relay: Relay,
+    /// [`EngineOptions::retry`].
     retry: Duration,
+    /// The delay before the retry after the next failed reload.
+    retry_delay: Duration,
     supervisor: Supervisor,
     /// The result of the last HAProxy apply.
     haproxy: Result<(), String>,
@@ -92,16 +99,22 @@ struct Running {
 
 impl Engine {
     /// Starts HAProxy with `initial.haproxy_cfg`, then applies `initial` as `apply` does.
+    /// The initial configuration must name no file: start fails, before HAProxy is started,
+    /// when `initial.files` is not empty.
     pub async fn start(
         endpoint: iroh::Endpoint,
         opts: EngineOptions,
         initial: Rendered,
     ) -> anyhow::Result<Self> {
+        if !initial.files.is_empty() {
+            anyhow::bail!("the initial configuration must not name files");
+        }
         let supervisor = Supervisor::start(opts.supervisor, &initial.haproxy_cfg).await?;
         let mut engine = Self {
             endpoint,
             relay: opts.relay,
             retry: opts.retry,
+            retry_delay: opts.retry,
             supervisor,
             haproxy: Ok(()),
             links: BTreeMap::new(),
@@ -113,13 +126,17 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Applies `rendered`: HAProxy's configuration, and the links of the edges in it.
+    /// Applies `rendered`: HAProxy's configuration with its files, and the links of the edges in
+    /// it. A retry after a failed reload is another call with the next render, which passes its
+    /// files again.
     ///
     /// Links of edges that left the plan, or whose id or address changed, are shut down in any
-    /// case. While HAProxy reloads, each remaining link forwards only on the ports whose
-    /// [`PortPlan`] (socket and fingerprint) in the new plan is the one HAProxy last loaded.
-    /// Only when HAProxy took the configuration are links started and ports added; when it did
-    /// not, each link keeps only those unchanged ports.
+    /// case. While HAProxy reloads, each remaining link forwards only on the ports it may keep:
+    /// those whose key and socket in the new plan are the ones HAProxy last loaded, with the same
+    /// fingerprint, or [`PortPlan::shared`] (HTTP or HTTPS) in both plans. A shared port so keeps
+    /// serving the rules HAProxy last loaded; a TCP port whose backend changes is cut. Only when
+    /// HAProxy took the configuration are links started and ports added; when it did not, each
+    /// link keeps only the ports it may keep.
     ///
     /// Not meant to be cancelled, and the reconcile loop never cancels it. A cancelled call can
     /// leave the links of the edges that left the plan removed and the other links' socket
@@ -146,15 +163,17 @@ impl Engine {
             info!(edge = %key, "stopping the link");
         }
         // Until HAProxy has the new configuration, a visitor on a port that is moving or going
-        // away is refused rather than delivered to what is behind its socket now. The ports
-        // asked of the edges stay as they are until the outcome is known.
+        // away, or on a TCP port whose backend changes, is refused rather than delivered to
+        // what is behind its socket now. The ports asked of the edges stay as they are until the
+        // outcome is known.
         for plan in &rendered.edges {
             if let Some(link) = self.links.get_mut(&plan.key) {
                 link.keep_unchanged(plan);
             }
         }
         let (applied, ()) = tokio::join!(
-            self.supervisor.apply(&rendered.haproxy_cfg),
+            self.supervisor
+                .apply(&rendered.haproxy_cfg, &rendered.files),
             stop_links(gone.into_iter().map(|(_, link)| link.handle))
         );
         self.note_unreachable(&rendered.edges);
@@ -162,12 +181,19 @@ impl Engine {
             Ok(_) => {
                 self.haproxy = Ok(());
                 self.retry_at = None;
+                self.retry_delay = self.retry;
                 self.program(&rendered.edges);
             }
             Err(e) => {
                 warn!(error = %e, "haproxy did not take the configuration; adding nothing");
-                self.retry_at = matches!(e, ApplyError::ReloadFailed(_) | ApplyError::Io(_))
-                    .then(|| Instant::now() + self.retry);
+                // Each attempt can be two reloads, and HAProxy ends the connections of workers
+                // older than `mworker-max-reloads` reloads: a failure that persists must not
+                // reload often.
+                self.retry_at = None;
+                if matches!(e, ApplyError::ReloadFailed(_) | ApplyError::Io(_)) {
+                    self.retry_at = Some(Instant::now() + self.retry_delay);
+                    self.retry_delay = backed_off(self.retry_delay);
+                }
                 self.haproxy = Err(e.to_string());
                 self.cut_down(&rendered.edges);
             }
@@ -317,8 +343,8 @@ impl Engine {
         }
     }
 
-    /// After HAProxy refused the configuration: each link keeps only the ports whose
-    /// [`PortPlan`] in the new plan is the one HAProxy last loaded; nothing is added.
+    /// After HAProxy refused the configuration: each link keeps only the ports it may keep (see
+    /// [`Engine::apply`]); nothing is added.
     fn cut_down(&mut self, plans: &[EdgePlan]) {
         for plan in plans {
             if let Some(link) = self.links.get_mut(&plan.key) {
@@ -327,6 +353,11 @@ impl Engine {
             }
         }
     }
+}
+
+/// The retry delay after `delay`: twice as long, at most [`MAX_RETRY`].
+fn backed_off(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(MAX_RETRY)
 }
 
 /// `last_error` of a link whose task has ended although it was not shut down.
@@ -358,15 +389,21 @@ impl Running {
         self.sockets = sockets;
     }
 
-    /// Cuts the table to the ports whose [`PortPlan`] in `plan` is the one HAProxy last loaded.
+    /// Cuts the table to the ports whose key and socket in `plan` are the ones HAProxy last
+    /// loaded, and whose fingerprint is too unless the port is shared in both plans: HAProxy's
+    /// socket for a shared port serves the rules it last loaded, which are the port's rules
+    /// until the new ones load.
     fn keep_unchanged(&mut self, plan: &EdgePlan) {
         let kept = self
             .sockets
             .iter()
             .filter(|(key, _)| {
-                plan.sockets
-                    .get(key)
-                    .is_some_and(|port| self.loaded.get(key) == Some(port))
+                let (Some(new), Some(loaded)) = (plan.sockets.get(key), self.loaded.get(key))
+                else {
+                    return false;
+                };
+                new.socket == loaded.socket
+                    && (new.fingerprint == loaded.fingerprint || (new.shared && loaded.shared))
             })
             .map(|(key, port)| (*key, port.clone()))
             .collect();
@@ -402,6 +439,20 @@ async fn stop_links(links: impl IntoIterator<Item = LinkHandle>) {
 mod tests {
     use super::*;
     use crate::tunnel::ListenerState;
+
+    #[test]
+    fn retry_delay_doubles_up_to_the_maximum() {
+        let mut delay = DEFAULT_RETRY;
+        let mut seen = vec![delay];
+        while delay < MAX_RETRY {
+            delay = backed_off(delay);
+            seen.push(delay);
+        }
+        let secs: Vec<u64> = seen.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 80, 160, 300]);
+        assert_eq!(backed_off(MAX_RETRY), MAX_RETRY);
+        assert_eq!(backed_off(Duration::MAX), MAX_RETRY);
+    }
 
     #[test]
     fn a_link_whose_task_ended_is_reported_stopped() {
