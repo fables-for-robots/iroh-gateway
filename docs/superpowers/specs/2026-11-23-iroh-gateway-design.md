@@ -334,9 +334,9 @@ Rules:
   mix on one port is `Conflicted`.
 - Listeners that share a port share one rule list: a request for
   `foo.example.com` that matches none of that listener's paths can be
-  answered by a route of a `*.example.com` listener on the same port. Core
-  Gateway API conformance holds; the optional "listener isolation" feature
-  is not provided.
+  answered by a route of a `*.example.com` listener on the same port.
+  Listener isolation, an optional feature of the Gateway API, is not
+  provided.
 - A listener may not use the edge's iroh port.
 - A TCP listener carries one `TCPRoute`. If several attach, the oldest
   wins and the others are not accepted.
@@ -642,7 +642,7 @@ closes until an apply succeeds. A port must never keep serving a backend
 the cluster no longer assigns to it.
 
 **Known limit: long-lived connections.** Any change to a serving listener's
-route or backends, in any namespace, reloads HAProxy. A connection that is
+routes, backends or certificates, in any namespace, reloads HAProxy. A connection that is
 still open 30 minutes after a reload (`hard-stop-after 30m`), or after 50
 further reloads (`mworker-max-reloads 50`), is closed. SSH and database
 sessions notice this. The real fix is to change backends through HAProxy's
