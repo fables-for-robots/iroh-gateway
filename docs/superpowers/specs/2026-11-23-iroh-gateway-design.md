@@ -111,9 +111,13 @@ These make the project a failure even if it works:
     a known IP and port with no lookup.
   - `Connection` offers `open_bi`/`accept_bi`, `send_datagram`,
     `read_datagram`, `max_datagram_size`, `remote_id`.
-  - Datagram size follows the path MTU: it starts at 1200 bytes and MTU
-    discovery raises it to at most 1452 by default. A full-size internet UDP
-    payload (1472 bytes) therefore never fits in one datagram.
+  - Datagram size follows the path MTU: QUIC packets start at 1200 bytes
+    and MTU discovery raises them to at most 1452 by default, and what
+    `max_datagram_size()` returns is smaller by the per-packet overhead
+    (1162 bytes on a fresh loopback connection, measured). A full-size
+    internet UDP payload (1472 bytes) therefore never fits in one datagram,
+    and with the 18-byte header a visitor packet of more than about 1140
+    bytes is split on a new path.
 - **HAProxy.** The open-source edition has no generic UDP proxying (only
   syslog/DNS via `log-forward`); generic UDP is an Enterprise module. It
   accepts PROXY protocol v2 on any bind, including unix sockets, and in
