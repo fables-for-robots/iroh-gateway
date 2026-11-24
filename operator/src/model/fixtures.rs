@@ -17,6 +17,9 @@ use gateway_api::httproutes::v1::{
 use gateway_api::tcproutes::v1::{
     TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteRulesBackendRefs, TcpRouteSpec,
 };
+use gateway_api::udproutes::v1::{
+    UdpRoute, UdpRouteParentRefs, UdpRouteRules, UdpRouteRulesBackendRefs, UdpRouteSpec,
+};
 use iroh_gateway_proto::transport::Relay;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service, ServicePort, ServiceSpec};
@@ -301,6 +304,19 @@ pub fn tcp_route(ns: &str, name: &str) -> TcpRoute {
     r
 }
 
+/// A UDPRoute with one empty rule and no parents; built on as a [`tcp_route`] is.
+pub fn udp_route(ns: &str, name: &str) -> UdpRoute {
+    let mut r = UdpRoute::new(
+        name,
+        UdpRouteSpec {
+            parent_refs: None,
+            rules: vec![UdpRouteRules::default()],
+        },
+    );
+    r.metadata.namespace = Some(ns.into());
+    r
+}
+
 pub trait RouteExt: Sized {
     /// A parent gateway in the route's namespace.
     fn parent(self, gateway: &str) -> Self;
@@ -321,110 +337,135 @@ pub trait RouteExt: Sized {
     fn created(self, seconds: i64) -> Self;
 }
 
-fn last_parent(r: &mut TcpRoute) -> &mut TcpRouteParentRefs {
-    r.spec
-        .parent_refs
-        .as_mut()
-        .and_then(|p| p.last_mut())
-        .expect("add a parent first")
+/// `RouteExt` for a generated route type with `parentRefs` and `rules` of `backendRefs`, as
+/// `TCPRoute` and `UDPRoute` have, in a module of its own.
+macro_rules! route_ext {
+    ($module:ident, $route:ident, $parent:ident, $rules:ident, $backend:ident) => {
+        mod $module {
+            use super::*;
+
+            fn last_parent(r: &mut $route) -> &mut $parent {
+                r.spec
+                    .parent_refs
+                    .as_mut()
+                    .and_then(|p| p.last_mut())
+                    .expect("add a parent first")
+            }
+
+            fn push_backend(mut r: $route, b: $backend) -> $route {
+                r.spec
+                    .rules
+                    .last_mut()
+                    .expect("a route has a rule")
+                    .backend_refs
+                    .push(b);
+                r
+            }
+
+            impl RouteExt for $route {
+                fn parent(mut self, gateway: &str) -> Self {
+                    self.spec
+                        .parent_refs
+                        .get_or_insert_with(Vec::new)
+                        .push($parent {
+                            name: gateway.into(),
+                            ..Default::default()
+                        });
+                    self
+                }
+
+                fn parent_in(mut self, ns: &str, gateway: &str) -> Self {
+                    self = self.parent(gateway);
+                    last_parent(&mut self).namespace = Some(ns.into());
+                    self
+                }
+
+                fn section(mut self, name: &str) -> Self {
+                    last_parent(&mut self).section_name = Some(name.into());
+                    self
+                }
+
+                fn port(mut self, port: i32) -> Self {
+                    last_parent(&mut self).port = Some(port);
+                    self
+                }
+
+                fn backend(self, service: &str, port: i32) -> Self {
+                    push_backend(
+                        self,
+                        $backend {
+                            name: service.into(),
+                            port: Some(port),
+                            ..Default::default()
+                        },
+                    )
+                }
+
+                fn weighted(self, service: &str, port: i32, weight: i32) -> Self {
+                    push_backend(
+                        self,
+                        $backend {
+                            name: service.into(),
+                            port: Some(port),
+                            weight: Some(weight),
+                            ..Default::default()
+                        },
+                    )
+                }
+
+                fn backend_in(self, ns: &str, service: &str, port: i32) -> Self {
+                    push_backend(
+                        self,
+                        $backend {
+                            name: service.into(),
+                            namespace: Some(ns.into()),
+                            port: Some(port),
+                            ..Default::default()
+                        },
+                    )
+                }
+
+                fn backend_kind(self, group: &str, kind: &str, name: &str) -> Self {
+                    push_backend(
+                        self,
+                        $backend {
+                            group: Some(group.into()),
+                            kind: Some(kind.into()),
+                            name: name.into(),
+                            port: Some(5432),
+                            ..Default::default()
+                        },
+                    )
+                }
+
+                fn second_rule(mut self) -> Self {
+                    self.spec.rules.push($rules::default());
+                    self
+                }
+
+                fn created(mut self, seconds: i64) -> Self {
+                    self.metadata.creation_timestamp = Some(time(seconds));
+                    self
+                }
+            }
+        }
+    };
 }
 
-fn push_backend(mut r: TcpRoute, b: TcpRouteRulesBackendRefs) -> TcpRoute {
-    r.spec
-        .rules
-        .last_mut()
-        .expect("a route has a rule")
-        .backend_refs
-        .push(b);
-    r
-}
-
-impl RouteExt for TcpRoute {
-    fn parent(mut self, gateway: &str) -> Self {
-        self.spec
-            .parent_refs
-            .get_or_insert_with(Vec::new)
-            .push(TcpRouteParentRefs {
-                name: gateway.into(),
-                ..Default::default()
-            });
-        self
-    }
-
-    fn parent_in(mut self, ns: &str, gateway: &str) -> Self {
-        self = self.parent(gateway);
-        last_parent(&mut self).namespace = Some(ns.into());
-        self
-    }
-
-    fn section(mut self, name: &str) -> Self {
-        last_parent(&mut self).section_name = Some(name.into());
-        self
-    }
-
-    fn port(mut self, port: i32) -> Self {
-        last_parent(&mut self).port = Some(port);
-        self
-    }
-
-    fn backend(self, service: &str, port: i32) -> Self {
-        push_backend(
-            self,
-            TcpRouteRulesBackendRefs {
-                name: service.into(),
-                port: Some(port),
-                ..Default::default()
-            },
-        )
-    }
-
-    fn weighted(self, service: &str, port: i32, weight: i32) -> Self {
-        push_backend(
-            self,
-            TcpRouteRulesBackendRefs {
-                name: service.into(),
-                port: Some(port),
-                weight: Some(weight),
-                ..Default::default()
-            },
-        )
-    }
-
-    fn backend_in(self, ns: &str, service: &str, port: i32) -> Self {
-        push_backend(
-            self,
-            TcpRouteRulesBackendRefs {
-                name: service.into(),
-                namespace: Some(ns.into()),
-                port: Some(port),
-                ..Default::default()
-            },
-        )
-    }
-
-    fn backend_kind(self, group: &str, kind: &str, name: &str) -> Self {
-        push_backend(
-            self,
-            TcpRouteRulesBackendRefs {
-                group: Some(group.into()),
-                kind: Some(kind.into()),
-                name: name.into(),
-                port: Some(5432),
-                ..Default::default()
-            },
-        )
-    }
-
-    fn second_rule(mut self) -> Self {
-        self.spec.rules.push(TcpRouteRules::default());
-        self
-    }
-
-    fn created(mut self, seconds: i64) -> Self {
-        self.metadata.creation_timestamp = Some(time(seconds));
-        self
-    }
-}
+route_ext!(
+    tcp,
+    TcpRoute,
+    TcpRouteParentRefs,
+    TcpRouteRules,
+    TcpRouteRulesBackendRefs
+);
+route_ext!(
+    udp,
+    UdpRoute,
+    UdpRouteParentRefs,
+    UdpRouteRules,
+    UdpRouteRulesBackendRefs
+);
 
 /// An HTTPRoute with no parents, hostnames or rules.
 pub fn http_route(ns: &str, name: &str) -> HttpRoute {
@@ -609,9 +650,24 @@ pub fn service(ns: &str, name: &str, cluster_ip: &str, ports: &[i32]) -> Service
 pub trait ServiceExt: Sized {
     /// Type `ExternalName`; the cluster IP is left as it was.
     fn external_name(self) -> Self;
+    /// Adds a port with `protocol: UDP`.
+    fn udp_port(self, port: i32) -> Self;
 }
 
 impl ServiceExt for Service {
+    fn udp_port(mut self, port: i32) -> Self {
+        self.spec
+            .get_or_insert_with(ServiceSpec::default)
+            .ports
+            .get_or_insert_with(Vec::new)
+            .push(ServicePort {
+                port,
+                protocol: Some("UDP".into()),
+                ..Default::default()
+            });
+        self
+    }
+
     fn external_name(mut self) -> Self {
         let spec = self.spec.get_or_insert_with(ServiceSpec::default);
         spec.type_ = Some("ExternalName".into());

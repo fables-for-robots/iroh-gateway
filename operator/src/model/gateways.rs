@@ -9,6 +9,7 @@ use gateway_api::gateways::v1::{
     GatewayListenersAllowedRoutesNamespaces, GatewayListenersAllowedRoutesNamespacesFrom as From,
     GatewayListenersTlsMode,
 };
+use iroh_gateway_proto::control::Protocol;
 
 use super::certs;
 use super::generation;
@@ -110,17 +111,19 @@ fn listeners(
         .map(|spec| listener(spec, gateway_ns, served, secrets))
         .collect();
 
-    // Listeners sharing a port conflict: on the protocol when it differs; on the hostname when
-    // it is HTTP or HTTPS, where several hostnames can share a port; on the port otherwise.
-    let mut by_port: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+    // Listeners sharing a port of one transport conflict: on the protocol when it differs; on
+    // the hostname when it is HTTP or HTTPS, where several hostnames can share a port; on the
+    // port otherwise. A UDP listener and a TCP, HTTP or HTTPS one share a port number freely.
+    let mut by_port: BTreeMap<(u16, bool), Vec<usize>> = BTreeMap::new();
     for (i, l) in out.iter().enumerate() {
         // Listeners with an invalid port (stored as 0) are already refused; they share nothing.
         if l.port == 0 {
             continue;
         }
-        by_port.entry(l.port).or_default().push(i);
+        let udp = l.transport() == Protocol::Udp;
+        by_port.entry((l.port, udp)).or_default().push(i);
     }
-    for (port, members) in by_port.into_iter().filter(|(_, m)| m.len() > 1) {
+    for ((port, _), members) in by_port.into_iter().filter(|(_, m)| m.len() > 1) {
         let protocol = out[members[0]].protocol.clone();
         if members.iter().any(|&i| out[i].protocol != protocol) {
             let reject = Reject::new(
@@ -185,6 +188,7 @@ fn listener(
 
     let kind = match spec.protocol.as_str() {
         "TCP" => Some(RouteKind::Tcp),
+        "UDP" => Some(RouteKind::Udp),
         "HTTP" | "HTTPS" => Some(RouteKind::Http),
         _ => None,
     };
@@ -195,7 +199,7 @@ fn listener(
         }
     };
     match spec.protocol.as_str() {
-        "TCP" => {}
+        "TCP" | "UDP" => {}
         "HTTP" | "HTTPS" => {
             match HostMatch::parse(spec.hostname.as_deref()) {
                 Ok(h) => hostname = h,
@@ -214,7 +218,7 @@ fn listener(
         }
         other => refuse(
             "UnsupportedProtocol",
-            format!("protocol {other:?} is not supported; TCP, HTTP and HTTPS are"),
+            format!("protocol {other:?} is not supported; TCP, UDP, HTTP and HTTPS are"),
         ),
     }
 
@@ -305,6 +309,7 @@ mod tests {
     use super::super::fixtures::*;
     use super::super::{GatewayModel, HostMatch, Model, Reject};
     use gateway_api::gateways::v1::{GatewayListenersTls, GatewayListenersTlsMode};
+    use iroh_gateway_proto::control::Protocol;
 
     fn model_of(s: &super::Snapshot) -> Model {
         build(s, &settings(&["infra"]))
@@ -375,26 +380,108 @@ mod tests {
     }
 
     #[test]
-    fn tls_and_udp_listeners_are_unsupported() {
+    fn udp_listener_is_accepted_and_supports_udp_routes() {
+        let g = one(&snap(gateway("infra", "gw").listener("dns", 53, "UDP")));
+        assert_eq!(g.accepted, Ok(()));
+        let l = &g.listeners[0];
+        assert_eq!(l.accepted, Ok(()));
+        assert_eq!(l.resolved_refs, Ok(()));
+        assert_eq!(l.conflicted, None);
+        assert_eq!(l.supported_kinds, ["UDPRoute"]);
+        assert_eq!(l.transport(), Protocol::Udp);
+        assert_eq!((l.port, l.attached_routes), (53, 0));
+        assert!(!l.serving());
+    }
+
+    #[test]
+    fn tls_listener_is_unsupported() {
         let g = one(&snap(
             gateway("infra", "gw")
                 .listener("pg", 5432, "TCP")
-                .listener("c", 853, "TLS")
-                .listener("d", 53, "UDP"),
+                .listener("c", 853, "TLS"),
         ));
         assert_eq!(g.accepted, Ok(()));
-        for l in &g.listeners[1..] {
-            assert_eq!(reason(&l.accepted), "UnsupportedProtocol", "{}", l.name);
-            let message = &l.accepted.as_ref().unwrap_err().message;
-            assert_eq!(
-                message,
-                &format!(
-                    "protocol {:?} is not supported; TCP, HTTP and HTTPS are",
-                    l.protocol
-                )
-            );
-            assert!(l.supported_kinds.is_empty());
+        let l = &g.listeners[1];
+        assert_eq!(reason(&l.accepted), "UnsupportedProtocol");
+        assert_eq!(
+            l.accepted.as_ref().unwrap_err().message,
+            r#"protocol "TLS" is not supported; TCP, UDP, HTTP and HTTPS are"#
+        );
+        assert!(l.supported_kinds.is_empty());
+        // Whatever it is, a listener that is not UDP is bound over TCP.
+        assert_eq!(l.transport(), Protocol::Tcp);
+        assert_eq!(g.listeners[0].transport(), Protocol::Tcp);
+    }
+
+    #[test]
+    fn tcp_and_udp_listeners_share_a_port() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("dns-tcp", 53, "TCP")
+                .listener("dns-udp", 53, "UDP"),
+        ));
+        for l in &g.listeners {
+            assert_eq!(l.accepted, Ok(()), "{}", l.name);
+            assert_eq!(l.conflicted, None, "{}", l.name);
         }
+        assert_eq!(g.listeners[0].supported_kinds, ["TCPRoute"]);
+        assert_eq!(g.listeners[1].supported_kinds, ["UDPRoute"]);
+        assert_eq!(g.accepted, Ok(()));
+    }
+
+    #[test]
+    fn http_and_udp_listeners_share_a_port() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("web", 443, "HTTPS")
+                .hostname("app.example.com")
+                .listener("quic", 443, "UDP"),
+        ));
+        for l in &g.listeners {
+            assert_eq!(l.accepted, Ok(()), "{}", l.name);
+            assert_eq!(l.conflicted, None, "{}", l.name);
+        }
+        assert_eq!(g.accepted, Ok(()));
+    }
+
+    #[test]
+    fn two_udp_listeners_on_one_port_conflict() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 53, "UDP")
+                .listener("b", 53, "UDP")
+                .listener("tcp", 53, "TCP"),
+        ));
+        for l in &g.listeners[..2] {
+            let c = l.conflicted.as_ref().unwrap();
+            assert_eq!(c.reason, "HostnameConflict", "{}", l.name);
+            assert_eq!(c.message, "several listeners use port 53 with protocol UDP");
+        }
+        // As two TCP listeners on one port get.
+        let tcp = one(&snap(
+            gateway("infra", "gw")
+                .listener("a", 53, "TCP")
+                .listener("b", 53, "TCP"),
+        ));
+        assert_eq!(
+            tcp.listeners[0].conflicted.as_ref().unwrap().message,
+            "several listeners use port 53 with protocol TCP"
+        );
+        // The TCP listener beside them is not conflicted.
+        assert_eq!(g.listeners[2].conflicted, None);
+        assert_eq!(g.listeners[2].accepted, Ok(()));
+        assert_eq!(g.accepted, Ok(()));
+    }
+
+    #[test]
+    fn udp_listener_ignores_its_hostname() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("dns", 53, "UDP")
+                .hostname("not a hostname!"),
+        ));
+        assert_eq!(g.listeners[0].accepted, Ok(()));
+        assert_eq!(g.listeners[0].hostname, HostMatch::Any);
     }
 
     #[test]
@@ -676,7 +763,7 @@ mod tests {
 
     #[test]
     fn gateway_with_no_valid_listener_is_not_accepted() {
-        let g = one(&snap(gateway("infra", "gw").listener("a", 80, "UDP")));
+        let g = one(&snap(gateway("infra", "gw").listener("a", 80, "TLS")));
         assert_eq!(reason(&g.accepted), "ListenersNotValid");
     }
 
@@ -721,7 +808,7 @@ mod tests {
         let g = one(&snap(
             gateway("infra", "gw")
                 .listener("a", 53, "TCP")
-                .listener("b", 53, "UDP"),
+                .listener("b", 53, "TLS"),
         ));
         for l in &g.listeners {
             assert_eq!(l.conflicted.as_ref().unwrap().reason, "ProtocolConflict");
@@ -750,7 +837,7 @@ mod tests {
         let g = one(&snap(
             gateway("infra", "gw")
                 .listener("ok", 5432, "TCP")
-                .listener("bad", 0, "UDP"),
+                .listener("bad", 0, "TLS"),
         ));
         assert_eq!(reason(&g.listeners[1].accepted), "PortUnavailable");
         assert!(g.listeners[1].supported_kinds.is_empty());

@@ -1,10 +1,13 @@
-//! TCPRoutes: which route binds to which listener, and the backends each listener gets; and the
-//! parent and backend checks, and the snapshot lookups, that every route kind shares.
+//! TCPRoutes and UDPRoutes: which route binds to which listener, and the backends each listener
+//! gets; and the parent and backend checks, and the snapshot lookups, that every route kind
+//! shares.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use gateway_api::tcproutes::v1::TcpRoute;
+use gateway_api::udproutes::v1::UdpRoute;
+use iroh_gateway_proto::control::Protocol;
 use k8s_openapi::api::core::v1::Service;
 use kube::ResourceExt;
 
@@ -39,14 +42,60 @@ pub(super) fn services_by_key(snapshot: &Snapshot) -> BTreeMap<ObjRef, &Service>
     services
 }
 
-/// Every route that names one of our gateways, by key. Fills `attached_routes` and `backends`
-/// of the listeners the routes win.
-pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<RouteModel> {
-    let mut routes: Vec<(ObjRef, &TcpRoute)> = snapshot
-        .tcp_routes
-        .iter()
-        .map(|r| (ObjRef::of(r), r))
-        .collect();
+/// A route that forwards a listener's connections or packets to weighted backends, with at most
+/// one rule: a `TCPRoute` or a `UDPRoute`.
+pub(super) trait L4Route: RouteResource {
+    /// How many rules the route has.
+    fn rule_count(&self) -> usize;
+    /// The `backendRefs` of every rule, in order.
+    fn backend_refs(&self) -> Vec<BackendRef<'_>>;
+}
+
+/// `L4Route` for the generated route types, which have the same rule and `backendRef` fields.
+macro_rules! l4_route {
+    ($($t:ty),*) => {$(
+        impl L4Route for $t {
+            fn rule_count(&self) -> usize {
+                self.spec.rules.len()
+            }
+
+            fn backend_refs(&self) -> Vec<BackendRef<'_>> {
+                self.spec
+                    .rules
+                    .iter()
+                    .flat_map(|r| &r.backend_refs)
+                    .map(|b| BackendRef {
+                        group: b.group.as_deref(),
+                        kind: b.kind.as_deref(),
+                        namespace: b.namespace.as_deref(),
+                        name: &b.name,
+                        port: b.port,
+                        weight: b.weight,
+                    })
+                    .collect()
+            }
+        }
+    )*};
+}
+
+l4_route!(TcpRoute, UdpRoute);
+
+/// What a backend of a route of `kind` is reached over.
+fn transport(kind: RouteKind) -> Protocol {
+    match kind {
+        RouteKind::Udp => Protocol::Udp,
+        RouteKind::Tcp | RouteKind::Http => Protocol::Tcp,
+    }
+}
+
+/// Every route of `all` that names one of our gateways, by key. Fills `attached_routes` and
+/// `backends` of the listeners the routes win.
+pub(super) fn routes<R: L4Route>(
+    all: &[R],
+    snapshot: &Snapshot,
+    gateways: &mut [GatewayModel],
+) -> Vec<RouteModel> {
+    let mut routes: Vec<(ObjRef, &R)> = all.iter().map(|r| (ObjRef::of(r), r)).collect();
     routes.sort_by(|a, b| a.0.cmp(&b.0));
 
     let namespaces = namespace_labels(snapshot);
@@ -54,11 +103,11 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
 
     let resolved: Vec<Resolved> = routes
         .iter()
-        .map(|(key, r)| resolve(r, &key.namespace, &services))
+        .map(|(key, r)| resolve(*r, &key.namespace, &services))
         .collect();
     let parents: Vec<Vec<Attachment>> = routes
         .iter()
-        .map(|(key, r)| attachments(r, &key.namespace, gateways, &namespaces))
+        .map(|(key, r)| attachments(*r, &key.namespace, gateways, &namespaces))
         .collect();
 
     // Per listener, the oldest route among those that passed every other check wins.
@@ -88,7 +137,7 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
         .enumerate()
         .filter(|(_, ((_, parents), _))| !parents.is_empty())
         .map(|(i, (((key, r), parents), resolved))| RouteModel {
-            kind: TcpRoute::KIND,
+            kind: R::KIND,
             key: key.clone(),
             generation: generation(*r),
             parents: parents
@@ -101,7 +150,10 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
                         } else {
                             Err(Reject::new(
                                 "UnsupportedValue",
-                                "another TCPRoute is already bound to this listener",
+                                format!(
+                                    "another {} is already bound to this listener",
+                                    R::KIND.as_str()
+                                ),
                             ))
                         }
                     }),
@@ -119,8 +171,8 @@ struct Attachment {
 }
 
 /// The route's `parentRef`s that name a gateway in the model, in order, without repeats.
-fn attachments(
-    route: &TcpRoute,
+fn attachments<R: L4Route>(
+    route: &R,
     route_ns: &str,
     gateways: &[GatewayModel],
     namespaces: &BTreeMap<String, Labels>,
@@ -163,19 +215,19 @@ pub(crate) fn parent_key(parent: &ParentRef, route_ns: &str) -> Option<ParentKey
     })
 }
 
-/// The listeners of `gw` that the TCPRoute may compete for, or why there are none.
-fn attach(
-    route: &TcpRoute,
+/// The listeners of `gw` that the route may compete for, or why there are none.
+fn attach<R: L4Route>(
+    route: &R,
     route_ns: &str,
     parent: &ParentKey,
     gw: &GatewayModel,
     namespaces: &BTreeMap<String, Labels>,
 ) -> Result<Vec<usize>, Reject> {
-    let kept = admitted(TcpRoute::KIND, route_ns, parent, gw, namespaces)?;
-    if route.spec.rules.len() > 1 {
+    let kept = admitted(R::KIND, route_ns, parent, gw, namespaces)?;
+    if route.rule_count() > 1 {
         return Err(Reject::new(
             "UnsupportedValue",
-            "a TCPRoute may have one rule",
+            format!("a {} may have one rule", R::KIND.as_str()),
         ));
     }
     Ok(kept)
@@ -289,19 +341,15 @@ struct Resolved {
     resolved_refs: Result<(), Reject>,
 }
 
-fn resolve(route: &TcpRoute, route_ns: &str, services: &BTreeMap<ObjRef, &Service>) -> Resolved {
+fn resolve<R: L4Route>(
+    route: &R,
+    route_ns: &str,
+    services: &BTreeMap<ObjRef, &Service>,
+) -> Resolved {
     let mut backends = Vec::new();
     let mut resolved_refs = Ok(());
-    for b in route.spec.rules.iter().flat_map(|r| &r.backend_refs) {
-        let b = BackendRef {
-            group: b.group.as_deref(),
-            kind: b.kind.as_deref(),
-            namespace: b.namespace.as_deref(),
-            name: &b.name,
-            port: b.port,
-            weight: b.weight,
-        };
-        match backend(&b, route_ns, services) {
+    for b in route.backend_refs() {
+        match backend(&b, transport(R::KIND), route_ns, services) {
             Ok(Some(backend)) => backends.push(backend),
             Ok(None) => {}
             Err(reject) => {
@@ -327,9 +375,11 @@ pub(super) struct BackendRef<'a> {
     pub weight: Option<i32>,
 }
 
-/// One `backendRef`: a backend, `None` if it has weight 0, or why it was refused.
+/// One `backendRef`: a backend, `None` if it has weight 0, or why it was refused. The Service
+/// port must be one of `transport`: `protocol: UDP` for `Udp`; TCP, the default, for `Tcp`.
 pub(super) fn backend(
     b: &BackendRef<'_>,
+    transport: Protocol,
     route_ns: &str,
     services: &BTreeMap<ObjRef, &Service>,
 ) -> Result<Option<Backend>, Reject> {
@@ -386,17 +436,23 @@ pub(super) fn backend(
             format!("service {key} has no cluster IP"),
         ));
     };
+    let of_transport = |protocol: Option<&str>| match transport {
+        Protocol::Tcp => !matches!(protocol, Some("UDP" | "SCTP")),
+        Protocol::Udp => protocol == Some("UDP"),
+    };
     let has_port = spec
         .and_then(|s| s.ports.as_ref())
         .into_iter()
         .flatten()
-        .any(|p| {
-            p.port == i32::from(port) && !matches!(p.protocol.as_deref(), Some("UDP" | "SCTP"))
-        });
+        .any(|p| p.port == i32::from(port) && of_transport(p.protocol.as_deref()));
     if !has_port {
+        let name = match transport {
+            Protocol::Tcp => "TCP",
+            Protocol::Udp => "UDP",
+        };
         return Err(Reject::new(
             "BackendNotFound",
-            format!("service {key} has no TCP port {port}"),
+            format!("service {key} has no {name} port {port}"),
         ));
     }
     let weight = b.weight.unwrap_or(1);
@@ -420,11 +476,14 @@ mod tests {
 
     use gateway_api::gateways::v1::{Gateway, GatewayListenersAllowedRoutesNamespacesSelector};
     use gateway_api::tcproutes::v1::TcpRoute;
+    use gateway_api::udproutes::v1::UdpRoute;
     use k8s_openapi::api::core::v1::Service;
 
     use super::super::build;
     use super::super::fixtures::*;
-    use super::super::{Backend, ListenerModel, Model, ObjRef, ParentKey, Reject, RouteModel};
+    use super::super::{
+        Backend, ListenerModel, Model, ObjRef, ParentKey, Reject, RouteKind, RouteModel,
+    };
     use super::Snapshot;
 
     const GROUP: &str = "gateway.networking.k8s.io";
@@ -453,6 +512,31 @@ mod tests {
 
     fn run(gateways: Vec<Gateway>, routes: Vec<TcpRoute>, services: Vec<Service>) -> Model {
         build(&snap(gateways, routes, services), &settings(&["gw"]))
+    }
+
+    fn run_udp(
+        gateways: Vec<Gateway>,
+        tcp: Vec<TcpRoute>,
+        udp: Vec<UdpRoute>,
+        services: Vec<Service>,
+    ) -> Model {
+        let mut s = snap(gateways, tcp, services);
+        s.udp_routes = udp;
+        build(&s, &settings(&["gw"]))
+    }
+
+    /// gw/public with the UDP listener dns:53.
+    fn dns() -> Gateway {
+        gateway("gw", "public").listener("dns", 53, "UDP")
+    }
+
+    /// gw/resolver with only the UDP port 53.
+    fn resolver() -> Service {
+        service("gw", "resolver", "10.43.0.53", &[]).udp_port(53)
+    }
+
+    fn message(r: &Result<(), Reject>) -> &str {
+        &r.as_ref().unwrap_err().message
     }
 
     /// gw/public with listener pg:5432.
@@ -1499,5 +1583,224 @@ mod tests {
             [backend("gw", "db2", "10.43.0.13", 5432, 1)]
         );
         assert_eq!(accepted(&expected, "apps", "b"), "UnsupportedValue");
+    }
+
+    #[test]
+    fn udp_route_fills_the_listener_backends() {
+        let m = run_udp(
+            vec![dns()],
+            vec![],
+            vec![
+                udp_route("gw", "r")
+                    .parent("public")
+                    .weighted("resolver", 53, 1)
+                    .weighted("other", 5353, 3),
+            ],
+            vec![
+                resolver(),
+                service("gw", "other", "10.43.0.54", &[]).udp_port(5353),
+            ],
+        );
+        let rm = route(&m, "gw", "r");
+        assert_eq!(rm.kind, RouteKind::Udp);
+        assert_eq!(accepted(&m, "gw", "r"), "Ok");
+        assert_eq!(resolved(&m, "gw", "r"), "Ok");
+        let l = listener(&m, "public", "dns");
+        assert_eq!(l.attached_routes, 1);
+        assert_eq!(
+            l.backends,
+            [
+                backend("gw", "resolver", "10.43.0.53", 53, 1),
+                backend("gw", "other", "10.43.0.54", 5353, 3),
+            ]
+        );
+        assert!(l.serving());
+    }
+
+    #[test]
+    fn udp_route_does_not_attach_to_a_tcp_listener_and_a_tcp_route_not_to_a_udp_listener() {
+        let m = run_udp(
+            vec![public(), gateway("gw", "udp").listener("dns", 53, "UDP")],
+            vec![tcp_route("gw", "t").parent("udp").backend("db", 5432)],
+            vec![
+                udp_route("gw", "u")
+                    .parent("public")
+                    .backend("resolver", 53),
+            ],
+            vec![db(), resolver()],
+        );
+        assert_eq!(accepted(&m, "gw", "t"), "NotAllowedByListeners");
+        assert_eq!(accepted(&m, "gw", "u"), "NotAllowedByListeners");
+        assert_eq!(
+            message(&route(&m, "gw", "u").parents[0].accepted),
+            r#"no accepted listener of gateway gw/public admits UDPRoutes from namespace "gw""#
+        );
+        for (gw, name) in [("public", "pg"), ("udp", "dns")] {
+            let l = listener(&m, gw, name);
+            assert_eq!(l.attached_routes, 0, "{name}");
+            assert!(l.backends.is_empty(), "{name}");
+            assert!(!l.serving(), "{name}");
+        }
+    }
+
+    #[test]
+    fn udp_route_to_a_tcp_service_port_is_refused() {
+        // A port without a protocol is TCP, as is one that says so.
+        for protocol in [None, Some("TCP")] {
+            let mut svc = service("gw", "resolver", "10.43.0.53", &[53]);
+            svc.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].protocol =
+                protocol.map(Into::into);
+            let m = run_udp(
+                vec![dns()],
+                vec![],
+                vec![
+                    udp_route("gw", "r")
+                        .parent("public")
+                        .backend("resolver", 53),
+                ],
+                vec![svc],
+            );
+            assert_eq!(accepted(&m, "gw", "r"), "Ok");
+            assert_eq!(resolved(&m, "gw", "r"), "BackendNotFound", "{protocol:?}");
+            assert_eq!(
+                message(&route(&m, "gw", "r").parents[0].resolved_refs),
+                "service gw/resolver has no UDP port 53"
+            );
+            let l = listener(&m, "public", "dns");
+            assert!(l.backends.is_empty());
+            assert!(!l.serving());
+        }
+    }
+
+    #[test]
+    fn tcp_route_to_a_udp_service_port_is_still_refused() {
+        let gw = || gateway("gw", "public").listener("dns", 53, "TCP");
+        let route_ = || {
+            tcp_route("gw", "r")
+                .parent("public")
+                .backend("resolver", 53)
+        };
+        let m = run(vec![gw()], vec![route_()], vec![resolver()]);
+        assert_eq!(resolved(&m, "gw", "r"), "BackendNotFound");
+        assert_eq!(
+            message(&route(&m, "gw", "r").parents[0].resolved_refs),
+            "service gw/resolver has no TCP port 53"
+        );
+        assert!(!listener(&m, "public", "dns").serving());
+        // A Service with both a TCP and a UDP port 53 serves the TCPRoute.
+        let both = service("gw", "resolver", "10.43.0.53", &[53]).udp_port(53);
+        let m = run(vec![gw()], vec![route_()], vec![both]);
+        assert_eq!(resolved(&m, "gw", "r"), "Ok");
+        assert!(listener(&m, "public", "dns").serving());
+    }
+
+    #[test]
+    fn older_udp_route_wins_the_listener() {
+        let routes = |a: i64, b: i64| {
+            vec![
+                udp_route("gw", "a")
+                    .parent("public")
+                    .backend("resolver", 53)
+                    .created(a),
+                udp_route("gw", "b")
+                    .parent("public")
+                    .backend("other", 53)
+                    .created(b),
+            ]
+        };
+        let svcs = || {
+            vec![
+                resolver(),
+                service("gw", "other", "10.43.0.99", &[]).udp_port(53),
+            ]
+        };
+        let m = run_udp(vec![dns()], vec![], routes(10, 20), svcs());
+        assert_eq!(accepted(&m, "gw", "a"), "Ok");
+        assert_eq!(accepted(&m, "gw", "b"), "UnsupportedValue");
+        assert_eq!(
+            message(&route(&m, "gw", "b").parents[0].accepted),
+            "another UDPRoute is already bound to this listener"
+        );
+        let l = listener(&m, "public", "dns");
+        assert_eq!(l.attached_routes, 1);
+        assert_eq!(l.backends, [backend("gw", "resolver", "10.43.0.53", 53, 1)]);
+
+        let m = run_udp(vec![dns()], vec![], routes(20, 10), svcs());
+        assert_eq!(accepted(&m, "gw", "a"), "UnsupportedValue");
+        assert_eq!(accepted(&m, "gw", "b"), "Ok");
+        assert_eq!(
+            listener(&m, "public", "dns").backends,
+            [backend("gw", "other", "10.43.0.99", 53, 1)]
+        );
+    }
+
+    #[test]
+    fn udp_route_with_two_rules_is_refused() {
+        let m = run_udp(
+            vec![dns()],
+            vec![],
+            vec![
+                udp_route("gw", "r")
+                    .parent("public")
+                    .backend("resolver", 53)
+                    .second_rule()
+                    .backend("resolver", 53),
+            ],
+            vec![resolver()],
+        );
+        assert_eq!(accepted(&m, "gw", "r"), "UnsupportedValue");
+        assert_eq!(
+            message(&route(&m, "gw", "r").parents[0].accepted),
+            "a UDPRoute may have one rule"
+        );
+        let l = listener(&m, "public", "dns");
+        assert_eq!(l.attached_routes, 0);
+        assert!(!l.serving());
+    }
+
+    #[test]
+    fn tcp_and_udp_routes_on_one_port_number_each_get_their_listener() {
+        let gw = gateway("gw", "public")
+            .listener("dns-tcp", 53, "TCP")
+            .listener("dns-udp", 53, "UDP");
+        let m = run_udp(
+            vec![gw],
+            vec![
+                tcp_route("gw", "t")
+                    .parent("public")
+                    .port(53)
+                    .backend("tcp-dns", 53),
+            ],
+            vec![
+                udp_route("gw", "u")
+                    .parent("public")
+                    .port(53)
+                    .backend("udp-dns", 53),
+            ],
+            vec![
+                service("gw", "tcp-dns", "10.43.0.53", &[53]),
+                service("gw", "udp-dns", "10.43.0.54", &[]).udp_port(53),
+            ],
+        );
+        for name in ["t", "u"] {
+            assert_eq!(accepted(&m, "gw", name), "Ok", "{name}");
+            assert_eq!(resolved(&m, "gw", name), "Ok", "{name}");
+        }
+        assert_eq!(route(&m, "gw", "t").kind, RouteKind::Tcp);
+        assert_eq!(route(&m, "gw", "u").kind, RouteKind::Udp);
+        let tcp = listener(&m, "public", "dns-tcp");
+        assert_eq!(tcp.attached_routes, 1);
+        assert_eq!(
+            tcp.backends,
+            [backend("gw", "tcp-dns", "10.43.0.53", 53, 1)]
+        );
+        assert!(tcp.serving());
+        let udp = listener(&m, "public", "dns-udp");
+        assert_eq!(udp.attached_routes, 1);
+        assert_eq!(
+            udp.backends,
+            [backend("gw", "udp-dns", "10.43.0.54", 53, 1)]
+        );
+        assert!(udp.serving());
     }
 }

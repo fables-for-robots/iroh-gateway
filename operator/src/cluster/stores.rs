@@ -150,6 +150,8 @@ impl SnapshotSource for Stores {
             gateways: cloned(&self.gateways),
             tcp_routes: readable(&self.tcp_routes),
             http_routes: readable(&self.http_routes),
+            // Not watched yet: no UDPRoute is attached, so no UDP listener serves.
+            udp_routes: Vec::new(),
             edges: cloned(&self.edges),
             services: cloned(&self.services),
             namespaces: cloned(&self.namespaces),

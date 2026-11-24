@@ -13,6 +13,7 @@ use gateway_api::gateways::v1::{
 };
 use gateway_api::httproutes::v1::HttpRoute;
 use gateway_api::tcproutes::v1::TcpRoute;
+use gateway_api::udproutes::v1::UdpRoute;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{Patch, PatchParams};
@@ -90,6 +91,12 @@ impl StatusWriter {
                 }
                 Target::Route(RouteKind::Http, key) => {
                     Api::<HttpRoute>::namespaced(self.client.clone(), &key.namespace)
+                        .patch_status(&key.name, &params, &body)
+                        .await
+                        .map(drop)
+                }
+                Target::Route(RouteKind::Udp, key) => {
+                    Api::<UdpRoute>::namespaced(self.client.clone(), &key.namespace)
                         .patch_status(&key.name, &params, &body)
                         .await
                         .map(drop)
