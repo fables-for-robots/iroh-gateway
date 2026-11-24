@@ -316,7 +316,18 @@ Rules:
   301, 302, 303, 307 or 308; a header name outside `[A-Za-z0-9_-]`; an empty
   header value, in a match or a header filter; an empty `hostnames` entry
   (for a route it would widen the route to every host of the listener); a
-  control character in a path, header value or hostname.
+  path with a space, `#` or `?`, which can never match (HAProxy answers 400
+  to a request target with a space or `#`, and the query is not part of the
+  path); more than 16 header matches in one match; a control character in a
+  path, header value or hostname.
+- A `RequestHeaderModifier` beside a redirect is accepted and has no effect,
+  since no request is forwarded. A `ResponseHeaderModifier` applies to every
+  answer of its rule, a redirect and a 500 included.
+- Paths are matched as the request sends them, without normalising `..` or
+  repeated slashes: `/public/../admin` matches a `/public` prefix. A `Host`
+  with a trailing dot matches no listener or route hostname, only rules for
+  any host. A listener's `tls.options`, and
+  `tls` on an `HTTP` listener, are ignored.
 - An `HTTPRoute` with no rules attaches and answers 404.
 - Route precedence follows the Gateway API specification (hostname
   specificity, then exact path, longest prefix, method, header count, then
@@ -332,10 +343,19 @@ Rules:
 - One protocol family per port on a Gateway. `HTTPS` listeners with
   different hostnames may share a port; so may `HTTP` listeners. Any other
   mix on one port is `Conflicted`.
-- Listeners that share a port share one rule list: a request for
-  `foo.example.com` that matches none of that listener's paths can be
-  answered by a route of a `*.example.com` listener on the same port.
-  Listener isolation, an optional feature of the Gateway API, is not
+- Listeners that share a port share one rule list, but a more specific
+  listener owns its hostname against the routes of less specific listeners
+  on that port: a route host reached through a listener gives no rule when
+  another listener of the port, accepted and not conflicted (serving or
+  not), has a more specific hostname (in the precedence order of hosts) that
+  the host falls under. With listeners `*.example.com` and
+  `foo.example.com`, a route of the wildcard listener that names
+  `foo.example.com` gets no rule for it, and keeps its rules for
+  `*.example.com` and other hosts. The route stays `Accepted`. What remains:
+  a request for `foo.example.com` that matches none of that listener's
+  rules can still be answered by a rule for `*.example.com` or for any host
+  on the same port (closing that needs negated host conditions). Listener
+  isolation, an optional feature of the Gateway API, is therefore still not
   provided.
 - A listener may not use the edge's iroh port.
 - A TCP listener carries one `TCPRoute`. If several attach, the oldest
@@ -424,11 +444,13 @@ status:
 An `HTTPS` listener takes its certificates from `kubernetes.io/tls` Secrets
 in the Gateway's namespace; a reference to another namespace is
 `RefNotPermitted`. Certificates are checked only for accepted `HTTPS`
-listeners, with rustls, before anything reaches HAProxy:
+listeners of Gateways in a served namespace, with rustls, before anything
+reaches HAProxy:
 
 - `tls.crt` must hold at least one certificate and no private key (a
-  `tls.crt` with a key is refused with a message saying so); `tls.key`
-  exactly one private key.
+  `tls.crt` with a key is refused with a message saying so), and every
+  certificate in it must parse (`certificate <n> in tls.crt cannot be
+  read`); `tls.key` exactly one private key.
 - The key must be one rustls with ring can sign with: RSA of 2048 to 4096
   bits, ECDSA P-256 or P-384, or Ed25519; and it must belong to the first
   certificate.
@@ -441,7 +463,10 @@ listeners, with rustls, before anything reaches HAProxy:
 The certificate files are not a copy of the Secret. The operator writes only
 the certificates and the one private key it parsed and checked, re-encoded
 as PEM, so HAProxy reads exactly what was checked; comments and other blocks
-in the Secret are not passed on. A file is named after the Secret and the
+in the Secret are not passed on. An EC key in SEC1 form is written as
+PKCS#8, wrapped with the algorithm of the curve ring confirmed, and checked
+again in that form: OpenSSL does not read a SEC1 key without its optional
+curve parameters, which ring accepts. A file is named after the Secret and the
 first 16 hex characters of the SHA-256 of its content
 (`<namespace>.<name>.<hash>.pem`), and each `HTTPS` port lists its files in
 a crt-list named after its content in turn. A renewed certificate therefore
@@ -589,9 +614,14 @@ An edge that sends a stream or datagram for a listener id not in its current
   else, as an `emptyDir` does. Unix socket paths are short, so the runtime
   directory's path may be at most 60 bytes.
 - Global limits: `maxconn 8192`; `timeout client` and `timeout server` of
-  1 h, so a connection that is idle for an hour is closed.
-- `X-Forwarded-For` and `X-Forwarded-Proto` are set, replacing whatever the
-  visitor sent. WebSockets work.
+  1 h, so a connection that is idle for an hour is closed; a TLS handshake
+  must complete within 10 s (`timeout client-hs`).
+- `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` (the request's
+  `Host`) and `X-Forwarded-Port` (the port the visitor connected to) are
+  set, replacing whatever the visitor sent; `Forwarded` and `X-Real-IP` from
+  the visitor are removed. WebSockets work.
+- Response header filters are `http-after-response` rules, so they also
+  apply to the answers HAProxy makes itself: redirects and 500s.
 - Access logs go to stdout.
 
 ### Backends
@@ -614,7 +644,12 @@ model ──▶ haproxy.cfg + certificate files + edge listener lists + UDP tabl
 
 Nothing is applied before every watch has listed once. While some have not
 (a CRD is missing, or the operator may not list Secrets in a gateway
-namespace), the operator logs every 30 s which lists are missing.
+namespace), the operator logs every 30 s which lists are missing. Routes
+are watched so that one the operator's types cannot read is left out of the
+snapshot and logged by namespace and name, instead of failing the whole
+list. `Gateway`s, `GatewayClass`es and `Edge`s are not: an unreadable one
+holds up the first list, and afterwards its kind stays as last read, since
+a stale but serving state is safer than dropping a Gateway.
 
 Applying a new render:
 
@@ -626,25 +661,40 @@ Applying a new render:
    a hard-stop limit passes.
 4. If invalid, the running configuration stays, the affected Gateways go
    `Programmed=False` with the validator's message, and a metric counts it.
-5. If the reload itself fails or its outcome is lost, the operator no longer
-   assumes which configuration is live and tries the same render again
-   every 5 s.
+5. If HAProxy answers that the reload failed, the previous configuration is
+   written back and reloaded once: after a failed reload, HAProxy's master
+   re-executes without its listening sockets on the next failure, so two
+   failures in a row would leave every socket refusing connections. If that
+   reload does not succeed either, or the outcome of a reload is lost, the
+   operator no longer assumes which configuration is live.
+6. After a failed reload the operator tries again after 5 s, then after
+   twice as long each time, up to 5 minutes; a successful apply resets the
+   delay.
 
 Edge listener lists and the UDP table are applied after HAProxy is ready
 for them, so an edge never opens a port that has nothing behind it. Ports
-that the new render removes or re-points stop accepting streams before
-HAProxy is reloaded.
+that the new render removes or re-points, and `TCP` ports whose backend
+changes, stop accepting streams before HAProxy is reloaded.
 
-After an apply that failed, an edge keeps a port only if nothing behind it
-changed: the same listener, the same socket and the same frontend and
-backend text as the last configuration HAProxy loaded. Otherwise the port
-closes until an apply succeeds. A port must never keep serving a backend
-the cluster no longer assigns to it.
+During an apply and after one that failed, an edge keeps a port only if it
+keeps the same listener and the same socket as the last configuration
+HAProxy loaded, and either the same frontend and backend text or, for an
+`HTTP` or `HTTPS` port, is such a port in both. A `TCP` port whose backend
+changed closes until an apply succeeds: it must never keep serving a backend
+the cluster no longer assigns to it. An `HTTP` or `HTTPS` port serves many
+routes and hosts, so it keeps forwarding to HAProxy's socket, which serves
+the rules HAProxy last loaded: a route that was changed or deleted stays
+served by its old rules until a configuration loads, with
+`Programmed=False` on the Gateway meanwhile. Closing it instead would take
+every host of the port down for one route's change. It closes when it
+leaves the plan, changes socket, or becomes a `TCP` port.
 
 **Known limit: long-lived connections.** Any change to a serving listener's
 routes, backends or certificates, in any namespace, reloads HAProxy. A connection that is
 still open 30 minutes after a reload (`hard-stop-after 30m`), or after 50
-further reloads (`mworker-max-reloads 50`), is closed. SSH and database
+further reloads (`mworker-max-reloads 50`), is closed. A refused reload
+counts twice, since the previous configuration is reloaded after it; the
+retry delay grows so that a failure that persists reloads rarely. SSH and database
 sessions notice this. The real fix is to change backends through HAProxy's
 runtime API without reloading; that is later work.
 
@@ -675,7 +725,8 @@ runtime API without reloading; that is later work.
 - **Toolchain.** Rust 1.100 (`rust-version = "1.100"`). nixpkgs 26.05 ships
   1.95 and unstable 1.99, so the flake takes the toolchain from
   `oxalica/rust-overlay`, pinned by a `rust-toolchain.toml`.
-- **Flake** dev shell: that toolchain, `haproxy`, `kind`, `kubectl`, `helm`.
+- **Flake** dev shell: that toolchain, `haproxy`, `kind`, `kubectl`, `helm`,
+  and `openssl`, which the HTTPS tests use to make RSA and SEC1 keys.
 - **License** AGPL-3.0-or-later, as the sibling projects.
 
 ## Observability

@@ -1,6 +1,7 @@
 //! Runs HAProxy in master-worker mode and applies new configurations to it: each one is
 //! validated with `haproxy -c` first, loaded through the master socket's `reload`, and taken
-//! back on disk when the reload fails.
+//! back on disk when the reload fails; after a reload HAProxy refused, the previous
+//! configuration is reloaded once.
 //!
 //! The files a configuration names besides itself (certificates with their keys) live in
 //! `<runtime_dir>/certs`. A file is kept as long as a configuration HAProxy runs, or may run,

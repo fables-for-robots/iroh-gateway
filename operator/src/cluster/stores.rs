@@ -59,9 +59,9 @@ pub trait SnapshotSource: Send {
 /// TCPRoutes and HTTPRoutes are watched through [`DeserializeGuard`]: a route the operator's
 /// types cannot read (a filter type from the experimental channel, say) is left out of the
 /// snapshot and logged by namespace and name, once per `resourceVersion`, and every other route
-/// is served. Every other kind is watched typed: one object that does not read fails its whole
-/// list, so that the store keeps what it last listed (and before the first list nothing is
-/// applied at all) until the object is fixed. For `Gateway`s, `GatewayClass`es and `Edge`s that
+/// is served. Every other kind is watched typed: an object that does not read is never taken
+/// in, and fails every list, so that the store keeps the objects as it last read them (and
+/// before the first list nothing is applied at all) until the object is fixed. For `Gateway`s, `GatewayClass`es and `Edge`s that
 /// is on purpose: a stale but serving state is safer than dropping a Gateway.
 pub struct Stores {
     gateway_classes: Store<GatewayClass>,
