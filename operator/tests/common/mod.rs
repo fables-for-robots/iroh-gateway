@@ -146,6 +146,9 @@ pub async fn udp_roundtrip(to: SocketAddr, payload: &[u8]) -> Vec<u8> {
 }
 
 /// [`udp_roundtrip`] from `socket`, so that every attempt is one flow of the same visitor.
+///
+/// The answer is the first from `to` whatever its payload, so that a misdelivered answer shows;
+/// a test must therefore leave no answer queued on `socket` from an earlier exchange.
 pub async fn udp_roundtrip_from(socket: &UdpSocket, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; MAX_PACKET];
     timeout(STEP, async {

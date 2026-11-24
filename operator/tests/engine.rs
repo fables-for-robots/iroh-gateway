@@ -1542,8 +1542,7 @@ async fn edge_that_leaves_the_plan_loses_its_udp_port() {
 #[tokio::test]
 async fn udp_targets_change_before_haproxy_reloads() {
     let w = World::new().await;
-    let a = udp_backend().await;
-    let b = udp_echo_server().await;
+    let (a, b) = (udp_backend().await, udp_backend().await);
     let tools = short_dir();
     let edge = w.edge().await;
     let (p, q, u) = (free_tcp_port(), free_tcp_port(), free_udp_port());
@@ -1562,27 +1561,27 @@ async fn udp_targets_change_before_haproxy_reloads() {
 
     // A TCP port is added, so HAProxy reloads, slowly; u moves to b.
     std::fs::write(tools.path().join("slow"), "").unwrap();
-    let next = w.udp_plan(&[p, q], &[(u, b)], &edges);
+    let next = w.udp_plan(&[p, q], &[(u, addr(&b))], &edges);
     let applying = async {
         engine.apply(next).await;
         Instant::now()
     };
     let during = async {
         // Well inside the second `haproxy -c` takes: the old configuration still runs.
-        sleep(Duration::from_millis(400)).await;
-        for _ in 0..3 {
-            let _ = visitor.send_to(b"during", public(u)).await;
-        }
-        nothing_arrives(&a, &[b"during"]).await;
+        sleep(Duration::from_millis(200)).await;
+        // The new target is reached before HAProxy has the new configuration.
+        deliver(&visitor, u, b"during", &b).await;
         Instant::now()
     };
-    let (applied_at, checked_at) = tokio::join!(applying, during);
-    assert!(checked_at < applied_at, "the reload ended before the check");
-    assert_eq!(engine.facts().haproxy, Ok(()));
-    assert_eq!(
-        udp_roundtrip_from(&visitor, public(u), b"after").await,
-        b"after"
+    let (applied_at, reached_at) = tokio::join!(applying, during);
+    assert!(
+        reached_at < applied_at,
+        "b was reached only after the reload"
     );
+    // And the old target got none of what was sent while HAProxy reloaded.
+    nothing_arrives(&a, &[b"during"]).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    deliver(&visitor, u, b"after", &b).await;
     echoes_on(q, b"q").await;
     engine.shutdown().await;
     edge.shutdown().await;
