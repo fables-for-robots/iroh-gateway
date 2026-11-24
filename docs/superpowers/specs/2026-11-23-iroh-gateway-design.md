@@ -1,7 +1,7 @@
 # iroh-gateway — Design
 
 Date: 2026-11-23
-Status: approved design; build steps 1 to 3 are built (see "Build order")
+Status: approved design; build steps 1 to 4 are built (see "Build order")
 
 ## Overview
 
@@ -246,10 +246,26 @@ One setting, with the same value on the operator and on its edges:
   packet as QUIC datagrams.
 - Closes all public listeners a few seconds after the tunnel drops, so
   visitors fail fast and a future health check sees the edge as down.
-- Enforces a cap on concurrent connections and UDP flows and refuses new
-  ones beyond it. The default is 2048 connections and the most that can be
-  configured is 4096; the worst case is about 400 KiB of memory per
-  connection.
+- Enforces a cap on concurrent connections and refuses new ones beyond it.
+  The default is 2048 connections and the most that can be configured is
+  4096; the worst case is about 400 KiB of memory per connection.
+- Enforces a cap on UDP flows (default and most 4096) by evicting, not
+  refusing: at the cap a new flow replaces the least recently used one.
+  Refusing would let anyone who sprays packets from made-up source addresses
+  (about 70 a second fill 4096 flows that live for 60 s) keep every real
+  visitor out; evicting costs the attacker's flows nothing but lets new
+  visitors in. A flow is also forgotten after 60 s without a packet in either
+  direction, when the tunnel's session changes, and when its port closes.
+- Optionally limits the UDP it sends into the tunnel (`--udp-rate-limit`,
+  bytes per second, off by default). The limit counts datagram bytes: each
+  packet's payload plus the 18-byte header of every piece it is split into,
+  so tiny and empty packets are not free. A token bucket holds at most
+  `max(rate, 65 535 + 64 × 18)` bytes, so the largest packet can pass even a
+  small limit, and starts full. A packet that does not fit is dropped before
+  it makes a flow. The reason: QUIC sends datagrams ahead of stream data, so
+  a UDP flood that fills the tunnel slows every TCP and HTTP stream of the
+  same edge, and no share of the tunnel is reserved for TCP. Replies from the
+  operator are not limited.
 - Does not let a visitor hold a connection slot indefinitely:
   - a connection that accepts no data for 300 s while data is waiting for
     it is aborted;
@@ -342,7 +358,11 @@ Rules:
   later; refusing is the safe subset.
 - One protocol family per port on a Gateway. `HTTPS` listeners with
   different hostnames may share a port; so may `HTTP` listeners. Any other
-  mix on one port is `Conflicted`.
+  mix on one port is `Conflicted`. The exception is `UDP`: it is its own
+  family, and a `UDP` listener may use the same port number as a `TCP`,
+  `HTTP` or `HTTPS` one (DNS on 53), the two being different sockets on the
+  edge, bound and routed separately. Two `UDP` listeners on one port
+  conflict.
 - Listeners that share a port share one rule list, but a more specific
   listener owns its hostname against the routes of less specific listeners
   on that port: a route host reached through a listener gives no rule when
@@ -358,10 +378,10 @@ Rules:
   isolation, an optional feature of the Gateway API, is therefore still not
   provided.
 - A listener may not use the edge's iroh port.
-- A TCP listener carries one `TCPRoute`. If several attach, the oldest
-  wins and the others are not accepted.
-- An edge opens a `TCP` listener's port only once the listener has a route
-  with at least one usable backend. An `HTTP` or `HTTPS` port opens once a
+- A TCP listener carries one `TCPRoute`, and a UDP listener one `UDPRoute`.
+  If several attach, the oldest wins and the others are not accepted.
+- An edge opens a `TCP` or `UDP` listener's port only once the listener has
+  a route with at least one usable backend. An `HTTP` or `HTTPS` port opens once a
   route is attached to one of its listeners, because a route can answer
   without a backend (a redirect, or 500 for a rule whose backends are all
   unusable); an `HTTPS` listener also needs usable certificates. Until then
@@ -543,6 +563,13 @@ Receive memory is bounded explicitly, because the QUIC defaults are not:
   operator hold: about 4096 × 192 KiB + 64 MiB ≈ 830 MiB in the worst case.
   The shipped memory limit of 1 GiB fits one edge and must be raised by
   about that much for each further edge.
+- UDP adds per edge on the operator: 4 MiB of reassembly, 1 MiB of received
+  datagrams not yet read and 256 KiB of datagrams queued to send, about
+  5.3 MiB, small against the figure above, so the worst case is about
+  835 MiB and the shipped limit still fits one edge. The kernel's buffers of
+  the flow sockets (one per flow, at most 4096 per edge) are not counted.
+  The edge holds the same 4 MiB, 1 MiB and 256 KiB for its session, and
+  queues at most 256 replies per UDP port.
 - The edge has no such connection-wide cap on purpose: with one, a few
   hundred visitors that stop reading could stall every other visitor.
 - The stream header is at most 256 bytes and must arrive within 5 s.
@@ -561,27 +588,62 @@ truncated request from the message framing. In return nothing outside the
 operator's container can reach the sockets, and no ports have to be
 allocated.
 
-**UDP.** Each visitor packet travels as one or more QUIC datagrams:
+**UDP.** Each visitor packet travels as one or more QUIC datagrams, in both
+directions, behind a header of 18 bytes, big-endian:
 
 ```
-listener id | flow id | packet id | fragment index | fragment count | payload
+listener id u32 | flow id u64 | packet id u32 | fragment index u8 | fragment count u8 | payload
 ```
 
-- The edge assigns a flow id per (visitor address, listener) and forgets it
-  after an idle timeout (default 60 s).
+- The edge assigns a flow id per (visitor address, port) and forgets it
+  after 60 s without a packet in either direction. Flow ids are never reused,
+  and the edge forgets every flow when the session
+  changes, so a reply can only reach a visitor of the session whose operator
+  saw that visitor's packets. The operator keeps at most 4096 flows per
+  edge too, and evicts the least recently used one at the cap.
 - On an unknown flow id the operator picks a backend from the `UDPRoute` by
-  weight, opens a UDP socket to it, and keeps the pairing until idle
-  timeout. Replies travel back under the same flow id and the edge sends
-  them to the visitor from the listener's socket.
-- A packet larger than `max_datagram_size()` minus the header is split into
-  fragments. The receiver reassembles within a short window and drops
-  incomplete packets. `max_datagram_size()` is read per send because it
-  changes with the path.
-- Delivery stays unreliable and unordered, which is what UDP promises.
-  Reliable streams were rejected because they add head-of-line blocking.
+  weight, opens a UDP socket connected to it, and keeps the pairing until
+  the idle timeout. Replies travel back under the same flow id and the edge
+  sends them to the visitor from the listener's socket. The backend sees
+  the operator pod, not the visitor.
+- A flow ends when its listener id leaves the routes or its backend is no
+  longer listed for the listener with a weight above 0. A backend set to
+  weight 0 therefore loses its flows at once: UDP has nothing to drain. The
+  socket closes with the flow, so no reply of the old backend reaches a
+  visitor afterwards.
+- A packet may carry up to 65 535 bytes (`MAX_PACKET`). One that does not
+  fit `max_datagram_size()` minus the header is split into at most 64 pieces
+  (`MAX_FRAGMENTS`); one that would need more is dropped.
+  `max_datagram_size()` is read for every packet, because it changes with
+  the path; `None`, or a size not above the header, drops the packet. The
+  receiver reassembles within 1 s of a packet's first piece and drops what
+  is incomplete.
+- Reassembly is bounded: per edge session, at most 4 MiB, counting each
+  stored piece's payload plus a small overhead for the piece and for its
+  packet, so many tiny pieces cannot exceed it. When it is full, the oldest
+  incomplete packets give way. A datagram that is shorter than the header,
+  has a count of 0 or above 64, an index not below its count, or belongs to a
+  packet above 65 535 bytes is dropped; none of it ends a session.
+- Nothing waits, retries or blocks for a UDP packet. Sends use
+  `send_datagram`, never a variant that waits, sockets send without
+  blocking, and what does not fit is dropped. Delivery stays unreliable and
+  unordered, which is what UDP promises. Reliable streams were rejected
+  because they add head-of-line blocking.
+- QUIC sends datagrams ahead of stream data. A UDP flood that fills the
+  tunnel therefore slows TCP and HTTP through the same edge; the edge's
+  optional rate limit (see "What an edge does") bounds it.
+- On an edge with several public addresses of one family, replies leave
+  from the address the system's routing picks, not necessarily the one the
+  visitor sent to. Fixing that needs `IP_PKTINFO`, which is not built.
 
-An edge that sends a stream or datagram for a listener id not in its current
-`Config` gets that stream reset or datagram dropped, and the event counted.
+A stream for a listener id not in the operator's current `Config` is reset
+and counted. A datagram for such an id is dropped, and counted: quietly when
+the id belonged to an earlier `Config` of the link (the edge had not applied
+the newest one yet, which happens at every change), and as a warning when
+the operator never issued the id, or issued it to a TCP listener, because
+the edge is then broken. A datagram under a known flow id with a different
+listener id is dropped. Each reason is counted separately and logged
+without flooding.
 
 ## Data path in the operator
 
@@ -671,12 +733,20 @@ Applying a new render:
    twice as long each time, up to 5 minutes; a successful apply resets the
    delay.
 
-Edge listener lists and the UDP table are applied after HAProxy is ready
-for them, so an edge never opens a port that has nothing behind it. Ports
-that the new render removes or re-points, and `TCP` ports whose backend
-changes, stop accepting streams before HAProxy is reloaded.
+Edge listener lists are applied after HAProxy is ready for them, so an edge
+never opens a TCP port that has nothing behind it. Ports that the new render
+removes or re-points, and `TCP` ports whose backend changes, stop accepting
+streams before HAProxy is reloaded.
 
-During an apply and after one that failed, an edge keeps a port only if it
+UDP does not depend on HAProxy: a UDP listener adds nothing to
+`haproxy.cfg`, and the UDP table of a running link follows every render at
+once, whether or not HAProxy takes that render's configuration, because UDP
+has no HAProxy state to be consistent with. Flows whose backend left the
+table end at once (see "Tunnel protocol"). Only the ports asked of the
+edge keep the order: the table is set first, then the edge is asked for the
+port, so an edge never opens a UDP port that has nothing behind it.
+
+During an apply and after one that failed, an edge keeps a TCP-family port only if it
 keeps the same listener and the same socket as the last configuration
 HAProxy loaded, and either the same frontend and backend text or, for an
 `HTTP` or `HTTPS` port, is such a port in both. A `TCP` port whose backend
@@ -753,13 +823,14 @@ HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
   the operator writes. No nodes, no pods.
 - **End to end.** A kind cluster with the manifests installed (the chart
   once it exists) and the edge as a pod: TCP, HTTP, an HTTP redirect, HTTPS
-  with a test certificate and its rotation, and later UDP, requests through
-  the edge to in-cluster services, and status assertions on `Gateway`,
+  with a test certificate and its rotation, UDP (a packet through the edge to a
+  backend that answers it, and its end when the `UDPRoute` is deleted),
+  requests through the edge to in-cluster services, and status assertions on `Gateway`,
   routes and `Edge`.
 
 ## Build order
 
-Each step ends in something that runs. Steps 1 to 3 are built.
+Each step ends in something that runs. Steps 1 to 4 are built.
 
 1. Tunnel with static configuration: `proto`, edge, operator-side endpoint,
    TCP forwarding to a fixed target. No Kubernetes. (Built.)
@@ -767,7 +838,7 @@ Each step ends in something that runs. Steps 1 to 3 are built.
    HAProxy supervision, status. Raw TCP works in a cluster. (Built.)
 3. HTTP and HTTPS: `HTTPRoute`, TLS termination, redirects and header
    filters. (Built.)
-4. UDP: datagram protocol with fragmentation, `UDPRoute`.
+4. UDP: datagram protocol with fragmentation, `UDPRoute`. (Built.)
 5. Packaging and docs: chart, image, edge releases, NixOS module, README
    with a walkthrough including cert-manager and external-dns.
 

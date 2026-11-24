@@ -1,10 +1,10 @@
 # iroh-gateway
 
-iroh-gateway is a TCP tunnel between a small public machine (the edge) and a private machine (the operator, for example a home cluster). The operator dials out to the edge over iroh (QUIC, peers identified by ed25519 key), so the private side needs no open port and no public address. Visitors connect to the edge, and their connections are carried through the tunnel to a target next to the operator. The design is in [the spec](docs/superpowers/specs/2026-11-23-iroh-gateway-design.md).
+iroh-gateway is a TCP and UDP tunnel between a small public machine (the edge) and a private machine (the operator, for example a home cluster). The operator dials out to the edge over iroh (QUIC, peers identified by ed25519 key), so the private side needs no open port and no public address. Visitors connect to the edge, and their connections and packets are carried through the tunnel to a target next to the operator. The design is in [the spec](docs/superpowers/specs/2026-11-23-iroh-gateway-design.md).
 
 ## Status
 
-The edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, HTTP and HTTPS (see [Kubernetes](#kubernetes); the images are not published yet).
+The edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, UDP, HTTP and HTTPS (see [Kubernetes](#kubernetes); the images are not published yet).
 
 ## Build
 
@@ -94,6 +94,8 @@ On a real deployment the edge runs on the public machine with `--iroh-listen <pu
 | | `--iroh-listen <addr>` (`IROH_GATEWAY_EDGE_IROH_LISTEN`) | `0.0.0.0:7842` |
 | | `--public-bind <ip>` (`IROH_GATEWAY_EDGE_PUBLIC_BIND`) | `::` |
 | | `--max-connections <n>` (`IROH_GATEWAY_EDGE_MAX_CONNECTIONS`), 1 to 4096; about 400 KiB per connection in the worst case | `2048` |
+| | `--max-udp-flows <n>` (`IROH_GATEWAY_EDGE_MAX_UDP_FLOWS`), 1 to 4096; at the cap a new UDP flow replaces the least recently used one | `4096` |
+| | `--udp-rate-limit <BYTES_PER_SECOND>` (`IROH_GATEWAY_EDGE_UDP_RATE_LIMIT`), 1 or more; see [UDP](#udp) | no limit |
 | | `--tunnel-grace <duration>` (`IROH_GATEWAY_EDGE_TUNNEL_GRACE`), for example `5s` | `5s` |
 | | `--relay <disabled\|n0\|URL>` (`IROH_GATEWAY_EDGE_RELAY`) | `disabled` |
 
@@ -121,31 +123,38 @@ address = "203.0.113.7:7842"   # optional when relay is not "disabled"
 protocol = "tcp"
 port = 8080
 target = "127.0.0.1:3000"
+
+[[edge.listener]]
+protocol = "udp"              # "tcp" or "udp"; both may use one port number
+port = 5353
+target = "127.0.0.1:5353"
 ```
 
-A relative `key_file` is taken relative to the directory of the configuration file. An `address` is `host:port`: an IP address (IPv6 in brackets, as in `[2001:db8::1]:7842`) or a DNS name, and a port from 1 to 65535. Unknown fields, a file without any `[[edge]]`, an edge listed twice, an edge without listeners, a listener on port 0, two listeners with the same protocol and port in one edge, a malformed `address`, and a missing `address` while `relay` is `disabled` are rejected at start.
+A UDP listener forwards each visitor's packets to its `target` as described under [UDP](#udp) (flows, limits, the backend seeing the operator's address); a listener has one target. A relative `key_file` is taken relative to the directory of the configuration file. An `address` is `host:port`: an IP address (IPv6 in brackets, as in `[2001:db8::1]:7842`) or a DNS name, and a port from 1 to 65535. Unknown fields, a file without any `[[edge]]`, an edge listed twice, an edge without listeners, a listener on port 0, two listeners with the same protocol and port in one edge (a `tcp` and a `udp` listener may share a port number), a malformed `address`, and a missing `address` while `relay` is `disabled` are rejected at start.
 
 ## Kubernetes
 
-`iroh-gateway-operator run` turns the operator into a Gateway API controller. It watches `GatewayClass`, `Gateway`, `TCPRoute`, `HTTPRoute`, `Service` and `Namespace` objects, the `Edge` resource of this project, and the TLS Secrets of the namespaces it serves Gateways in. It runs HAProxy as a child process, which forwards TCP listeners to their backend Service and routes HTTP and HTTPS requests by host, path, method and header, terminating TLS in the cluster. It tells every edge which public ports to open, and writes status back to the objects.
+`iroh-gateway-operator run` turns the operator into a Gateway API controller. It watches `GatewayClass`, `Gateway`, `TCPRoute`, `UDPRoute`, `HTTPRoute`, `Service` and `Namespace` objects, the `Edge` resource of this project, and the TLS Secrets of the namespaces it serves Gateways in. It runs HAProxy as a child process, which forwards TCP listeners to their backend Service and routes HTTP and HTTPS requests by host, path, method and header, terminating TLS in the cluster. UDP listeners do not go through HAProxy: the operator forwards their packets itself (see [UDP](#udp)). It tells every edge which public ports to open, and writes status back to the objects.
 
 What this step does and does not do:
 
-- `TCP`, `HTTP` and `HTTPS` listeners, `TCPRoute` and `HTTPRoute` (see [HTTP and HTTPS](#http-and-https) for what an `HTTPRoute` may use). There is no UDP, no TLS passthrough and no `TLSRoute` or `GRPCRoute` yet; a listener with any other protocol is not accepted.
+- `TCP`, `UDP`, `HTTP` and `HTTPS` listeners, `TCPRoute`, `UDPRoute` and `HTTPRoute` (see [UDP](#udp) and [HTTP and HTTPS](#http-and-https) for what a `UDPRoute` and an `HTTPRoute` may use). There is no TLS passthrough and no `TLSRoute` or `GRPCRoute` yet; a listener with any other protocol is not accepted.
 - One operator replica. The manifests use one replica with the `Recreate` strategy; running two would make both dial the edges and write the same status.
 - The images are not published yet. `deploy/operator.yaml` names `ghcr.io/fables-for-robots/iroh-gateway-operator:0.1.0`, which does not exist until the packaging step is done. Build the images yourself and load them into your cluster (see below).
-- No health endpoint, no metrics, no NetworkPolicy. The operator pod must be able to send UDP to the edges and TCP to the backend Services.
+- No health endpoint, no metrics, no NetworkPolicy. The operator pod must be able to send UDP to the edges, and TCP and UDP to the backend Services.
 - Everything the manifests create lives in the namespace `iroh-gateway`.
 - Long-lived connections. A configuration change anywhere (any serving listener's routes, backends or certificates, in any namespace) reloads HAProxy. Connections that are still open 30 minutes after a reload, or after 50 further reloads, are closed, and a connection idle for an hour is closed. This is a known limit of this step for long-lived TCP such as SSH or database sessions.
-- Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The manifest's limit of 1 GiB fits one edge; raise it by about that much for each further edge.
+- Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The manifest's limit of 1 GiB fits one edge; raise it by about that much for each further edge. UDP adds about 5.3 MiB per edge to the worst case (a 4 MiB budget for reassembling large packets, 1 MiB of received datagrams and 256 KiB queued to send), which the 1 GiB limit still covers; the kernel's buffers for the flow sockets (one per UDP flow, up to 4096 per edge) are not counted.
 
 ### Prerequisites
 
-The Gateway API v1.7.0 standard CRDs, which include `HTTPRoute` and `TCPRoute`:
+The Gateway API v1.7.0 standard CRDs, which include `HTTPRoute`, `TCPRoute` and `UDPRoute`:
 
 ```sh
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 ```
+
+The `UDPRoute` CRD must be installed: the operator applies nothing until every kind it watches has been listed once.
 
 ### Install
 
@@ -469,9 +478,57 @@ A `TCPRoute` or `HTTPRoute` the operator cannot read (one that uses a field valu
 - A `Host` with a trailing dot (`www.example.com.`) matches no hostname of a listener or route; only rules for any host apply to it.
 - A listener's `tls.options`, and `tls` on an `HTTP` listener, are ignored.
 
+### UDP
+
+A `UDP` listener and a `UDPRoute` forward packets through the tunnel as QUIC datagrams, without HAProxy. The edge opens the UDP port, the operator sends each visitor's packets to the backend Service's cluster IP and port, and the backend's replies go back to the visitor from the same port. The `Gateway` gets a listener, and a route names it and a Service (which needs a `UDP` port with that number):
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: iroh-gateway
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: dns
+      protocol: UDP
+      port: 53
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata:
+  name: dns
+  namespace: iroh-gateway
+spec:
+  parentRefs:
+    - name: public
+      sectionName: dns
+  rules:
+    - backendRefs:
+        - name: dns
+          port: 53
+```
+
+The edge's `Service` (or firewall) must let UDP on that port in. `scripts/e2e-kind.sh` sends packets through such a route to a backend that answers them.
+
+What to know:
+
+- **The backend sees the operator pod,** not the visitor, as with TCP.
+- **A flow is a visitor's address and port.** It lasts 60 s after its last packet in either direction. The operator picks the flow's backend by weight when the flow begins, so a visitor who returns after the flow has ended may get another backend. A flow ends at once when its backend is no longer listed in the route with a weight above 0 (a backend set to weight 0 loses its flows immediately; UDP has no draining), and when its route or listener goes away.
+- **At most 4,096 flows per edge.** At the limit a new flow replaces the least recently used one, so someone spraying packets from made-up source addresses cannot shut new visitors out, though they can push existing flows out. `--max-udp-flows` lowers the limit on an edge.
+- **Packets up to 65,535 bytes work.** A packet larger than one QUIC datagram (1,200 bytes on a new path, up to 1,452 once the path is known to take it) is split into at most 64 pieces inside the tunnel, each with an 18-byte header, and put back together within 1 s on the other side. One lost piece loses the packet, as with IP fragments, and delivery is neither ordered nor retried, as with UDP. Reassembly holds at most 4 MiB of pieces per edge session, counting a small overhead for each piece.
+- **A `UDP` and a `TCP`, `HTTP` or `HTTPS` listener may share a port number** on one `Gateway` (DNS on 53, for example). Two `UDP` listeners on one port conflict. A `UDP` listener takes one `UDPRoute` with one rule (the oldest wins), as a `TCP` listener does.
+- **A UDP flood slows TCP and HTTP through the same edge.** QUIC sends datagrams ahead of stream data, so UDP that fills the tunnel starves the streams. `--udp-rate-limit <BYTES_PER_SECOND>` on the edge bounds it: it limits the UDP bytes the edge sends into the tunnel, counting each packet's payload plus an 18-byte header for every piece it is split into, and drops packets beyond it. Its burst is at least one largest packet (65,535 bytes plus 64 headers), so a small limit still lets a big packet through now and then. It is off by default and does not limit replies coming back from the operator.
+- **On an edge with several public addresses,** replies leave from the address the system's routing picks, which may not be the one the visitor sent to.
+- **UDP keeps following the cluster while HAProxy refuses a configuration:** the targets of UDP listeners change with every render, whether or not HAProxy takes it.
+- **Packets are dropped quietly when they cannot be delivered:** a full tunnel, a packet no path can carry, a flow whose backend left, a datagram for a listener that an earlier configuration of the edge still named. A datagram for a listener id the operator never issued, or for a TCP listener, is logged as a warning, because the edge is then broken.
+
 ### Upgrading from the TCP-only version
 
-The new version watches `HTTPRoute`s and TLS Secrets, which the old RBAC rules do not allow. Apply `deploy/rbac.yaml` before switching to the new image; otherwise the operator waits for its permissions, logging which lists it cannot get, and applies nothing, so no edge serves any port until the rules are in place.
+The new version watches `HTTPRoute`s, `UDPRoute`s and TLS Secrets, which the old RBAC rules do not allow. Apply `deploy/rbac.yaml` before switching to the new image; otherwise the operator waits for its permissions, logging which lists it cannot get, and applies nothing, so no edge serves any port until the rules are in place. The `UDPRoute` CRD must also be installed, as it is with the standard channel of Gateway API v1.7.0; without it the operator applies nothing either.
+
+Old and new binaries work together: an edge of the previous version answers a `UDP` listener with a bind error, and a previous operator never asks for one. Update the edges to serve UDP.
 
 ### `iroh-gateway-operator run`
 
@@ -496,13 +553,13 @@ Every condition below is also visible with `kubectl describe`. A False condition
 | `GatewayClass` (ours) | `Accepted` | Always True. |
 | `Gateway` | `Accepted` | False with `NamespaceNotAllowed` (the namespace is not in `--gateway-namespaces`), `UnsupportedAddress` (`spec.addresses` is set; addresses come from the edges) or `ListenersNotValid` (no listener is both accepted and free of conflicts). True with reason `ListenersNotValid` when the Gateway works but some listeners do not: refused, conflicted, or `HTTPS` without a usable certificate. |
 | | `Programmed` | False with `Invalid` (the Gateway is not accepted, or HAProxy refused the configuration), `AddressNotAssigned` (no accepted `Edge` is bound to the Gateway) or `Pending` (no bound edge is connected with every serving port open). |
-| Listener | `Accepted` | False with `UnsupportedProtocol` (only `TCP`, `HTTP` and `HTTPS`; `HTTPS` only with `tls.mode` `Terminate`), `UnsupportedValue` (the `hostname` of an `HTTP` or `HTTPS` listener is not a DNS name or a `*.` wildcard) or `PortUnavailable` (not between 1 and 65535). A `TCP` listener's `hostname` is ignored. |
-| | `Conflicted` | True with `HostnameConflict` (several `TCP` listeners on one port, or several `HTTP` or several `HTTPS` listeners on one port with the same `hostname`) or `ProtocolConflict` (listeners on one port with different protocols); the conflicting listeners are then unusable. `HTTP` listeners with different hostnames share a port, and so do `HTTPS` listeners. |
-| | `ResolvedRefs` | False with `InvalidRouteKinds` (`allowedRoutes.kinds` lists a kind other than the protocol's: `TCPRoute` for `TCP`, `HTTPRoute` for `HTTP` and `HTTPS`; the listener keeps working with its own kind if that is listed too), and for an `HTTPS` listener `InvalidCertificateRef` or `RefNotPermitted` (see [Certificates](#http-and-https)), which replace `InvalidRouteKinds`. |
+| Listener | `Accepted` | False with `UnsupportedProtocol` (only `TCP`, `UDP`, `HTTP` and `HTTPS`; `HTTPS` only with `tls.mode` `Terminate`), `UnsupportedValue` (the `hostname` of an `HTTP` or `HTTPS` listener is not a DNS name or a `*.` wildcard) or `PortUnavailable` (not between 1 and 65535). A `TCP` listener's `hostname` is ignored. |
+| | `Conflicted` | True with `HostnameConflict` (several `TCP` or several `UDP` listeners on one port, or several `HTTP` or several `HTTPS` listeners on one port with the same `hostname`) or `ProtocolConflict` (listeners on one port with different protocols); the conflicting listeners are then unusable. `HTTP` listeners with different hostnames share a port, and so do `HTTPS` listeners. A `UDP` listener and a `TCP`, `HTTP` or `HTTPS` listener on one port do not conflict. |
+| | `ResolvedRefs` | False with `InvalidRouteKinds` (`allowedRoutes.kinds` lists a kind other than the protocol's: `TCPRoute` for `TCP`, `UDPRoute` for `UDP`, `HTTPRoute` for `HTTP` and `HTTPS`; the listener keeps working with its own kind if that is listed too), and for an `HTTPS` listener `InvalidCertificateRef` or `RefNotPermitted` (see [Certificates](#http-and-https)), which replace `InvalidRouteKinds`. |
 | | `Programmed` | False with `Invalid` (the listener, its Gateway, or HAProxy is at fault; for an `HTTPS` listener without usable certificates, the `ResolvedRefs` message) or `Pending` (no connected edge reports this listener's port open, or, for a listener without a route, no edge is connected; the message names the edges that cannot bind the port, or those not connected and those that have not reported it). True as soon as one edge has the port open, whatever the Gateway's other ports do. |
-| `TCPRoute`, per parent | `Accepted` | False with `NoMatchingParent` (no listener matches `sectionName` and `port`), `NotAllowedByListeners` (no usable listener admits routes of this kind from the route's namespace) or `UnsupportedValue` (more than one rule, or another `TCPRoute` already holds the listener). |
+| `TCPRoute` and `UDPRoute`, per parent | `Accepted` | False with `NoMatchingParent` (no listener matches `sectionName` and `port`), `NotAllowedByListeners` (no usable listener admits routes of this kind from the route's namespace) or `UnsupportedValue` (more than one rule, or another route of the same kind already holds the listener). |
 | `HTTPRoute`, per parent | `Accepted` | False with `NoMatchingParent`, `NotAllowedByListeners`, `NoMatchingListenerHostname` (no listener that admits the route shares a hostname with it) or `UnsupportedValue` (the route uses something the operator does not support; see [HTTP and HTTPS](#http-and-https)). |
-| `TCPRoute` and `HTTPRoute`, per parent | `ResolvedRefs` | False with `InvalidKind` (the backend is not a core `Service`), `RefNotPermitted` (the Service is in another namespace), `BackendNotFound` (no such Service, an `ExternalName` Service, no cluster IP, or no TCP port with that number) or `UnsupportedValue` (the backend has no valid port). |
+| `TCPRoute`, `UDPRoute` and `HTTPRoute`, per parent | `ResolvedRefs` | False with `InvalidKind` (the backend is not a core `Service`), `RefNotPermitted` (the Service is in another namespace), `BackendNotFound` (no such Service, an `ExternalName` Service, no cluster IP, or no port with that number of the route's protocol: `UDP` for a `UDPRoute`, otherwise TCP) or `UnsupportedValue` (the backend has no valid port). |
 | `Edge` | `Accepted` | False with `NamespaceNotAllowed`, `InvalidEndpointId`, `NoAddress` (`address` is required while the operator uses no relay), `NoPublicAddress` (no `address` and no `publicAddresses`), `InvalidPublicAddress` (an entry of `publicAddresses` is neither an IP address nor a DNS name; a port is not allowed), `InvalidAddress`, `GatewayNotFound` (no `Gateway` of ours with `gatewayRef.name` in the same namespace), `GatewayNotAccepted`, or `DuplicateEndpointId` (an older `Edge` has the same id). |
 | | `Connected` | False with `NotConnected`; the message says why, for example that the link has not started yet or the last connection error. An edge that is not accepted is never connected. |
 | | `Programmed` | False with `NotConnected`, `Pending` (connected, but the edge has not reported a port yet) or `BindFailed` (the edge could not open a port; the message names the port and the error). |
@@ -513,24 +570,24 @@ Every condition below is also visible with `kubectl describe`. A False condition
 
 - A `Gateway` and an `Edge` are served only in the namespaces of `--gateway-namespaces` (by default only the operator's own). In other namespaces they are not accepted.
 - An `Edge` names its `Gateway` by `gatewayRef.name` and must be in the same namespace. A `Gateway` serves through the `Edge` objects that point at it.
-- Whoever may create an `Edge` in a served namespace controls the published addresses of that namespace's Gateways and sees their raw TCP: an `Edge` with the id of an edge they run adds its addresses to the Gateway, and that edge then carries, and sees, the TCP streams of the visitors who use them, and can reach the Gateway's backends. Restrict who may create `Edge` resources there (RBAC on `edges.gateway.fables-for-robots.ch`).
+- Whoever may create an `Edge` in a served namespace controls the published addresses of that namespace's Gateways and sees their raw TCP and UDP: an `Edge` with the id of an edge they run adds its addresses to the Gateway, and that edge then carries, and sees, the TCP streams and UDP packets of the visitors who use them, and can reach the Gateway's backends. Restrict who may create `Edge` resources there (RBAC on `edges.gateway.fables-for-robots.ch`).
 - Pointing an `Edge` at another `Gateway` leaves the streams that are already open running until they end; new visitors reach the new Gateway's backends. Deleting the `Edge` cuts its open streams.
 - The `Gateway`'s `gatewayClassName` must name a `GatewayClass` whose `controllerName` is this operator's; any other `Gateway` is ignored.
 - A backend must be a core `Service` with a cluster IP, in the same namespace as the route. There is no `ReferenceGrant` support, `ExternalName` and headless Services do not work, and the operator sends to the Service's cluster IP.
-- Each `TCP` listener has at most one `TCPRoute` with at most one rule. If several routes name a listener, the oldest wins and the others are not accepted. An `HTTP` or `HTTPS` listener takes any number of `HTTPRoute`s.
-- A port opens on the edges only when a listener is accepted and has no conflict, and: for `TCP`, has a `TCPRoute` attached whose backend resolved; for `HTTP`, has an `HTTPRoute` attached; for `HTTPS`, has an `HTTPRoute` attached and usable certificates. A `Gateway` with no route opens nothing (it is `Programmed` once an edge is connected); deleting the last route closes the port.
+- Each `TCP` listener has at most one `TCPRoute`, and each `UDP` listener at most one `UDPRoute`, with at most one rule. If several routes name a listener, the oldest wins and the others are not accepted. An `HTTP` or `HTTPS` listener takes any number of `HTTPRoute`s.
+- A port opens on the edges only when a listener is accepted and has no conflict, and: for `TCP` or `UDP`, has a `TCPRoute` or `UDPRoute` attached whose backend resolved; for `HTTP`, has an `HTTPRoute` attached; for `HTTPS`, has an `HTTPRoute` attached and usable certificates. A `Gateway` with no route opens nothing (it is `Programmed` once an edge is connected); deleting the last route closes the port.
 - A certificate Secret must be in the Gateway's namespace, and that namespace needs the Secret rules of [Secrets](#secrets).
 - A `Gateway` cannot ask for addresses; they come from the edges' `publicAddresses`, or from the host in their `address`. A DNS name is published in lower case without a trailing dot. A `Gateway` lists at most 16 addresses, the first 16 in sorted order; when there are more, its `Programmed` message (when True) or its `Accepted` message says how many are not listed.
 
 ## Running in production
 
-- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection). `iroh-gateway-edge run` and `iroh-gateway-operator static` raise their soft open-file limit to the hard limit at start (on macOS to at most 10240) and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
+- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection); each UDP flow uses one on the operator (its socket to the backend), up to 4096 per edge. `iroh-gateway-edge run` and `iroh-gateway-operator static` raise their soft open-file limit to the hard limit at start (on macOS to at most 10240) and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
 - **Ports below 1024.** On Linux, a public port below 1024 needs `CAP_NET_BIND_SERVICE` or root on the edge.
 - **The iroh port.** The edge's iroh UDP port (`--iroh-listen`, default 7842) must be reachable from the operator for a direct connection.
 
 ## Trust
 
-The visitor address a backend sees (in `X-Forwarded-For` for HTTP and HTTPS) is only as trustworthy as the edge. It is for logging, not for access control. A `TCPRoute` backend sees the operator pod's address, not the visitor's. Each side pins the other's key: the edge serves only the operator named by `--operator`, and the operator connects only to the edges it lists.
+The visitor address a backend sees (in `X-Forwarded-For` for HTTP and HTTPS) is only as trustworthy as the edge. It is for logging, not for access control. A `TCPRoute` or `UDPRoute` backend sees the operator pod's address, not the visitor's. Each side pins the other's key: the edge serves only the operator named by `--operator`, and the operator connects only to the edges it lists.
 
 ## Relay mode
 
@@ -543,7 +600,7 @@ A relay learns the home IP, the edge's IP, and the size and timing of the relaye
 - **Addresses exchanged in direct mode.** iroh's QUIC NAT traversal cannot be switched off in iroh 1.5: even with relay mode disabled, each side tells the other its local interface addresses and sends probe packets to the addresses it is told. Port mapping (UPnP/NAT-PMP/PCP) is disabled. Mitigation, for the edge only: start the edge with `--iroh-listen <public-ip>:7842` instead of `0.0.0.0:7842`, since only a wildcard bind advertises every interface. This limits only what the edge advertises: the operator binds wildcard sockets and still advertises its own interface addresses (its LAN addresses, for example) to the edge.
 - **Stalled visitors are cut after 5 minutes.** If a visitor accepts no data for 300 seconds while data is waiting for it, the connection is aborted. Idle connections with nothing pending are not affected.
 - **Half-closed connections are cut after 5 minutes of silence.** Once one side has finished sending, the connection is aborted if the other side sends nothing for 300 seconds.
-- **No UDP.** UDP listeners are reported as a bind error in this version.
+- **UDP is best effort.** A packet that does not fit the tunnel, or loses a piece, is lost, and a UDP flood can slow TCP and HTTP through the same edge unless `--udp-rate-limit` is set; see [UDP](#udp).
 - **No metrics yet.** Both binaries log to stderr only.
 
 ## License
