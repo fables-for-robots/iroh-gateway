@@ -41,6 +41,7 @@ iroh = { workspace = true, features = ["test-utils"] }
 iroh-gateway-edge = { path = "../edge" }
 tokio = { workspace = true, features = ["io-util", "time", "test-util"] }
 rcgen.workspace = true
+tokio-rustls.workspace = true
 
 [[bin]]
 name = "iroh-gateway-operator"
