@@ -24,9 +24,12 @@ pub const UDP_FLOW_IDLE: Duration = Duration::from_secs(60);
 /// How many flows one side tracks; at the cap a new flow replaces the least recently used one.
 pub const MAX_UDP_FLOWS: usize = 4096;
 
-/// What one incomplete packet is assumed to cost besides its payload; bounds how many a flood of
-/// tiny fragments can make [`Reassembler`] track.
-const ENTRY_COST: usize = 64;
+/// What one incomplete packet costs in memory besides its payload: the map and order slots and
+/// the entry itself, rounded up.
+const ENTRY_COST: usize = 256;
+/// What one stored fragment costs besides its payload: its `(index, Bytes)` slot and the
+/// allocation of its copy, rounded up.
+const FRAGMENT_COST: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -138,8 +141,11 @@ struct Entry {
     first_seen: Instant,
     /// Arrival rank of the entry, the key in `Reassembler::order`.
     rank: u64,
-    /// Bytes held; the sum of `parts`.
+    /// Payload bytes held; the sum of `parts`.
     bytes: usize,
+    /// What the entry counts against the budget: its payload plus the per-entry and
+    /// per-fragment costs.
+    charged: usize,
     /// `(index, payload)` of the fragments that arrived, fewer than `count`.
     parts: Vec<(u8, Bytes)>,
 }
@@ -148,7 +154,10 @@ struct Entry {
 pub struct Reassembler {
     max_bytes: usize,
     window: Duration,
+    /// Payload bytes held.
     buffered: usize,
+    /// Payload and overhead held; never above `max_bytes`.
+    charged: usize,
     next_rank: u64,
     entries: HashMap<(u64, u32), Entry>,
     /// Entries, oldest first.
@@ -161,6 +170,7 @@ impl Reassembler {
             max_bytes,
             window,
             buffered: 0,
+            charged: 0,
             next_rank: 0,
             entries: HashMap::new(),
             order: BTreeMap::new(),
@@ -194,22 +204,22 @@ impl Reassembler {
             }
         }
         // Every fragment but the last is full, and no packet ends in an empty one.
-        if payload.is_empty() || payload.len() > MAX_PACKET || payload.len() > self.max_bytes {
+        if payload.is_empty() || payload.len() > MAX_PACKET {
+            return None;
+        }
+        let is_new = !self.entries.contains_key(&key);
+        let cost = payload.len() + FRAGMENT_COST + if is_new { ENTRY_COST } else { 0 };
+        if is_new && cost > self.max_bytes {
             return None;
         }
         // Make room, oldest first. The packet being extended may be the oldest; dropping it
-        // drops this fragment with it.
-        // A fragment that completes its packet is not stored, so it needs no room.
-        let is_new = !self.entries.contains_key(&key);
+        // drops this fragment with it. A fragment that completes its packet is not stored, so it
+        // needs no room.
         let completes = self
             .entries
             .get(&key)
             .is_some_and(|entry| entry.parts.len() + 1 == usize::from(entry.count));
-        let max_entries = (self.max_bytes / ENTRY_COST).max(1);
-        while !completes
-            && (self.buffered + payload.len() > self.max_bytes
-                || (is_new && self.entries.len() >= max_entries))
-        {
+        while !completes && self.charged + cost > self.max_bytes {
             let (_, oldest) = self.order.pop_first()?;
             self.forget(&oldest);
             if oldest == key {
@@ -226,10 +236,13 @@ impl Reassembler {
                 first_seen: now,
                 rank,
                 bytes: 0,
+                charged: 0,
                 parts: Vec::new(),
             }
         });
         entry.bytes += payload.len();
+        entry.charged += cost;
+        self.charged += cost;
         entry
             .parts
             .push((header.index, Bytes::copy_from_slice(&payload)));
@@ -268,6 +281,12 @@ impl Reassembler {
         self.entries.clear();
         self.order.clear();
         self.buffered = 0;
+        self.charged = 0;
+    }
+
+    #[cfg(test)]
+    fn charged(&self) -> usize {
+        self.charged
     }
 
     /// Drops the entries first seen `window` or longer ago.
@@ -292,6 +311,7 @@ impl Reassembler {
     fn forget(&mut self, key: &(u64, u32)) -> Option<Entry> {
         let entry = self.entries.remove(key)?;
         self.buffered -= entry.bytes;
+        self.charged -= entry.charged;
         Some(entry)
     }
 }
@@ -458,7 +478,9 @@ mod tests {
     #[test]
     fn budget_drops_the_oldest_incomplete_packets() {
         let t = Instant::now();
-        let mut r = Reassembler::new(3000, S(1));
+        // Two 1500-byte fragments and their overhead fit; a third does not.
+        let budget = 2 * (1500 + FRAGMENT_COST + ENTRY_COST);
+        let mut r = Reassembler::new(budget, S(1));
         let mut packets = Vec::new();
         for packet in 0..3u32 {
             let h = Header {
@@ -472,10 +494,11 @@ mod tests {
                 r.push(h, Bytes::from(vec![packet as u8; 1500]), t)
                     .is_none()
             );
-            assert!(r.buffered() <= 3000);
+            assert!(r.charged() <= budget);
             packets.push(h);
         }
         assert_eq!(r.buffered(), 3000);
+        assert_eq!(r.len(), 2);
         // The newest first: the last fragment of the dropped packet would only start a new one.
         let mut done = Vec::new();
         for h in packets.into_iter().rev() {
@@ -615,18 +638,25 @@ mod tests {
     fn many_tiny_fragments_cannot_exhaust_memory() {
         let t = Instant::now();
         let mut r = Reassembler::new(REASSEMBLY_BYTES, S(1));
-        for packet in 0..200_000u32 {
-            let h = Header {
-                listener_id: 7,
-                flow_id: 1,
-                packet_id: packet,
-                index: 0,
-                count: 2,
-            };
-            r.push(h, Bytes::from_static(b"x"), t);
+        // Every packet one fragment short of complete, each fragment one byte.
+        for packet in 0..100_000u32 {
+            for index in 0..63 {
+                let h = Header {
+                    listener_id: 7,
+                    flow_id: 1,
+                    packet_id: packet,
+                    index,
+                    count: 64,
+                };
+                r.push(h, Bytes::from_static(b"x"), t);
+                assert!(r.charged() <= REASSEMBLY_BYTES);
+                assert!(r.buffered() <= r.charged());
+            }
         }
-        assert!(r.buffered() <= REASSEMBLY_BYTES);
-        assert!(r.len() <= REASSEMBLY_BYTES / 64);
+        assert!(r.len() > 100, "the budget holds some packets: {}", r.len());
+        // What it holds really costs about what it charges: at most one packet's 63 parts per
+        // 63 + overhead bytes.
+        assert!(r.buffered() <= REASSEMBLY_BYTES / 2);
     }
 
     /// A small deterministic shuffle; the tests need no more randomness than the seed.

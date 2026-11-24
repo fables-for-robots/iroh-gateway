@@ -190,11 +190,18 @@ mod tests {
                 size.is_some_and(|n| n >= 1100 + crate::datagram::HEADER_LEN),
                 "{size:?}"
             );
-            from.send_datagram(Bytes::from_static(b"ping")).unwrap();
-            let got = tokio::time::timeout(Duration::from_secs(10), to.read_datagram())
-                .await
-                .expect("datagram arrives")
-                .unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    from.send_datagram(Bytes::from_static(b"ping")).unwrap();
+                    if let Ok(got) =
+                        tokio::time::timeout(Duration::from_millis(200), to.read_datagram()).await
+                    {
+                        break got.unwrap();
+                    }
+                }
+            })
+            .await
+            .expect("datagram arrives");
             assert_eq!(got.as_ref(), b"ping");
         }
     }
