@@ -215,6 +215,9 @@ async fn read_datagrams(shared: Arc<Shared>, conn: Connection, session: u64) {
     let mut expiry = tokio::time::interval(EXPIRE_EVERY);
     expiry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
+        // A datagram that is already queued is read without waiting, which takes no part in
+        // tokio's budget: without this, a flood would keep the task on its thread.
+        tokio::task::coop::consume_budget().await;
         let current = tokio::select! {
             datagram = conn.read_datagram() => match datagram {
                 Ok(datagram) => shared.reply(datagram, &mut reassembler, session),

@@ -640,6 +640,59 @@ async fn a_backend_that_is_not_listening_disturbs_no_other_flow() {
 }
 
 #[tokio::test]
+async fn a_backend_flooding_replies_does_not_hold_up_another_flow() {
+    const FLOOD: Duration = Duration::from_secs(2);
+    let flood = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let watch = flood.try_clone().unwrap();
+    watch.set_nonblocking(true).unwrap();
+    let watch = UdpSocket::from_std(watch).unwrap();
+    let b = backend().await;
+    let t = setup(
+        &[],
+        &[5300, 5301],
+        &[(5300, addr(&watch)), (5301, addr(&b))],
+        |_| {},
+    )
+    .await;
+    let (p, q) = (t.id(udp(5300)), t.id(udp(5301)));
+    let from = deliver(t.conn(), p, 1, b"start", &watch).await;
+    drop(watch);
+    // Sends replies on flow 1 as fast as it can, faster than they can be forwarded.
+    let flooder = std::thread::spawn(move || {
+        let payload = vec![7u8; 8_000];
+        let start = std::time::Instant::now();
+        while start.elapsed() < FLOOD {
+            let _ = flood.send_to(&payload, from);
+        }
+    });
+    // Blocks this runtime's only thread, so the flood is under way when the test yields.
+    std::thread::sleep(Duration::from_millis(100));
+    let start = std::time::Instant::now();
+    let arrived = timeout(Duration::from_secs(1), async {
+        loop {
+            send_packet(t.conn(), q, 2, next_packet_id(), b"meanwhile");
+            if arrival(&b, b"meanwhile", &[], Duration::from_millis(200))
+                .await
+                .is_some()
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    let waited = start.elapsed();
+    let flooding = !flooder.is_finished();
+    assert!(
+        arrived.is_ok() && waited < Duration::from_secs(1),
+        "flow 2 waited {waited:?} behind flow 1's replies"
+    );
+    assert!(flooding, "the flood ended before flow 2 was served");
+    flooder.join().unwrap();
+    t.assert_up();
+    t.shutdown().await;
+}
+
+#[tokio::test]
 async fn ipv6_target_is_reached() {
     let Ok(a) = UdpSocket::bind("[::1]:0").await else {
         eprintln!("skipped: this host has no IPv6 loopback");

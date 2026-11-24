@@ -7,6 +7,7 @@
 //! reply of an old backend reaches a visitor afterwards.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -26,6 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use tracing::field::display;
 use tracing::{Instrument, debug, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +121,9 @@ pub(crate) async fn forward(
     expiry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let (mut routes_open, mut targets_open) = (true, true);
     loop {
+        // A datagram that is already queued is read without waiting, which takes no part in
+        // tokio's budget: without this, a flood would keep the task on its thread.
+        tokio::task::coop::consume_budget().await;
         // Changes first: a datagram sent after a change is forwarded under it.
         tokio::select! {
             biased;
@@ -267,8 +272,10 @@ impl Forwarder {
                 let socket = match connect(target) {
                     Ok(socket) => Arc::new(socket),
                     Err(e) => {
-                        debug!(%target, "opening a udp socket failed: {e}");
-                        shared.drops.socket_error.hit();
+                        shared
+                            .drops
+                            .socket_error
+                            .hit_with(&format_args!("opening a socket to {target} failed: {e}"));
                         return;
                     }
                 };
@@ -319,6 +326,10 @@ impl Forwarder {
 /// aborts it. A receive error (such as `ConnectionRefused` after an ICMP error) is ignored.
 async fn replies(shared: Arc<Shared>, socket: Arc<UdpSocket>, flow_id: u64, seq: u64) {
     loop {
+        // Cached readiness, `try_recv` and the sends never wait or take from tokio's budget:
+        // without this, a backend sending faster than the loop drains would keep the task on
+        // its thread.
+        tokio::task::coop::consume_budget().await;
         if socket.readable().await.is_err() {
             return;
         }
@@ -424,14 +435,30 @@ impl Counter {
     }
 
     fn hit(&self) {
+        self.count_and_log(None);
+    }
+
+    /// [`Counter::hit`], logging `detail` with the drop when the throttle lets it through.
+    fn hit_with(&self, detail: &dyn fmt::Display) {
+        self.count_and_log(Some(detail));
+    }
+
+    fn count_and_log(&self, detail: Option<&dyn fmt::Display>) {
         let total = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         let Some(suppressed) = lock(&self.log).hit() else {
             return;
         };
+        let detail = detail.map(display);
         if self.warn {
-            warn!(total, suppressed, "udp packet dropped: {}", self.reason);
+            warn!(
+                total,
+                suppressed, detail, "udp packet dropped: {}", self.reason
+            );
         } else {
-            debug!(total, suppressed, "udp packet dropped: {}", self.reason);
+            debug!(
+                total,
+                suppressed, detail, "udp packet dropped: {}", self.reason
+            );
         }
     }
 }
