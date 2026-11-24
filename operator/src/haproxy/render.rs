@@ -11,12 +11,16 @@ use std::path::{Path, PathBuf};
 use iroh_gateway_proto::control::{ListenerKey, Protocol};
 use sha2::{Digest, Sha256};
 
+use crate::haproxy::SecretFile;
 use crate::model::{GatewayModel, Model, ObjRef};
 
 /// What the model asks of HAProxy and of the edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub haproxy_cfg: String,
+    /// The files `haproxy_cfg` names under `<runtime_dir>/certs`, each named after its content,
+    /// so that equal configurations mean equal files.
+    pub files: Vec<SecretFile>,
     /// One per accepted edge of an accepted Gateway, sorted by key.
     pub edges: Vec<EdgePlan>,
 }
@@ -153,6 +157,7 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
 
     Rendered {
         haproxy_cfg: cfg,
+        files: Vec::new(),
         edges,
     }
 }

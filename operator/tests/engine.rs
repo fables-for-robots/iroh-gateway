@@ -14,8 +14,8 @@ use common::*;
 use iroh::{EndpointId, SecretKey};
 use iroh_gateway_edge::{Edge, EdgeHandle};
 use iroh_gateway_operator::engine::{Engine, EngineEvent, EngineOptions};
-use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::{Rendered, port_id, render};
+use iroh_gateway_operator::haproxy::{CERT_DIR, SecretFile, SupervisorOptions};
 use iroh_gateway_operator::model::{
     Backend, EdgeModel, GatewayModel, HostMatch, ListenerModel, Model, ObjRef,
 };
@@ -610,6 +610,75 @@ async fn failed_reload_is_retried() {
     assert!(w.socket("gw", q).exists());
     // Succeeded: no retry is pending any more.
     assert!(timeout(RETRY * 3, changed(&mut engine)).await.is_err());
+    engine.shutdown().await;
+}
+
+/// `rendered` with a frontend that binds `<dir>/s/tls.sock` with `ssl crt <dir>/certs/<name>`,
+/// and the file that line names.
+fn with_cert(w: &World, mut rendered: Rendered, name: &str) -> Rendered {
+    let d = w.dir.path().display();
+    rendered.haproxy_cfg.push_str(&format!(
+        "\nfrontend tls\n\
+         \x20   bind unix@{d}/s/tls.sock ssl crt {d}/{CERT_DIR}/{name} mode 600\n\
+         \x20   tcp-request connection reject\n"
+    ));
+    rendered.files.push(SecretFile {
+        name: name.to_owned(),
+        contents: certificate_with_key(),
+    });
+    rendered
+}
+
+#[tokio::test]
+async fn engine_passes_files_to_haproxy() {
+    let w = World::new().await;
+    let p = free_tcp_port();
+    let mut engine = w.start(w.plan(&[("gw", &[p])], &[])).await;
+    let rendered = with_cert(&w, w.plan(&[("gw", &[p])], &[]), "a.pem");
+    // Without its file, the configuration is refused.
+    let mut without = rendered.clone();
+    without.files.clear();
+    engine.apply(without).await;
+    let err = engine.facts().haproxy.unwrap_err();
+    assert!(err.contains("a.pem"), "{err}");
+
+    engine.apply(rendered.clone()).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(
+        std::fs::read_to_string(w.dir.path().join(CERT_DIR).join("a.pem")).unwrap(),
+        rendered.files[0].contents
+    );
+    assert!(w.dir.path().join("s").join("tls.sock").exists());
+    engine.shutdown().await;
+    assert!(!w.dir.path().join(CERT_DIR).join("a.pem").exists());
+}
+
+#[tokio::test]
+async fn retry_after_a_failed_reload_passes_the_files_again() {
+    let w = World::new().await;
+    let p = free_tcp_port();
+    let mut engine = w.start(w.plan(&[("gw", &[p])], &[])).await;
+    let master = w.dir.path().join("master.sock");
+    let away = w.dir.path().join("master.away");
+    std::fs::rename(&master, &away).unwrap();
+    let rendered = with_cert(&w, w.plan(&[("gw", &[p])], &[]), "a.pem");
+    let cert = w.dir.path().join(CERT_DIR).join("a.pem");
+    engine.apply(rendered.clone()).await;
+    assert!(engine.facts().haproxy.is_err());
+    // The reload certainly failed, so the file the refused configuration named is gone.
+    assert!(!cert.exists());
+
+    timeout(STEP, changed(&mut engine))
+        .await
+        .expect("no retry after a failed reload");
+    std::fs::rename(&away, &master).unwrap();
+    engine.apply(rendered.clone()).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(
+        std::fs::read_to_string(&cert).unwrap(),
+        rendered.files[0].contents
+    );
+    assert!(w.dir.path().join("s").join("tls.sock").exists());
     engine.shutdown().await;
 }
 

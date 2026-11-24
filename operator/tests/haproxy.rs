@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::short_dir;
+use common::{certificate_with_key, short_dir};
 use iroh_gateway_operator::haproxy::{
-    Applied, ApplyError, MAX_RUNTIME_DIR_LEN, Supervisor, SupervisorOptions,
+    Applied, ApplyError, CERT_DIR, MAX_RUNTIME_DIR_LEN, SecretFile, Supervisor, SupervisorOptions,
 };
 use iroh_gateway_operator::tunnel::proxyv2;
 use nix::errno::Errno;
@@ -242,7 +242,7 @@ async fn apply_same_text_is_unchanged() {
     let c = cfg(&dir, &[("a.sock", echo)]);
     let mut sup = Supervisor::start(opts(&dir), &c).await.unwrap();
     let before = worker_pids(&dir).await;
-    assert_eq!(sup.apply(&c).await.unwrap(), Applied::Unchanged);
+    assert_eq!(sup.apply(&c, &[]).await.unwrap(), Applied::Unchanged);
     assert_eq!(worker_pids(&dir).await, before, "no new worker");
     sup.shutdown().await;
 }
@@ -259,7 +259,7 @@ async fn apply_switches_backend_and_keeps_open_connections() {
     assert_eq!(read_exact(&mut conn1, 1).await, b"A");
 
     let next = cfg(&dir, &[("a.sock", b)]);
-    assert_eq!(sup.apply(&next).await.unwrap(), Applied::Reloaded);
+    assert_eq!(sup.apply(&next, &[]).await.unwrap(), Applied::Reloaded);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
         next
@@ -282,7 +282,7 @@ async fn invalid_config_is_refused_and_old_one_keeps_serving() {
 
     let bad = good.replace("default_backend b0", "default_backend nope");
     assert_ne!(bad, good);
-    match sup.apply(&bad).await {
+    match sup.apply(&bad, &[]).await {
         Err(ApplyError::Invalid(m)) => {
             assert!(m.contains("nope"), "{m}");
             assert!(m.contains("[ALERT]"), "{m}");
@@ -298,7 +298,7 @@ async fn invalid_config_is_refused_and_old_one_keeps_serving() {
     echoes(&mut s, b"hi").await;
     drop(s);
     // The refused text did not become the running one.
-    assert_eq!(sup.apply(&good).await.unwrap(), Applied::Unchanged);
+    assert_eq!(sup.apply(&good, &[]).await.unwrap(), Applied::Unchanged);
     sup.shutdown().await;
 }
 
@@ -311,7 +311,7 @@ async fn failed_reload_restores_the_previous_config() {
 
     // `haproxy -c` does not bind, so this passes the check and fails only when the new worker
     // starts.
-    match sup.apply(&fails_to_load(&dir, &good)).await {
+    match sup.apply(&fails_to_load(&dir, &good), &[]).await {
         Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("Success=0"), "{m}"),
         other => panic!("expected ReloadFailed, got {other:?}"),
     }
@@ -339,13 +339,13 @@ async fn definite_reload_failure_keeps_unchanged_working() {
     let dir = short_dir();
     let good = cfg(&dir, &[("a.sock", echo)]);
     let mut sup = Supervisor::start(opts(&dir), &good).await.unwrap();
-    match sup.apply(&fails_to_load(&dir, &good)).await {
+    match sup.apply(&fails_to_load(&dir, &good), &[]).await {
         Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("Success=0"), "{m}"),
         other => panic!("expected ReloadFailed, got {other:?}"),
     }
     let before = worker_pids(&dir).await;
     // `Success=0` says the old worker kept serving, so the old text is known to run.
-    assert_eq!(sup.apply(&good).await.unwrap(), Applied::Unchanged);
+    assert_eq!(sup.apply(&good, &[]).await.unwrap(), Applied::Unchanged);
     assert_eq!(worker_pids(&dir).await, before, "no new worker");
     sup.shutdown().await;
 }
@@ -366,7 +366,7 @@ async fn apply_after_a_cancelled_apply_reloads_again() {
     // request, then drop it while the reload is in flight.
     let cfg_path = dir.path().join("haproxy.cfg");
     {
-        let fut = sup.apply(&new);
+        let fut = sup.apply(&new, &[]);
         tokio::pin!(fut);
         let deadline = Instant::now() + STEP;
         loop {
@@ -386,7 +386,7 @@ async fn apply_after_a_cancelled_apply_reloads_again() {
     // as the engine would; none may claim `Unchanged`.
     let deadline = Instant::now() + 3 * STEP;
     loop {
-        match sup.apply(&old).await {
+        match sup.apply(&old, &[]).await {
             Ok(Applied::Reloaded) => break,
             Ok(Applied::Unchanged) => panic!("old text claimed to run after a cancelled reload"),
             Err(e) => {
@@ -398,7 +398,7 @@ async fn apply_after_a_cancelled_apply_reloads_again() {
     let mut conn = visit(&dir, "a.sock").await;
     assert_eq!(read_exact(&mut conn, 1).await, b"A");
     drop(conn);
-    assert_eq!(sup.apply(&new).await.unwrap(), Applied::Reloaded);
+    assert_eq!(sup.apply(&new, &[]).await.unwrap(), Applied::Reloaded);
     let mut conn = visit(&dir, "a.sock").await;
     assert_eq!(read_exact(&mut conn, 1).await, b"B");
     drop(conn);
@@ -543,14 +543,14 @@ async fn start_fails_clearly_without_the_binary() {
     assert!(msg.contains("/nonexistent/haproxy"), "{msg}");
 }
 
-/// A stand-in for `haproxy`: `-c` accepts anything; otherwise it records its pid in
-/// `<cfg>.pid` and sleeps without ever opening the master socket.
+/// A stand-in for `haproxy`: `-c` accepts anything without `nope` in it; otherwise it records its
+/// pid in `<cfg>.pid` and sleeps without ever opening the master socket.
 fn fake_haproxy(dir: &TempDir) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.path().join("fake-haproxy");
     std::fs::write(
         &path,
-        "#!/bin/sh\n[ \"$1\" = \"-c\" ] && exit 0\necho $$ > \"$5.tmp\"\nmv \"$5.tmp\" \"$5.pid\"\nexec sleep 60\n",
+        "#!/bin/sh\n[ \"$1\" = \"-c\" ] && { grep -q nope \"$3\" && exit 1; exit 0; }\necho $$ > \"$5.tmp\"\nmv \"$5.tmp\" \"$5.pid\"\nexec sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -628,7 +628,7 @@ async fn reload_without_a_reply_times_out_and_restores() {
     let mut sup = Supervisor::start(o, "global\n").await.unwrap();
     let pid = fake_pid(&dir).await;
     let started = Instant::now();
-    match sup.apply("global\n    maxconn 10\n").await {
+    match sup.apply("global\n    maxconn 10\n", &[]).await {
         Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
         other => panic!("expected ReloadFailed, got {other:?}"),
     }
@@ -670,7 +670,7 @@ async fn restore_replaces_the_file_instead_of_rewriting_it() {
         }
         std::fs::hard_link(&cfg, &seen).unwrap();
     };
-    let (applied, ()) = tokio::join!(sup.apply(new), watch);
+    let (applied, ()) = tokio::join!(sup.apply(new, &[]), watch);
     assert!(
         matches!(applied, Err(ApplyError::ReloadFailed(_))),
         "{applied:?}"
@@ -697,12 +697,12 @@ async fn apply_after_a_timed_out_reload_reloads_again() {
     let old = "global\n";
     let mut sup = Supervisor::start(o, old).await.unwrap();
     let pid = fake_pid(&dir).await;
-    match sup.apply("global\n    maxconn 10\n").await {
+    match sup.apply("global\n    maxconn 10\n", &[]).await {
         Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
         other => panic!("expected ReloadFailed, got {other:?}"),
     }
     // The timed-out reload may still take effect, so the old text is no longer known to run.
-    match sup.apply(old).await {
+    match sup.apply(old, &[]).await {
         Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
         other => panic!("expected another reload attempt, got {other:?}"),
     }
@@ -796,4 +796,309 @@ async fn rendered_config_passes_haproxy_validation() {
     let sup = Supervisor::start(o, &rendered.haproxy_cfg).await.unwrap();
     assert!(exists(&runtime.join("s").join("idle.sock")));
     sup.shutdown().await;
+}
+
+/// [`cfg`] with one frontend on `a.sock` to `backend` that also binds `<dir>/s/tls.sock` with
+/// `ssl crt <dir>/certs/<name>`, and the file that line names.
+fn with_cert(dir: &TempDir, backend: SocketAddr, name: &str) -> (String, SecretFile) {
+    let d = dir.path().display();
+    let text = cfg(dir, &[("a.sock", backend)]).replace(
+        "    default_backend b0\n",
+        &format!(
+            "    bind unix@{d}/s/tls.sock ssl crt {d}/{CERT_DIR}/{name} mode 600\n\
+             \x20   default_backend b0\n"
+        ),
+    );
+    assert!(text.contains("ssl crt"), "{text}");
+    let file = SecretFile {
+        name: name.to_owned(),
+        contents: certificate_with_key(),
+    };
+    (text, file)
+}
+
+/// The names in `<dir>/certs`, dot files included, sorted.
+fn cert_files(dir: &TempDir) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.path().join(CERT_DIR))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[tokio::test]
+async fn certificate_files_are_private() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let mut sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    let certs = dir.path().join(CERT_DIR);
+    assert_eq!(mode(&certs), 0o700);
+    let (text, file) = with_cert(&dir, echo, "a.pem");
+    assert_eq!(
+        sup.apply(&text, std::slice::from_ref(&file)).await.unwrap(),
+        Applied::Reloaded
+    );
+    assert_eq!(mode(&certs), 0o700);
+    assert_eq!(mode(&certs.join("a.pem")), 0o600);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn files_are_written_before_validation() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let mut sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    // What a crash in the middle of writing the file would have left; it must not stand in the
+    // way, nor stay.
+    let leftover = dir.path().join(CERT_DIR).join(".a.pem.tmp");
+    std::fs::write(&leftover, "partial").unwrap();
+    let (text, file) = with_cert(&dir, echo, "a.pem");
+    assert_eq!(
+        sup.apply(&text, std::slice::from_ref(&file)).await.unwrap(),
+        Applied::Reloaded
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(CERT_DIR).join("a.pem")).unwrap(),
+        file.contents
+    );
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    assert!(exists(&dir.path().join("s").join("tls.sock")));
+    let mut s = visit(&dir, "a.sock").await;
+    echoes(&mut s, b"hi").await;
+    drop(s);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn configuration_naming_a_missing_file_is_invalid() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let good = cfg(&dir, &[("a.sock", echo)]);
+    let mut sup = Supervisor::start(opts(&dir), &good).await.unwrap();
+    let (text, _) = with_cert(&dir, echo, "a.pem");
+    match sup.apply(&text, &[]).await {
+        Err(ApplyError::Invalid(m)) => assert!(m.contains("a.pem"), "{m}"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
+        good
+    );
+    assert!(cert_files(&dir).is_empty());
+    let mut s = visit(&dir, "a.sock").await;
+    echoes(&mut s, b"hi").await;
+    drop(s);
+    assert_eq!(sup.apply(&good, &[]).await.unwrap(), Applied::Unchanged);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn unreferenced_files_are_removed_after_a_successful_apply() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let mut sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    let (a, a_file) = with_cert(&dir, echo, "a.pem");
+    assert_eq!(sup.apply(&a, &[a_file]).await.unwrap(), Applied::Reloaded);
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    let (b, b_file) = with_cert(&dir, echo, "b.pem");
+    assert_eq!(sup.apply(&b, &[b_file]).await.unwrap(), Applied::Reloaded);
+    assert_eq!(cert_files(&dir), ["b.pem"]);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_configuration_keeps_the_loaded_files_and_removes_the_new() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let mut sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    let (a, a_file) = with_cert(&dir, echo, "a.pem");
+    assert_eq!(
+        sup.apply(&a, std::slice::from_ref(&a_file)).await.unwrap(),
+        Applied::Reloaded
+    );
+    let (b, b_file) = with_cert(&dir, echo, "b.pem");
+    let bad = b.replace("default_backend b0", "default_backend nope");
+    assert_ne!(bad, b);
+    match sup.apply(&bad, &[b_file]).await {
+        Err(ApplyError::Invalid(m)) => assert!(m.contains("nope"), "{m}"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(CERT_DIR).join("a.pem")).unwrap(),
+        a_file.contents
+    );
+    let mut s = visit(&dir, "a.sock").await;
+    echoes(&mut s, b"hi").await;
+    drop(s);
+    assert_eq!(sup.apply(&a, &[a_file]).await.unwrap(), Applied::Unchanged);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_reload_keeps_the_loaded_files() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let mut sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    let (a, a_file) = with_cert(&dir, echo, "a.pem");
+    assert_eq!(
+        sup.apply(&a, std::slice::from_ref(&a_file)).await.unwrap(),
+        Applied::Reloaded
+    );
+    let (b, b_file) = with_cert(&dir, echo, "b.pem");
+    match sup.apply(&fails_to_load(&dir, &b), &[b_file]).await {
+        Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("Success=0"), "{m}"),
+        other => panic!("expected ReloadFailed, got {other:?}"),
+    }
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
+        a
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(CERT_DIR).join("a.pem")).unwrap(),
+        a_file.contents
+    );
+    assert_eq!(sup.apply(&a, &[a_file]).await.unwrap(), Applied::Unchanged);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_outcome_removes_nothing() {
+    let dir = short_dir();
+    let mut o = opts(&dir);
+    o.haproxy_bin = fake_haproxy(&dir);
+    o.reload_timeout = Duration::from_millis(300);
+    let (server, reloads) = fake_master(&dir);
+    let mut sup = Supervisor::start(o, "global\n").await.unwrap();
+    let pid = fake_pid(&dir).await;
+    let file = |name: &str| SecretFile {
+        name: name.to_owned(),
+        contents: format!("contents of {name}\n"),
+    };
+    match sup
+        .apply("global\n    maxconn 10\n", &[file("a.pem")])
+        .await
+    {
+        Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
+        other => panic!("expected ReloadFailed, got {other:?}"),
+    }
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    // Both may be running or loading now: neither goes.
+    match sup
+        .apply("global\n    maxconn 11\n", &[file("b.pem")])
+        .await
+    {
+        Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
+        other => panic!("expected ReloadFailed, got {other:?}"),
+    }
+    assert_eq!(cert_files(&dir), ["a.pem", "b.pem"]);
+    // A refused configuration was never sent: only its own file goes.
+    match sup.apply("global\n    nope\n", &[file("c.pem")]).await {
+        Err(ApplyError::Invalid(_)) => {}
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(cert_files(&dir), ["a.pem", "b.pem"]);
+    assert_eq!(reloads.load(Ordering::SeqCst), 2);
+    server.abort();
+    sup.shutdown().await;
+    gone(&[pid]).await;
+    assert!(cert_files(&dir).is_empty());
+}
+
+#[tokio::test]
+async fn file_names_that_leave_the_directory_are_refused() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let good = cfg(&dir, &[("a.sock", echo)]);
+    let mut sup = Supervisor::start(opts(&dir), &good).await.unwrap();
+    let (text, fine) = with_cert(&dir, echo, "a.pem");
+    for name in ["../x", "a/b", ".hidden", ""] {
+        let bad = SecretFile {
+            name: name.to_owned(),
+            contents: "x".to_owned(),
+        };
+        match sup.apply(&text, &[fine.clone(), bad]).await {
+            Err(ApplyError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{name:?}: {e}")
+            }
+            other => panic!("{name:?}: expected Io, got {other:?}"),
+        }
+        assert!(cert_files(&dir).is_empty(), "{name:?}");
+        assert!(!exists(&dir.path().join("x")), "{name:?}");
+        assert!(!exists(&dir.path().join("haproxy.cfg.new")), "{name:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
+            good
+        );
+    }
+    assert_eq!(sup.apply(&good, &[]).await.unwrap(), Applied::Unchanged);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn start_empties_the_certificate_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let certs = dir.path().join(CERT_DIR);
+    std::fs::create_dir(&certs).unwrap();
+    std::fs::set_permissions(&certs, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(certs.join("old.pem"), "old").unwrap();
+    std::fs::write(certs.join(".old.pem.tmp"), "partial").unwrap();
+    std::fs::create_dir(certs.join("sub")).unwrap();
+    std::fs::write(certs.join("sub").join("deep.pem"), "deep").unwrap();
+    let sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    assert!(cert_files(&dir).is_empty(), "{:?}", cert_files(&dir));
+    assert_eq!(mode(&certs), 0o700);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_removes_certificate_files() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let mut sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    let (text, file) = with_cert(&dir, echo, "a.pem");
+    assert_eq!(sup.apply(&text, &[file]).await.unwrap(), Applied::Reloaded);
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    sup.shutdown().await;
+    assert!(cert_files(&dir).is_empty(), "{:?}", cert_files(&dir));
+}
+
+#[tokio::test]
+async fn dropping_the_supervisor_removes_certificate_files() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let mut sup = Supervisor::start(opts(&dir), &cfg(&dir, &[("a.sock", echo)]))
+        .await
+        .unwrap();
+    let (text, file) = with_cert(&dir, echo, "a.pem");
+    assert_eq!(sup.apply(&text, &[file]).await.unwrap(), Applied::Reloaded);
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    let mut pids = worker_pids(&dir).await;
+    pids.push(sup.pid() as i32);
+    drop(sup);
+    assert!(cert_files(&dir).is_empty(), "{:?}", cert_files(&dir));
+    gone(&pids).await;
 }

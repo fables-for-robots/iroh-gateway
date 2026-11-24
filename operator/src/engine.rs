@@ -92,6 +92,7 @@ struct Running {
 
 impl Engine {
     /// Starts HAProxy with `initial.haproxy_cfg`, then applies `initial` as `apply` does.
+    /// `initial.files` are not written: the initial configuration must name none.
     pub async fn start(
         endpoint: iroh::Endpoint,
         opts: EngineOptions,
@@ -113,7 +114,9 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Applies `rendered`: HAProxy's configuration, and the links of the edges in it.
+    /// Applies `rendered`: HAProxy's configuration with its files, and the links of the edges in
+    /// it. A retry after a failed reload is another call with the next render, which passes its
+    /// files again.
     ///
     /// Links of edges that left the plan, or whose id or address changed, are shut down in any
     /// case. While HAProxy reloads, each remaining link forwards only on the ports whose
@@ -154,7 +157,8 @@ impl Engine {
             }
         }
         let (applied, ()) = tokio::join!(
-            self.supervisor.apply(&rendered.haproxy_cfg),
+            self.supervisor
+                .apply(&rendered.haproxy_cfg, &rendered.files),
             stop_links(gone.into_iter().map(|(_, link)| link.handle))
         );
         self.note_unreachable(&rendered.edges);
