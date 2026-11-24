@@ -388,7 +388,11 @@ struct Drops {
     no_target: Counter,
     /// Opening a flow's socket failed, or it refused a packet.
     socket_error: Counter,
-    /// A reply that could not be split or sent into the tunnel.
+    /// A reply that could not be split at the session's datagram size (none known, no room
+    /// past the header, or more than `MAX_FRAGMENTS` pieces), or a datagram `send_datagram`
+    /// refused (too large for the path, datagrams unsupported, or the connection lost). Not
+    /// counted: on a full send buffer the QUIC layer discards the oldest queued datagram, one
+    /// piece of some earlier packet, silently.
     send_error: Counter,
 }
 

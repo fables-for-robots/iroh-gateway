@@ -108,7 +108,7 @@ udp_listener_programmed() {
     [ "$got" = True ]
 }
 
-# True when the Accepted condition of the only parent entry of UDPRoute echo reads True.
+# True when the Accepted condition of the only parent entry of UDPRoute udp-echo reads True.
 udproute_accepted() {
   got="$(k get udproutes.gateway.networking.k8s.io udp-echo \
     -o jsonpath='{.status.parents[*].conditions[?(@.type=="Accepted")].status}' 2>&1)" &&

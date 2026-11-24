@@ -381,7 +381,9 @@ Rules:
   on the same port (closing that needs negated host conditions). Listener
   isolation, an optional feature of the Gateway API, is therefore still not
   provided.
-- A listener may not use the edge's iroh port.
+- Listeners are not kept off the edge's iroh port. A `UDP` listener on it
+  ends as a bind error that the edge reports, as for any port it cannot
+  open.
 - A TCP listener carries one `TCPRoute`, and a UDP listener one `UDPRoute`.
   If several attach, the oldest wins and the others are not accepted.
 - An edge opens a `TCP` or `UDP` listener's port only once the listener has
