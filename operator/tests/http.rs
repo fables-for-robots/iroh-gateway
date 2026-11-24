@@ -1172,7 +1172,8 @@ async fn hostile_strings_cannot_inject_configuration() {
         assert_eq!(s.get(80, &request("a", path)).await.tag(), "D", "{path}");
     }
     // The literal path itself cannot be sent: HAProxy refuses a request line with a space or
-    // a '#' in its target before any rule runs, so it never reaches the backend.
+    // a '#' in its target before any rule runs, so it never reaches the backend. (The model
+    // refuses a route with such a path; this hand-built model tests the quoting alone.)
     let r = s.get(80, &request("a", literal_path)).await;
     assert_eq!(r.status, 400, "{}", r.describe());
     // A header value matches only its literal self.

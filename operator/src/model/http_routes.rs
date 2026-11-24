@@ -23,6 +23,8 @@ use super::{
 };
 
 const UNSUPPORTED: &str = "UnsupportedValue";
+/// The most header matches one match may have: the CRD's limit, which the model does not rely on.
+const MAX_HEADER_MATCHES: usize = 16;
 
 /// One accepted route on one listener.
 pub(super) struct Attached {
@@ -382,6 +384,17 @@ fn http_match(m: &HttpRouteRulesMatches) -> Result<HttpMatch, String> {
             if !value.starts_with('/') {
                 return Err(format!("path {value:?} does not start with '/'"));
             }
+            // HAProxy answers 400 to a request target with a space or a '#', and `path` never
+            // holds the query.
+            if let Some(c) = value.chars().find(|c| matches!(c, ' ' | '#' | '?')) {
+                let what = match c {
+                    ' ' => "a space".to_owned(),
+                    c => format!("'{c}'"),
+                };
+                return Err(format!(
+                    "path {value:?} can never match: it contains {what}"
+                ));
+            }
             if *ty == P::Exact {
                 PathMatch::Exact(value.to_owned())
             } else {
@@ -391,6 +404,12 @@ fn http_match(m: &HttpRouteRulesMatches) -> Result<HttpMatch, String> {
         }
     };
 
+    let count = m.headers.as_ref().map_or(0, Vec::len);
+    if count > MAX_HEADER_MATCHES {
+        return Err(format!(
+            "a match has {count} header matches; at most {MAX_HEADER_MATCHES} are supported"
+        ));
+    }
     let mut headers: Vec<(String, String)> = Vec::new();
     for h in m.headers.iter().flatten() {
         if h.r#type == Some(HttpRouteRulesMatchesHeadersType::RegularExpression) {
@@ -1269,6 +1288,57 @@ mod tests {
             assert_eq!(r.reason, "UnsupportedValue", "{bad:?}");
             assert!(r.message.contains("hostname"), "{}", r.message);
         }
+    }
+
+    #[test]
+    fn paths_that_can_never_match_refuse_the_route() {
+        for (p, what) in [
+            ("/a b", "a space"),
+            ("/a#b", "'#'"),
+            ("/a?b=c", "'?'"),
+            ("/?", "'?'"),
+            // The first of several is named.
+            ("/x#y z", "'#'"),
+            ("/x y#z", "a space"),
+        ] {
+            for m in [exact_path(p), prefix_path(p)] {
+                let route = http_route("gw", "r")
+                    .rule()
+                    .matching(exact_path("/fine"))
+                    .backend("web", 8080)
+                    .rule()
+                    .matching(m)
+                    .backend("web", 8080);
+                let r = refusal(&route);
+                assert_eq!(r.reason, "UnsupportedValue", "{p}");
+                assert_eq!(
+                    r.message,
+                    format!("rule 1: path {p:?} can never match: it contains {what}"),
+                );
+            }
+        }
+        // Characters a request target may carry are fine.
+        for p in ["/a%20b", "/a%23b", "/x'y\"z$HOME%41\\w", "/~user/;p=1"] {
+            let rule = the_rule(&base().matching(exact_path(p)), &[web()]);
+            assert_eq!(rule.matches[0].path, PathMatch::Exact(p.into()));
+        }
+    }
+
+    #[test]
+    fn more_than_16_header_matches_refuse_the_route() {
+        let names: Vec<String> = (0..17).map(|i| format!("x-h{i:02}")).collect();
+        let list = |n: usize| -> Vec<(&str, &str)> {
+            names[..n].iter().map(|h| (h.as_str(), "v")).collect()
+        };
+        let rule = the_rule(&base().matching(headers(&list(16))), &[web()]);
+        assert_eq!(rule.matches[0].headers.len(), 16);
+
+        let r = refusal(&base().matching(headers(&list(17))));
+        assert_eq!(r.reason, "UnsupportedValue");
+        assert_eq!(
+            r.message,
+            "rule 0: a match has 17 header matches; at most 16 are supported"
+        );
     }
 
     #[test]
