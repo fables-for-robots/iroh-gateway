@@ -1,7 +1,68 @@
-//! HTTP-specific parts of the model: which hosts a listener or a route answers for.
+//! HTTP-specific parts of the model: which hosts a listener or a route answers for, and the rules
+//! of an HTTPRoute as the operator honours them.
 
 use std::fmt;
 use std::net::IpAddr;
+
+use super::Backend;
+
+/// The path part of an [`HttpMatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathMatch {
+    Exact(String),
+    /// Never ends in '/', except "/" itself.
+    Prefix(String),
+}
+
+/// One `matches` entry of an HTTPRoute rule: every part must hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpMatch {
+    /// `Prefix("/")` when the match names no path.
+    pub path: PathMatch,
+    /// Upper case.
+    pub method: Option<String>,
+    /// Exact header values: names lower case, sorted by name, each name once.
+    pub headers: Vec<(String, String)>,
+}
+
+/// What a `RequestHeaderModifier` or `ResponseHeaderModifier` filter does, in the filter's order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HeaderMods {
+    pub set: Vec<(String, String)>,
+    pub add: Vec<(String, String)>,
+    pub remove: Vec<String>,
+}
+
+/// A `RequestRedirect` filter. `None` keeps that part of the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    /// `http` or `https`.
+    pub scheme: Option<String>,
+    /// An exact host name, lower case.
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
+    /// 301, 302, 303, 307 or 308.
+    pub status: u16,
+}
+
+/// What a rule does with a request it matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpAction {
+    Forward(Vec<Backend>),
+    Redirect(Redirect),
+    /// Answers 500.
+    Fail,
+}
+
+/// One rule of an accepted HTTPRoute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRouteRule {
+    /// Never empty: a rule without matches matches `Prefix("/")`.
+    pub matches: Vec<HttpMatch>,
+    pub request_headers: HeaderMods,
+    pub response_headers: HeaderMods,
+    pub action: HttpAction,
+}
 
 /// Which request hosts a listener or a route answers for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -76,7 +76,12 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
     let mut sockets: HashMap<&ObjRef, HashMap<ListenerKey, PortPlan>> = HashMap::new();
     for gateway in &gateways {
         let per_gateway = sockets.entry(&gateway.key).or_default();
-        let mut listeners: Vec<_> = gateway.listeners.iter().filter(|l| l.serving()).collect();
+        // Only TCP for now: HTTP and HTTPS listeners get their frontends in a later step.
+        let mut listeners: Vec<_> = gateway
+            .listeners
+            .iter()
+            .filter(|l| l.serving() && l.protocol == "TCP")
+            .collect();
         listeners.sort_by_key(|l| l.port);
         for listener in listeners {
             let id = port_id(&gateway.key, listener.port);
@@ -379,6 +384,31 @@ mod tests {
         // The edge still gets a plan, with no ports open.
         assert_eq!(r.edges.len(), 1);
         assert!(r.edges[0].sockets.is_empty());
+    }
+
+    #[test]
+    fn http_listeners_are_not_rendered_yet() {
+        // HTTP and HTTPS get their own frontends in a later step; until then a serving HTTP
+        // listener neither gets a TCP frontend nor opens its port on the edges.
+        let g = gw("gw", "public");
+        let mut http = listener(80, vec![]);
+        http.protocol = "HTTP".into();
+        http.supported_kinds = vec!["HTTPRoute".into()];
+        assert!(http.serving(), "precondition");
+        let m = model(
+            vec![gateway(
+                g.clone(),
+                vec![http, listener(5432, vec![backend("10.0.0.1", 5432, 1)])],
+            )],
+            vec![edge("e1", 1, &g)],
+        );
+        let r = render_in(&m);
+        let id = port_id(&g, 80);
+        assert!(!r.haproxy_cfg.contains(&id), "{}", r.haproxy_cfg);
+        assert!(!r.haproxy_cfg.contains("port 80\n"), "{}", r.haproxy_cfg);
+        assert_eq!(r.edges.len(), 1);
+        let ports: Vec<u16> = r.edges[0].sockets.keys().map(|k| k.port).collect();
+        assert_eq!(ports, [5432]);
     }
 
     #[test]

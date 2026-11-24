@@ -9,6 +9,7 @@ mod edges;
 pub(crate) mod fixtures;
 mod gateways;
 mod http;
+mod http_routes;
 mod routes;
 
 use std::collections::BTreeSet;
@@ -33,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::crd::Edge;
 
 pub use certs::Certificate;
-pub use http::HostMatch;
+pub use http::{HeaderMods, HostMatch, HttpAction, HttpMatch, HttpRouteRule, PathMatch, Redirect};
 pub(crate) use routes::parent_key;
 
 /// A namespaced object, by name.
@@ -248,7 +249,8 @@ pub struct Model {
     pub gateways: Vec<GatewayModel>,
     /// Every `Edge`, by key.
     pub edges: Vec<EdgeModel>,
-    /// Every `TCPRoute` with a `parentRef` naming one of our gateways, by kind, then key.
+    /// Every `TCPRoute` and `HTTPRoute` with a `parentRef` naming one of our gateways, by kind,
+    /// then key.
     pub routes: Vec<RouteModel>,
 }
 
@@ -444,8 +446,11 @@ pub fn build(snapshot: &Snapshot, settings: &Settings) -> Model {
     let edges = edges::edges(snapshot, settings, &gateways);
     edges::bind(&mut gateways, &edges);
 
-    // Routes pass: attach TCPRoutes to listeners, fill `attached_routes` and `backends`.
+    // Routes pass: attach TCPRoutes and HTTPRoutes to listeners, fill `attached_routes`, and
+    // `backends` for TCP.
     let mut routes = routes::routes(snapshot, &mut gateways);
+    let (http_routes, _attached) = http_routes::routes(snapshot, &mut gateways);
+    routes.extend(http_routes);
     routes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
 
     Model {

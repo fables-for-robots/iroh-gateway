@@ -10,7 +10,10 @@ use gateway_api::gateways::v1::{
     GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewayListenersTls,
     GatewayListenersTlsCertificateRefs, GatewaySpec,
 };
-use gateway_api::httproutes::v1::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};
+use gateway_api::httproutes::v1::{
+    HttpRoute, HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs,
+    HttpRouteRulesFilters, HttpRouteRulesMatches, HttpRouteSpec,
+};
 use gateway_api::tcproutes::v1::{
     TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteRulesBackendRefs, TcpRouteSpec,
 };
@@ -433,8 +436,38 @@ pub fn http_route(ns: &str, name: &str) -> HttpRoute {
 pub trait HttpRouteExt: Sized {
     /// A parent gateway in the route's namespace.
     fn parent(self, gateway: &str) -> Self;
+    fn parent_in(self, ns: &str, gateway: &str) -> Self;
     /// Applies to the last parent.
     fn section(self, name: &str) -> Self;
+    /// Adds an entry to `hostnames`.
+    fn hostname(self, hostname: &str) -> Self;
+    /// Starts a new, empty rule.
+    fn rule(self) -> Self;
+    /// Adds a match to the last rule, as do the filter and backend builders; they start a rule
+    /// if there is none.
+    fn matching(self, m: HttpRouteRulesMatches) -> Self;
+    fn filter(self, f: HttpRouteRulesFilters) -> Self;
+    fn backend(self, service: &str, port: i32) -> Self;
+    fn weighted(self, service: &str, port: i32, weight: i32) -> Self;
+    fn backend_in(self, ns: &str, service: &str, port: i32) -> Self;
+    /// Creation time, in seconds after the epoch.
+    fn created(self, seconds: i64) -> Self;
+}
+
+fn last_http_rule(r: &mut HttpRoute) -> &mut HttpRouteRules {
+    let rules = r.spec.rules.get_or_insert_with(Vec::new);
+    if rules.is_empty() {
+        rules.push(HttpRouteRules::default());
+    }
+    rules.last_mut().expect("just ensured")
+}
+
+fn push_http_backend(mut r: HttpRoute, b: HttpRouteRulesBackendRefs) -> HttpRoute {
+    last_http_rule(&mut r)
+        .backend_refs
+        .get_or_insert_with(Vec::new)
+        .push(b);
+    r
 }
 
 impl HttpRouteExt for HttpRoute {
@@ -449,6 +482,17 @@ impl HttpRouteExt for HttpRoute {
         self
     }
 
+    fn parent_in(self, ns: &str, gateway: &str) -> Self {
+        let mut r = self.parent(gateway);
+        r.spec
+            .parent_refs
+            .as_mut()
+            .and_then(|p| p.last_mut())
+            .expect("just added")
+            .namespace = Some(ns.into());
+        r
+    }
+
     fn section(mut self, name: &str) -> Self {
         self.spec
             .parent_refs
@@ -456,6 +500,78 @@ impl HttpRouteExt for HttpRoute {
             .and_then(|p| p.last_mut())
             .expect("add a parent first")
             .section_name = Some(name.into());
+        self
+    }
+
+    fn hostname(mut self, hostname: &str) -> Self {
+        self.spec
+            .hostnames
+            .get_or_insert_with(Vec::new)
+            .push(hostname.into());
+        self
+    }
+
+    fn rule(mut self) -> Self {
+        self.spec
+            .rules
+            .get_or_insert_with(Vec::new)
+            .push(HttpRouteRules::default());
+        self
+    }
+
+    fn matching(mut self, m: HttpRouteRulesMatches) -> Self {
+        last_http_rule(&mut self)
+            .matches
+            .get_or_insert_with(Vec::new)
+            .push(m);
+        self
+    }
+
+    fn filter(mut self, f: HttpRouteRulesFilters) -> Self {
+        last_http_rule(&mut self)
+            .filters
+            .get_or_insert_with(Vec::new)
+            .push(f);
+        self
+    }
+
+    fn backend(self, service: &str, port: i32) -> Self {
+        push_http_backend(
+            self,
+            HttpRouteRulesBackendRefs {
+                name: service.into(),
+                port: Some(port),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn weighted(self, service: &str, port: i32, weight: i32) -> Self {
+        push_http_backend(
+            self,
+            HttpRouteRulesBackendRefs {
+                name: service.into(),
+                port: Some(port),
+                weight: Some(weight),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn backend_in(self, ns: &str, service: &str, port: i32) -> Self {
+        push_http_backend(
+            self,
+            HttpRouteRulesBackendRefs {
+                name: service.into(),
+                namespace: Some(ns.into()),
+                port: Some(port),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn created(mut self, seconds: i64) -> Self {
+        self.metadata.creation_timestamp = Some(time(seconds));
         self
     }
 }

@@ -1,5 +1,5 @@
 //! TCPRoutes: which route binds to which listener, and the backends each listener gets; and the
-//! parent and backend checks that every route kind shares.
+//! parent and backend checks, and the snapshot lookups, that every route kind shares.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -16,10 +16,28 @@ use super::{
 
 const GATEWAY_KIND: &str = "Gateway";
 
-type Labels = BTreeMap<String, String>;
+pub(super) type Labels = BTreeMap<String, String>;
 
 /// A listener slot: index of the gateway in the model, index of the listener in that gateway.
-type Slot = (usize, usize);
+pub(super) type Slot = (usize, usize);
+
+/// The labels of every namespace in the snapshot, by name.
+pub(super) fn namespace_labels(snapshot: &Snapshot) -> BTreeMap<String, Labels> {
+    snapshot
+        .namespaces
+        .iter()
+        .map(|n| (n.name_any(), n.metadata.labels.clone().unwrap_or_default()))
+        .collect()
+}
+
+/// The services of the snapshot by key; of two with one key, the first.
+pub(super) fn services_by_key(snapshot: &Snapshot) -> BTreeMap<ObjRef, &Service> {
+    let mut services: BTreeMap<ObjRef, &Service> = BTreeMap::new();
+    for svc in &snapshot.services {
+        services.entry(ObjRef::of(svc)).or_insert(svc);
+    }
+    services
+}
 
 /// Every route that names one of our gateways, by key. Fills `attached_routes` and `backends`
 /// of the listeners the routes win.
@@ -31,15 +49,8 @@ pub(super) fn routes(snapshot: &Snapshot, gateways: &mut [GatewayModel]) -> Vec<
         .collect();
     routes.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let namespaces: BTreeMap<String, Labels> = snapshot
-        .namespaces
-        .iter()
-        .map(|n| (n.name_any(), n.metadata.labels.clone().unwrap_or_default()))
-        .collect();
-    let mut services: BTreeMap<ObjRef, &Service> = BTreeMap::new();
-    for svc in &snapshot.services {
-        services.entry(ObjRef::of(svc)).or_insert(svc);
-    }
+    let namespaces = namespace_labels(snapshot);
+    let services = services_by_key(snapshot);
 
     let resolved: Vec<Resolved> = routes
         .iter()
