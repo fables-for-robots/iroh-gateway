@@ -400,7 +400,7 @@ fn http_match(m: &HttpRouteRulesMatches) -> Result<HttpMatch, String> {
             ));
         }
         header_name(&h.name)?;
-        no_control(format_args!("the value of header {:?}", h.name), &h.value)?;
+        header_value(&h.name, &h.value)?;
         // Of two entries for one name, only the first counts.
         let name = h.name.to_ascii_lowercase();
         if !headers.iter().any(|(n, _)| *n == name) {
@@ -439,7 +439,7 @@ fn header_mods<'a>(
 ) -> Result<HeaderMods, String> {
     let pair = |(name, value): (&str, &str)| {
         header_name(name)?;
-        no_control(format_args!("the value of header {name:?}"), value)?;
+        header_value(name, value)?;
         Ok::<_, String>((name.to_owned(), value.to_owned()))
     };
     Ok(HeaderMods {
@@ -515,6 +515,15 @@ fn header_name(name: &str) -> Result<(), String> {
     } else {
         Err(format!("header name {name:?} is not of [A-Za-z0-9_-]"))
     }
+}
+
+/// `Err` if the value of header `name` is empty, which HAProxy cannot take as an argument, or
+/// has a control character.
+fn header_value(name: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("the value of header {name:?} is empty"));
+    }
+    no_control(format_args!("the value of header {name:?}"), value)
 }
 
 /// `Err` if `value` has a byte below 0x20 or 0x7f. The message quotes it escaped.
@@ -1337,6 +1346,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn empty_header_values_refuse_the_route() {
+        let response = |set: Option<&str>, add: Option<&str>| HttpRouteRulesFilters {
+            response_header_modifier: Some(HttpRouteRulesFiltersResponseHeaderModifier {
+                set: set.map(|v| {
+                    vec![HttpRouteRulesFiltersResponseHeaderModifierSet {
+                        name: "x-a".into(),
+                        value: v.into(),
+                    }]
+                }),
+                add: add.map(|v| {
+                    vec![HttpRouteRulesFiltersResponseHeaderModifierAdd {
+                        name: "x-a".into(),
+                        value: v.into(),
+                    }]
+                }),
+                ..Default::default()
+            }),
+            ..filter(HttpRouteRulesFiltersType::ResponseHeaderModifier)
+        };
+        // The second rule of each route carries the empty value, so that the message must name
+        // the right one.
+        let second = || {
+            http_route("gw", "r")
+                .backend("web", 8080)
+                .rule()
+                .backend("web", 8080)
+        };
+        let cases: Vec<(&str, HttpRoute)> = vec![
+            ("match", second().matching(headers(&[("x-a", "")]))),
+            (
+                "match among others",
+                second().matching(headers(&[("x-b", "1"), ("x-a", "")])),
+            ),
+            (
+                "request set",
+                second().filter(set_request_header("x-a", "")),
+            ),
+            (
+                "request add",
+                second().filter(add_request_header("x-a", "")),
+            ),
+            ("response set", second().filter(response(Some(""), None))),
+            (
+                "response add",
+                second().filter(response(Some("1"), Some(""))),
+            ),
+        ];
+        for (what, route) in cases {
+            let r = refusal(&route);
+            assert_eq!(r.reason, "UnsupportedValue", "{what}");
+            assert_eq!(
+                r.message, "rule 1: the value of header \"x-a\" is empty",
+                "{what}"
+            );
+        }
+        // The same routes with a value translate.
+        assert_eq!(
+            the_rule(&base().matching(headers(&[("x-a", "1")])), &[web()]).matches[0].headers,
+            pairs(&[("x-a", "1")])
+        );
+        assert!(
+            translate(
+                &second().filter(response(Some("1"), Some("2"))),
+                &by_key(&[web()])
+            )
+            .0
+            .is_ok()
+        );
     }
 
     // ---- attachment ----
