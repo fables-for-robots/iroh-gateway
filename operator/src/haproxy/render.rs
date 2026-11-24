@@ -80,6 +80,7 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
          \x20   timeout tunnel 1h\n\
          \x20   timeout http-request 10s\n\
          \x20   timeout http-keep-alive 60s\n\
+         \x20   timeout client-hs 10s\n\
          \n\
          frontend idle\n\
          \x20   bind unix@{dir}/s/idle.sock mode 600\n\
