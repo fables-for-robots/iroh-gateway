@@ -2,6 +2,7 @@
 mod common;
 
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use common::*;
@@ -11,7 +12,8 @@ use iroh_gateway_edge::Edge;
 use iroh_gateway_operator::tunnel::{
     Connector, LinkOptions, ListenerState, MAX_STATUS_TEXT, StaticConnector,
 };
-use iroh_gateway_proto::control::{BindState, ListenerStatus, Status, StreamHeader};
+use iroh_gateway_proto::control::{BindState, ListenerKey, ListenerStatus, Status, StreamHeader};
+use iroh_gateway_proto::datagram::{MAX_UDP_FLOWS, UDP_FLOW_IDLE};
 use iroh_gateway_proto::frame::write_frame;
 use iroh_gateway_proto::transport::Relay;
 use iroh_gateway_proto::{CLOSE_SHUTDOWN, RESET_BAD_HEADER, RESET_UNKNOWN_LISTENER};
@@ -20,12 +22,47 @@ use tokio::net::TcpListener;
 use tokio::time::{Instant, timeout};
 
 fn bound(keys: &[u16]) -> Vec<ListenerState> {
+    bound_keys(&keys.iter().map(|&p| tcp(p)).collect::<Vec<_>>())
+}
+
+fn bound_keys(keys: &[ListenerKey]) -> Vec<ListenerState> {
     keys.iter()
-        .map(|&p| ListenerState {
-            key: tcp(p),
-            bound: Ok(()),
-        })
+        .map(|&key| ListenerState { key, bound: Ok(()) })
         .collect()
+}
+
+/// The edge's public UDP address for port `p`.
+fn public(p: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], p))
+}
+
+/// A port free for both TCP and UDP on 127.0.0.1.
+fn free_tcp_and_udp_port() -> u16 {
+    loop {
+        let p = free_tcp_port();
+        if std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
+}
+
+/// An edge and a link with one UDP port, `p`, forwarding to a UDP echo server, once the edge
+/// has bound it.
+async fn udp_rig() -> (Rig, u16) {
+    let echo = udp_echo_server().await;
+    let p = free_udp_port();
+    let rig = rig_full(&[], &[], &[(p, echo)], &[p], |_| {}, |_, _| {}).await;
+    wait_state(&rig.link, |s| {
+        s.connected && s.listeners == bound_keys(&[udp(p)])
+    })
+    .await;
+    (rig, p)
+}
+
+fn random_bytes(len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    fastrand::fill(&mut bytes);
+    bytes
 }
 
 #[tokio::test]
@@ -121,7 +158,15 @@ async fn backend_down_resets_visitor() {
 async fn early_disconnects_release_slots_end_to_end() {
     let echo = echo_server().await;
     let p = free_tcp_port();
-    let rig = rig_full(&[(p, echo)], &[p], |e| e.max_connections = 1, |_, _| {}).await;
+    let rig = rig_full(
+        &[(p, echo)],
+        &[p],
+        &[],
+        &[],
+        |e| e.max_connections = 1,
+        |_, _| {},
+    )
+    .await;
     wait_state(&rig.link, |s| s.listeners == bound(&[p])).await;
 
     for _ in 0..20 {
@@ -302,6 +347,8 @@ fn no_address_and_no_relay_is_rejected() {
     assert_eq!(opts.backoff_max, Duration::from_secs(30));
     assert_eq!(opts.bind_retry, Duration::from_secs(30));
     assert_eq!(opts.first_status_timeout, Duration::from_secs(10));
+    assert_eq!(opts.udp_max_flows, MAX_UDP_FLOWS);
+    assert_eq!(opts.udp_flow_idle, UDP_FLOW_IDLE);
 }
 
 #[tokio::test]
@@ -312,8 +359,10 @@ async fn an_edge_that_never_answers_the_config_is_redialled() {
     let limit = Duration::from_millis(500);
     // Before the link exists, so certainly before its session starts.
     let spawned = Instant::now();
-    let (link, _desired, _endpoint) = fake
-        .link_with(&[(p, echo)], &[p], |opts| opts.first_status_timeout = limit)
+    let (link, _desired, _udp, _endpoint) = fake
+        .link_with(&[(p, echo)], &[p], &[], &[], |opts| {
+            opts.first_status_timeout = limit
+        })
         .await;
     let mut s = fake.accept().await;
     s.read_config().await;
@@ -381,8 +430,8 @@ async fn bind_retry_keeps_ids_under_a_new_generation() {
     let echo = echo_server().await;
     let (p, q) = (free_tcp_port(), free_tcp_port());
     let fake = FakeEdge::bind().await;
-    let (link, _desired, _endpoint) = fake
-        .link_with(&[(p, echo), (q, echo)], &[p, q], |opts| {
+    let (link, _desired, _udp, _endpoint) = fake
+        .link_with(&[(p, echo), (q, echo)], &[p, q], &[], &[], |opts| {
             opts.bind_retry = Duration::from_millis(200);
         })
         .await;
@@ -427,6 +476,8 @@ async fn last_error_explains_a_wrong_key() {
     let rig = rig_full(
         &[(p, echo)],
         &[p],
+        &[],
+        &[],
         |e| e.operator = SecretKey::generate().public(),
         |_, _| {},
     )
@@ -816,4 +867,104 @@ async fn shutdown_closes_with_shutdown_code() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn udp_echoes_through_edge_and_operator() {
+    let (rig, p) = udp_rig().await;
+    assert_eq!(udp_roundtrip(public(p), b"hello").await, b"hello");
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_packets_echo_through_edge_and_operator() {
+    let (rig, p) = udp_rig().await;
+    for len in [1_400, 9_000] {
+        let payload = random_bytes(len);
+        assert!(
+            udp_roundtrip(public(p), &payload).await == payload,
+            "{len} bytes"
+        );
+    }
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn largest_packet_echoes_through_edge_and_operator() {
+    let (rig, p) = udp_rig().await;
+    let payload = random_bytes(65_507);
+    assert!(udp_roundtrip(public(p), &payload).await == payload);
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_and_udp_on_one_port_number_reach_their_own_targets() {
+    let tcp_echo = echo_server().await;
+    let udp_echo = udp_echo_server().await;
+    let p = free_tcp_and_udp_port();
+    let rig = rig_full(
+        &[(p, tcp_echo)],
+        &[p],
+        &[(p, udp_echo)],
+        &[p],
+        |_| {},
+        |_, _| {},
+    )
+    .await;
+    wait_state(&rig.link, |s| {
+        s.connected && s.listeners == bound_keys(&[tcp(p), udp(p)])
+    })
+    .await;
+    echoes(&mut visitor(p).await, b"over tcp").await;
+    assert_eq!(udp_roundtrip(public(p), b"over udp").await, b"over udp");
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn udp_works_again_after_the_edge_restarts() {
+    let (mut rig, p) = udp_rig().await;
+    assert_eq!(udp_roundtrip(public(p), b"before").await, b"before");
+
+    let iroh_addr = rig.edge.iroh_addr();
+    rig.edge.shutdown().await;
+    wait_state(&rig.link, |s| !s.connected && s.listeners.is_empty()).await;
+
+    rig.edge = Edge::spawn(edge_options(
+        rig.operator_key.public(),
+        rig.edge_key.clone(),
+        iroh_addr,
+    ))
+    .await
+    .unwrap();
+    wait_state(&rig.link, |s| {
+        s.connected && s.listeners == bound_keys(&[udp(p)])
+    })
+    .await;
+    assert_eq!(udp_roundtrip(public(p), b"after").await, b"after");
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn many_visitors_each_get_their_own_answer() {
+    let (rig, p) = udp_rig().await;
+    let answers = futures::future::join_all((0..50).map(|i| async move {
+        let payload = format!("visitor {i}").into_bytes();
+        let answer = udp_roundtrip(public(p), &payload).await;
+        (payload, answer)
+    }))
+    .await;
+    for (payload, answer) in answers {
+        assert_eq!(
+            String::from_utf8_lossy(&answer),
+            String::from_utf8_lossy(&payload)
+        );
+    }
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
 }

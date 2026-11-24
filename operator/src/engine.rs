@@ -25,7 +25,8 @@ use crate::haproxy::{ApplyError, Supervisor, SupervisorOptions};
 use crate::model::ObjRef;
 use crate::status::Facts;
 use crate::tunnel::{
-    EdgeLink, EdgeState, HaproxyConnector, LinkHandle, LinkOptions, truncate_status_text,
+    EdgeLink, EdgeState, HaproxyConnector, LinkHandle, LinkOptions, UdpTargets,
+    truncate_status_text,
 };
 
 /// Default for [`EngineOptions::retry`].
@@ -90,6 +91,12 @@ struct Running {
     state: watch::Receiver<EdgeState>,
     desired: watch::Sender<Vec<ListenerKey>>,
     connector: Arc<HaproxyConnector>,
+    /// The link's UDP targets.
+    #[allow(
+        dead_code,
+        reason = "nothing fills the table until the render plans UDP"
+    )]
+    udp: watch::Sender<UdpTargets>,
     /// The ports in the table `connector` was last given, which are also the ports this link
     /// asks its edge for (once published).
     sockets: HashMap<ListenerKey, PortPlan>,
@@ -322,8 +329,14 @@ impl Engine {
         for (plan, opts, connector) in new {
             info!(edge = %plan.key, "starting the link");
             let (desired, desired_rx) = watch::channel(Vec::new());
-            let handle =
-                EdgeLink::spawn(self.endpoint.clone(), opts, desired_rx, connector.clone());
+            let (udp, udp_rx) = watch::channel(UdpTargets::new());
+            let handle = EdgeLink::spawn(
+                self.endpoint.clone(),
+                opts,
+                desired_rx,
+                connector.clone(),
+                udp_rx,
+            );
             let link = Running {
                 endpoint_id: plan.endpoint_id,
                 address: plan.address.clone(),
@@ -331,6 +344,7 @@ impl Engine {
                 handle,
                 desired,
                 connector,
+                udp,
                 sockets: plan.sockets.clone(),
                 loaded: plan.sockets.clone(),
             };

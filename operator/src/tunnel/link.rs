@@ -1,5 +1,6 @@
 //! The link to one edge: dials it, redials with backoff, pushes the desired listeners, tracks the
-//! state the edge reports and hands every visitor stream to a [`Connector`].
+//! state the edge reports, hands every visitor stream to a [`Connector`] and every session's UDP
+//! datagrams to its forwarder.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
@@ -16,6 +17,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gateway_proto::control::{
     BindState, Config, Listener, ListenerKey, MAX_STREAM_HEADER_LEN, Status, StreamHeader,
 };
+use iroh_gateway_proto::datagram::{MAX_UDP_FLOWS, UDP_FLOW_IDLE};
 use iroh_gateway_proto::frame::{FrameError, read_frame, read_frame_max, write_frame};
 use iroh_gateway_proto::splice::splice;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
@@ -30,6 +32,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::connector::Connector;
+use super::udp::{self, UdpTargets};
 
 /// How long an incoming stream may take to deliver its `StreamHeader`.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,6 +103,11 @@ pub struct LinkOptions {
     /// How long a new session waits for the edge's first `Status`; without one it ends and the
     /// link redials.
     pub first_status_timeout: Duration,
+    /// How many UDP flows a session keeps; at the cap a new flow replaces the least recently
+    /// used one.
+    pub udp_max_flows: usize,
+    /// A UDP flow is closed after this long without a packet in either direction.
+    pub udp_flow_idle: Duration,
 }
 
 impl LinkOptions {
@@ -118,6 +126,8 @@ impl LinkOptions {
             backoff_max: Duration::from_secs(30),
             bind_retry: Duration::from_secs(30),
             first_status_timeout: Duration::from_secs(10),
+            udp_max_flows: MAX_UDP_FLOWS,
+            udp_flow_idle: UDP_FLOW_IDLE,
         })
     }
 }
@@ -136,11 +146,13 @@ pub struct EdgeLink;
 
 impl EdgeLink {
     /// Starts dialing the edge in the background and keeps a session with it until shutdown.
+    /// The packets of each UDP listener go to its targets in `udp`.
     pub fn spawn<C: Connector>(
         endpoint: Endpoint,
         opts: LinkOptions,
         desired: watch::Receiver<Vec<ListenerKey>>,
         connector: Arc<C>,
+        udp: watch::Receiver<UdpTargets>,
     ) -> LinkHandle {
         let (state_tx, state) = watch::channel(EdgeState::default());
         let (shutdown, shutdown_rx) = oneshot::channel();
@@ -151,6 +163,7 @@ impl EdgeLink {
             desired,
             desired_open: true,
             connector,
+            udp,
             state: state_tx,
             generation: 0,
             ids: HashMap::new(),
@@ -198,6 +211,8 @@ struct Link<C> {
     /// False once the sender of `desired` is gone; its last value stays desired.
     desired_open: bool,
     connector: Arc<C>,
+    /// Each session's UDP forwarder follows it; a closed channel keeps its last value.
+    udp: watch::Receiver<UdpTargets>,
     state: watch::Sender<EdgeState>,
     /// The generation of the last `Config` sent, counted over all connections.
     generation: u64,
@@ -219,6 +234,8 @@ struct Session {
     /// Configs sent and not yet acknowledged, oldest first.
     unacked: VecDeque<Config>,
     streams: JoinSet<()>,
+    /// The session's UDP forwarder.
+    udp: JoinHandle<()>,
     got_status: bool,
 }
 
@@ -356,11 +373,23 @@ impl<C: Connector> Link<C> {
     }
 
     async fn session(&mut self, conn: Connection, shutdown: &mut oneshot::Receiver<()>) -> Ended {
+        let routes = watch::Sender::new(HashMap::new());
+        let udp = tokio::spawn(
+            udp::forward(
+                conn.clone(),
+                routes.subscribe(),
+                self.udp.clone(),
+                self.opts.udp_max_flows,
+                self.opts.udp_flow_idle,
+            )
+            .in_current_span(),
+        );
         let mut s = Session {
             conn: conn.clone(),
-            routes: watch::Sender::new(HashMap::new()),
+            routes,
             unacked: VecDeque::new(),
             streams: JoinSet::new(),
+            udp,
             got_status: false,
         };
         let waiting = Some(WAITING_FOR_STATUS.to_owned());
@@ -381,12 +410,18 @@ impl<C: Connector> Link<C> {
             Some(e) => Some(truncate_status_text(&self.session_ended(&conn, e))),
         };
         s.streams.abort_all();
+        s.udp.abort();
         while let Some(done) = s.streams.join_next().await {
             if let Err(e) = done
                 && e.is_panic()
             {
                 error!("stream task panicked: {e}");
             }
+        }
+        if let Err(e) = (&mut s.udp).await
+            && e.is_panic()
+        {
+            error!("udp forwarder panicked: {e}");
         }
         self.state.send_if_modified(|st| {
             let mut changed = st.connected || !st.listeners.is_empty();

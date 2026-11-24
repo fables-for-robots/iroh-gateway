@@ -68,6 +68,8 @@ async fn unauthorized_close_names_the_operator_key() {
     let rig = rig_full(
         &[(p, echo)],
         &[p],
+        &[],
+        &[],
         |e| e.operator = SecretKey::generate().public(),
         |_, _| {},
     )
@@ -99,7 +101,8 @@ async fn replaced_close_says_another_operator_connected() {
     .unwrap();
     let (_desired, rx) = watch::channel(vec![tcp(p)]);
     let connector = StaticConnector::new([(tcp(p), echo)].into_iter().collect());
-    let second = EdgeLink::spawn(endpoint.clone(), opts, rx, Arc::new(connector));
+    let (_udp, udp_rx) = watch::channel(Default::default());
+    let second = EdgeLink::spawn(endpoint.clone(), opts, rx, Arc::new(connector), udp_rx);
 
     let edge = rig.edge.endpoint_id().fmt_short().to_string();
     let line = line_with(&["another operator with the same key", &edge]).await;

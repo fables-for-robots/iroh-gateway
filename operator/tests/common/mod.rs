@@ -2,6 +2,7 @@
 
 pub mod envtest;
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,17 +13,21 @@ use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions};
 use iroh_gateway_operator::tunnel::{
-    EdgeLink, EdgeState, LinkHandle, LinkOptions, StaticConnector, bind_endpoint,
+    EdgeLink, EdgeState, LinkHandle, LinkOptions, StaticConnector, UdpTarget, UdpTargets,
+    bind_endpoint,
 };
 use iroh_gateway_proto::ALPN;
 use iroh_gateway_proto::control::{
     BindState, Config, ListenerKey, ListenerStatus, Protocol, Status, StreamHeader,
 };
-use iroh_gateway_proto::datagram::{MAX_UDP_FLOWS, UDP_FLOW_IDLE};
+use iroh_gateway_proto::datagram::{
+    Header, MAX_PACKET, MAX_UDP_FLOWS, Packet, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler,
+    UDP_FLOW_IDLE, split,
+};
 use iroh_gateway_proto::frame::{read_frame, write_frame};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 
@@ -84,6 +89,105 @@ pub fn tcp(port: u16) -> ListenerKey {
     }
 }
 
+pub fn udp(port: u16) -> ListenerKey {
+    ListenerKey {
+        protocol: Protocol::Udp,
+        port,
+    }
+}
+
+/// Answers every UDP packet with the same bytes to its sender, until the test ends.
+pub async fn udp_echo_server() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_PACKET];
+        loop {
+            // An ICMP error from an earlier answer surfaces here; it ends nothing.
+            if let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&buf[..n], from).await;
+            }
+        }
+    });
+    addr
+}
+
+/// Sends `payload` to `to` from a fresh socket and returns the first answer from `to`; sends
+/// again every 500 ms until one arrives, and panics after `STEP`.
+pub async fn udp_roundtrip(to: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let local: SocketAddr = if to.is_ipv4() {
+        "127.0.0.1:0".parse().unwrap()
+    } else {
+        "[::1]:0".parse().unwrap()
+    };
+    let socket = UdpSocket::bind(local).await.unwrap();
+    let mut buf = vec![0u8; MAX_PACKET];
+    timeout(STEP, async {
+        loop {
+            let _ = socket.send_to(payload, to).await;
+            let answer = timeout(Duration::from_millis(500), async {
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((n, from)) if from == to => return buf[..n].to_vec(),
+                        _ => continue,
+                    }
+                }
+            })
+            .await;
+            if let Ok(answer) = answer {
+                return answer;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no answer from {to} within {STEP:?}"))
+}
+
+/// The next whole packet on `conn`, decoded and reassembled; panics after `STEP`.
+pub async fn recv_packet(conn: &Connection) -> Packet {
+    let mut reassembler = Reassembler::new(REASSEMBLY_BYTES, REASSEMBLY_WINDOW);
+    timeout(STEP, async {
+        loop {
+            let datagram = conn.read_datagram().await.unwrap();
+            let Ok((header, payload)) = Header::decode(datagram) else {
+                continue;
+            };
+            let now = tokio::time::Instant::now().into_std();
+            if let Some(packet) = reassembler.push(header, payload, now) {
+                return packet;
+            }
+        }
+    })
+    .await
+    .expect("no packet")
+}
+
+/// Sends `payload` as one packet, split by the connection's current datagram size.
+pub fn send_packet(
+    conn: &Connection,
+    listener_id: u32,
+    flow_id: u64,
+    packet_id: u32,
+    payload: &[u8],
+) {
+    let max = conn.max_datagram_size().expect("datagrams unsupported");
+    for datagram in split(listener_id, flow_id, packet_id, payload, max).unwrap() {
+        conn.send_datagram(datagram).unwrap();
+    }
+}
+
+/// A UDP targets table: each `(port, target)` adds `target` with weight 1 to `udp(port)`.
+pub fn udp_targets(targets: &[(u16, SocketAddr)]) -> UdpTargets {
+    let mut table: UdpTargets = HashMap::new();
+    for &(port, addr) in targets {
+        table
+            .entry(udp(port))
+            .or_default()
+            .push(UdpTarget { addr, weight: 1 });
+    }
+    table
+}
+
 pub fn edge_options(operator: EndpointId, key: SecretKey, iroh_listen: SocketAddr) -> EdgeOptions {
     EdgeOptions {
         secret_key: key,
@@ -103,6 +207,7 @@ pub struct Rig {
     pub edge: EdgeHandle,
     pub link: LinkHandle,
     pub desired: watch::Sender<Vec<ListenerKey>>,
+    pub udp: watch::Sender<UdpTargets>,
     pub operator_key: SecretKey,
     pub edge_key: SecretKey,
     /// Held so the link's connections live: dropping an endpoint aborts its connections.
@@ -122,13 +227,16 @@ pub async fn rig_with(
     desired: &[u16],
     customize: impl FnOnce(&EdgeHandle, &mut LinkOptions),
 ) -> Rig {
-    rig_full(targets, desired, |_| {}, customize).await
+    rig_full(targets, desired, &[], &[], |_| {}, customize).await
 }
 
-/// [`rig_with`] with a hook to change the edge's options as well.
+/// [`rig_with`] with UDP targets and desired UDP ports (see [`udp_targets`]) and a hook to change
+/// the edge's options as well.
 pub async fn rig_full(
     targets: &[(u16, SocketAddr)],
     desired: &[u16],
+    udp_targets: &[(u16, SocketAddr)],
+    udp_desired: &[u16],
     customize_edge: impl FnOnce(&mut EdgeOptions),
     customize: impl FnOnce(&EdgeHandle, &mut LinkOptions),
 ) -> Rig {
@@ -153,11 +261,19 @@ pub async fn rig_full(
     opts.backoff_min = Duration::from_millis(50);
     opts.backoff_max = Duration::from_millis(200);
     customize(&edge, &mut opts);
-    let (desired, link) = spawn_link(endpoint.clone(), opts, targets, desired);
+    let (desired, udp, link) = spawn_link(
+        endpoint.clone(),
+        opts,
+        targets,
+        desired,
+        udp_targets,
+        udp_desired,
+    );
     Rig {
         edge,
         link,
         desired,
+        udp,
         operator_key,
         edge_key,
         endpoint,
@@ -204,11 +320,12 @@ pub async fn relay_rig(
     opts.backoff_min = Duration::from_millis(50);
     opts.backoff_max = Duration::from_millis(200);
     let ports: Vec<u16> = targets.iter().map(|&(p, _)| p).collect();
-    let (desired, link) = spawn_link(endpoint.clone(), opts, targets, &ports);
+    let (desired, udp, link) = spawn_link(endpoint.clone(), opts, targets, &ports, &[], &[]);
     let rig = Rig {
         edge,
         link,
         desired,
+        udp,
         operator_key,
         edge_key,
         endpoint,
@@ -216,16 +333,30 @@ pub async fn relay_rig(
     (rig, server)
 }
 
-fn spawn_link(
+/// A link with `desired` as TCP ports and then `udp_desired` as UDP ports desired, TCP
+/// `targets` behind a `StaticConnector` and `udp_targets` as its UDP table.
+pub fn spawn_link(
     endpoint: Endpoint,
     opts: LinkOptions,
     targets: &[(u16, SocketAddr)],
     desired: &[u16],
-) -> (watch::Sender<Vec<ListenerKey>>, LinkHandle) {
-    let (tx, rx) = watch::channel(desired.iter().map(|&p| tcp(p)).collect());
+    udp_targets: &[(u16, SocketAddr)],
+    udp_desired: &[u16],
+) -> (
+    watch::Sender<Vec<ListenerKey>>,
+    watch::Sender<UdpTargets>,
+    LinkHandle,
+) {
+    let keys = desired
+        .iter()
+        .map(|&p| tcp(p))
+        .chain(udp_desired.iter().map(|&p| udp(p)))
+        .collect();
+    let (tx, rx) = watch::channel(keys);
+    let (udp_tx, udp_rx) = watch::channel(self::udp_targets(udp_targets));
     let connector = StaticConnector::new(targets.iter().map(|&(p, a)| (tcp(p), a)).collect());
-    let link = EdgeLink::spawn(endpoint, opts, rx, Arc::new(connector));
-    (tx, link)
+    let link = EdgeLink::spawn(endpoint, opts, rx, Arc::new(connector), udp_rx);
+    (tx, udp_tx, link)
 }
 
 /// Waits up to 5 s for the link's state to satisfy `pred`; panics on timeout.
@@ -322,16 +453,26 @@ impl FakeEdge {
         targets: &[(u16, SocketAddr)],
         desired: &[u16],
     ) -> (LinkHandle, watch::Sender<Vec<ListenerKey>>, Endpoint) {
-        self.link_with(targets, desired, |_| {}).await
+        let (link, desired, _udp, endpoint) =
+            self.link_with(targets, desired, &[], &[], |_| {}).await;
+        (link, desired, endpoint)
     }
 
-    /// [`FakeEdge::link`] with a hook to change the link's options.
+    /// [`FakeEdge::link`] with UDP targets and desired UDP ports (see [`spawn_link`]) and a hook
+    /// to change the link's options; also returns the sender of the link's UDP table.
     pub async fn link_with(
         &self,
         targets: &[(u16, SocketAddr)],
         desired: &[u16],
+        udp_targets: &[(u16, SocketAddr)],
+        udp_desired: &[u16],
         customize: impl FnOnce(&mut LinkOptions),
-    ) -> (LinkHandle, watch::Sender<Vec<ListenerKey>>, Endpoint) {
+    ) -> (
+        LinkHandle,
+        watch::Sender<Vec<ListenerKey>>,
+        watch::Sender<UdpTargets>,
+        Endpoint,
+    ) {
         let endpoint = bind_endpoint(SecretKey::generate(), &Relay::Disabled)
             .await
             .unwrap();
@@ -341,8 +482,15 @@ impl FakeEdge {
         opts.backoff_min = Duration::from_millis(50);
         opts.backoff_max = Duration::from_millis(200);
         customize(&mut opts);
-        let (desired, link) = spawn_link(endpoint.clone(), opts, targets, desired);
-        (link, desired, endpoint)
+        let (desired, udp, link) = spawn_link(
+            endpoint.clone(),
+            opts,
+            targets,
+            desired,
+            udp_targets,
+            udp_desired,
+        );
+        (link, desired, udp, endpoint)
     }
 
     /// Accepts the link's connection and its control stream.

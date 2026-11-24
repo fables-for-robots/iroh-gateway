@@ -18,7 +18,9 @@ use nix::unistd::Pid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use common::{echo_server, edge_options, free_tcp_port};
+use common::{
+    echo_server, edge_options, free_tcp_port, free_udp_port, udp_echo_server, udp_roundtrip,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_iroh-gateway-operator");
 
@@ -250,6 +252,58 @@ async fn static_forwards_to_target() {
             }
         }
     }
+
+    let status = child.terminate();
+    assert!(status.success(), "{status:?}");
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn static_forwards_udp_to_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("o.key");
+    let id = operator(&["id", "--key-file", key.to_str().unwrap()]);
+    assert!(id.status.success());
+    let operator_id: EndpointId = String::from_utf8(id.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    let edge = Edge::spawn(edge_options(
+        operator_id,
+        SecretKey::generate(),
+        "127.0.0.1:0".parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+    let target = udp_echo_server().await;
+    let port = free_udp_port();
+    let cfg = dir.path().join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "key_file = {:?}\n[[edge]]\nendpoint_id = \"{}\"\naddress = \"{}\"\n\
+             [[edge.listener]]\nprotocol = \"udp\"\nport = {port}\ntarget = \"{target}\"\n",
+            key.to_str().unwrap(),
+            edge.endpoint_id(),
+            edge.iroh_addr()
+        ),
+    )
+    .unwrap();
+    let mut child = Running(
+        bin()
+            .args(["static", "--config", cfg.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    // Sent again until the operator has connected and the edge has bound the port.
+    let to = format!("127.0.0.1:{port}").parse().unwrap();
+    assert_eq!(udp_roundtrip(to, b"hello").await, b"hello");
 
     let status = child.terminate();
     assert!(status.success(), "{status:?}");
