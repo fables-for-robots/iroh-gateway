@@ -1002,11 +1002,11 @@ mod tests {
             cert("site-a", "1111111111111111"),
             cert("site-b", "2222222222222222"),
         );
-        let r = render_ports(vec![simple_port(443, Some(vec![a.clone(), b.clone()]))]);
-        let golden = include_str!("testdata/https.cfg");
+        let mut port = simple_port(443, Some(vec![a.clone(), b.clone()]));
         // The golden file's server is on 8443.
-        let golden = golden.replace("10.0.0.1:8443", "10.0.0.1:8080");
-        assert_eq!(r.haproxy_cfg, golden);
+        port.backends = vec![forward(vec![backend("10.0.0.1", 8443, 1)])];
+        let r = render_ports(vec![port]);
+        assert_eq!(r.haproxy_cfg, include_str!("testdata/https.cfg"));
         let list = "/run/igw/certs/gw.site-a.1111111111111111.pem\n\
                     /run/igw/certs/gw.site-b.2222222222222222.pem\n";
         let list_name = format!(

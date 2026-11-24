@@ -1046,7 +1046,7 @@ async fn hostile_strings_cannot_inject_configuration() {
         backend("M").await,
     );
     // (header, value, the value as it must stand in the configuration).
-    let set: [(&str, &str, &str); 9] = [
+    let set: [(&str, &str, &str); 10] = [
         ("x-h1", "%[src]", "'%%[src]'"),
         ("x-h2", "%[env(HOME)]", "'%%[env(HOME)]'"),
         ("x-h3", "${HOME}", "'${HOME}'"),
@@ -1060,6 +1060,8 @@ async fn hostile_strings_cannot_inject_configuration() {
             "' } use_backend be_x if TRUE #",
             "''\\'' } use_backend be_x if TRUE #'",
         ),
+        // Repeated spaces inside one quoted word stay as they are.
+        ("x-h10", "a  b   c", "'a  b   c'"),
     ];
     let mut with_headers = to(d);
     with_headers.request_headers.set = set

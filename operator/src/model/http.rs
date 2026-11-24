@@ -760,20 +760,21 @@ mod tests {
         let by = |name: &str, header: &str| {
             route(name).matching(with_headers(prefix_path("/"), &[header]))
         };
+        // Named so that the order of the keys is the reverse of the order of age.
         let routes = vec![
-            by("undated", "x-a"),
-            by("newer", "x-b").created(20),
-            by("b-same-age", "x-c").created(10),
-            by("a-same-age", "x-d").created(10),
+            by("a-undated", "x-a"),
+            by("b-newer", "x-b").created(20),
+            by("d-same-age", "x-c").created(10),
+            by("c-same-age", "x-d").created(10),
         ];
         let p = the_port(vec![public()], routes);
         assert_eq!(
             lines(&p),
             [
-                "(any) /* - [x-d] a-same-age",
-                "(any) /* - [x-c] b-same-age",
-                "(any) /* - [x-b] newer",
-                "(any) /* - [x-a] undated",
+                "(any) /* - [x-d] c-same-age",
+                "(any) /* - [x-c] d-same-age",
+                "(any) /* - [x-b] b-newer",
+                "(any) /* - [x-a] a-undated",
             ]
         );
 
