@@ -269,7 +269,7 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
         }
     };
     let mut engine = started?;
-    let stores = Stores::start(client.clone());
+    let stores = Stores::start(client.clone(), &settings.gateway_namespaces);
     let writer = StatusWriter::new(client, args.controller_name);
     let opts = ControllerOptions::new(settings, &haproxy_dir);
     // A signal that came since the engine started ends the loop at once.

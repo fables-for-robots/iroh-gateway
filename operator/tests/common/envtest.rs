@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use gateway_api::gatewayclasses::v1::GatewayClass;
 use gateway_api::gateways::v1::Gateway;
+use gateway_api::httproutes::v1::HttpRoute;
 use gateway_api::tcproutes::v1::TcpRoute;
 use iroh_gateway_operator::crd::Edge;
 use k8s_openapi::api::core::v1::Namespace;
@@ -33,9 +34,10 @@ const START_ATTEMPTS: u32 = 5;
 /// The upstream manifest `scripts/envtest-assets` downloads beside the binaries.
 const GATEWAY_API_MANIFEST: &str = "gateway-api-v1.7.0-standard-install.yaml";
 /// The CRDs of that manifest the operator uses.
-const GATEWAY_API_CRDS: [&str; 3] = [
+const GATEWAY_API_CRDS: [&str; 4] = [
     "gatewayclasses.gateway.networking.k8s.io",
     "gateways.gateway.networking.k8s.io",
+    "httproutes.gateway.networking.k8s.io",
     "tcproutes.gateway.networking.k8s.io",
 ];
 
@@ -300,6 +302,7 @@ impl Envtest {
         self.served::<Edge>().await;
         self.served::<GatewayClass>().await;
         self.served::<Gateway>().await;
+        self.served::<HttpRoute>().await;
         self.served::<TcpRoute>().await;
     }
 
