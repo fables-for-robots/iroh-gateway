@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use gateway_api::gateways::v1::{GatewayListenersTls, GatewayListenersTlsCertificateRefs};
 use k8s_openapi::api::core::v1::Secret;
 use rustls::crypto::ring::sign::any_supported_type;
@@ -19,7 +21,10 @@ pub struct Certificate {
     pub secret: ObjRef,
     /// See `file_name`.
     pub file_name: String,
-    /// `tls.crt`, then `tls.key`, each ending in exactly one newline. Key material.
+    /// Re-encoded from what was checked, so HAProxy reads nothing else: every certificate of
+    /// `tls.crt`, in order, as a `CERTIFICATE` block, then the private key under the label of its
+    /// form (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`). Standard base64 with padding
+    /// in lines of 64 characters; every line ends in one `\n`. Key material.
     pub pem: String,
 }
 
@@ -34,6 +39,9 @@ impl fmt::Debug for Certificate {
 
 /// `<the first 80 characters of "<namespace>.<name>", every character outside [a-z0-9.-] replaced by '_'>`
 /// `.<the first 16 hex characters of SHA-256 over pem>.pem`
+///
+/// `pem` is [`Certificate::pem`], the re-encoded text, so equal certificates and keys give equal
+/// names whatever the whitespace or extra text in the Secret.
 pub(crate) fn file_name(secret: &ObjRef, pem: &str) -> String {
     let stem: String = format!("{}.{}", secret.namespace, secret.name)
         .chars()
@@ -45,6 +53,22 @@ pub(crate) fn file_name(secret: &ObjRef, pem: &str) -> String {
         .collect();
     let digest = hex::encode(Sha256::digest(pem.as_bytes()));
     format!("{stem}.{}.pem", &digest[..16])
+}
+
+/// Appends `der` to `out` as a PEM block with `label`: standard base64 with padding in lines of 64
+/// characters, every line ending in `\n`.
+fn push_block(out: &mut String, label: &str, der: &[u8]) {
+    let b64 = BASE64.encode(der);
+    out.push_str("-----BEGIN ");
+    out.push_str(label);
+    out.push_str("-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.extend(line.iter().map(|&b| char::from(b)));
+        out.push('\n');
+    }
+    out.push_str("-----END ");
+    out.push_str(label);
+    out.push_str("-----\n");
 }
 
 const SECRET_TYPE: &str = "kubernetes.io/tls";
@@ -143,8 +167,19 @@ fn certificate(key: ObjRef, secret: &Secret) -> Result<Certificate, Reject> {
         return Err(refuse("tls.key must hold exactly one private key"));
     }
     let der = keys.remove(0);
+    let key_label = match &der {
+        PrivateKeyDer::Pkcs8(_) => "PRIVATE KEY",
+        PrivateKeyDer::Pkcs1(_) => "RSA PRIVATE KEY",
+        PrivateKeyDer::Sec1(_) => "EC PRIVATE KEY",
+        _ => return Err(refuse("unsupported private key type")),
+    };
     let signing_key =
         any_supported_type(&der).map_err(|_| refuse("unsupported private key type"))?;
+    let mut pem = String::new();
+    for c in &chain {
+        push_block(&mut pem, "CERTIFICATE", c);
+    }
+    push_block(&mut pem, key_label, der.secret_der());
     match CertifiedKey::new(chain, signing_key).keys_match() {
         Ok(()) => {}
         Err(rustls::Error::InconsistentKeys(_)) => {
@@ -153,7 +188,6 @@ fn certificate(key: ObjRef, secret: &Secret) -> Result<Certificate, Reject> {
         Err(_) => return Err(refuse("the first certificate in tls.crt cannot be read")),
     }
 
-    let pem = format!("{}\n{}\n", crt.trim_end(), tls_key.trim_end());
     Ok(Certificate {
         file_name: file_name(&key, &pem),
         secret: key,
@@ -171,6 +205,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::super::fixtures::*;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
     use super::super::{ListenerModel, Model, ObjRef, Reject, Snapshot, build};
     use super::file_name;
 
@@ -270,6 +307,52 @@ mod tests {
         secret
     }
 
+    /// One PEM block as the operator must write it: base64 with padding in lines of 64, every
+    /// line ending in `\n`.
+    fn block(label: &str, der: &[u8]) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        let mut lines = Vec::new();
+        let mut rest = b64.as_str();
+        while !rest.is_empty() {
+            let (line, tail) = rest.split_at(rest.len().min(64));
+            lines.push(line);
+            rest = tail;
+        }
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.join("\n")
+        )
+    }
+
+    /// The certificates of `crt` and the PKCS#8 key of `key`, re-encoded from their DER.
+    fn canonical(crt: &str, key: &str) -> String {
+        let mut out = String::new();
+        for c in CertificateDer::pem_slice_iter(crt.as_bytes()) {
+            out.push_str(&block("CERTIFICATE", &c.unwrap()));
+        }
+        let key = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+        out.push_str(&block("PRIVATE KEY", key.secret_der()));
+        out
+    }
+
+    /// `pem` with every `\n` made `\r\n`.
+    fn crlf(pem: &str) -> String {
+        pem.replace('\n', "\r\n")
+    }
+
+    /// `pem`'s blocks with `label` put in place of their own.
+    fn relabel(pem: &str, label: &str) -> String {
+        pem.lines()
+            .map(|l| match l.strip_prefix("-----BEGIN ") {
+                Some(_) => format!("-----BEGIN {label}-----\n"),
+                None if l.starts_with("-----END ") => format!("-----END {label}-----\n"),
+                None => format!("{l}\n"),
+            })
+            .collect()
+    }
+
     /// The base64 lines of a PEM key: every line that is not a marker.
     fn key_lines(pem: &str) -> Vec<&str> {
         pem.lines()
@@ -289,11 +372,13 @@ mod tests {
         assert_eq!(l.certificates.len(), 1);
         let c = &l.certificates[0];
         assert_eq!(c.secret, ObjRef::new(NS, "site-tls"));
+        // rcgen writes canonical PEM already: LF, lines of 64.
         let pem = format!("{}\n{}\n", crt.trim_end(), key.trim_end());
+        assert_eq!(pem, canonical(&crt, &key));
         assert_eq!(c.pem, pem);
         assert_eq!(c.file_name, format!("gw.site-tls.{}.pem", sha16(&pem)));
 
-        // Each part ends in exactly one newline, whatever the Secret has.
+        // Extra blank lines around the parts do not reach the file.
         let m = model_of(
             vec![https("public", &["site-tls"])],
             vec![tls_secret(
@@ -819,5 +904,163 @@ mod tests {
         assert!(!listeners[1].serving());
         listeners[0].conflicted = Some(Reject::new("HostnameConflict", "x"));
         assert!(!listeners[0].serving());
+    }
+    /// The certificate of a model of one HTTPS Gateway and a Secret `site-tls` with `crt` and
+    /// `key`, or what refused it.
+    fn resolved(crt: &str, key: &str) -> Result<super::Certificate, Reject> {
+        let m = model_of(
+            vec![https("public", &["site-tls"])],
+            vec![tls_secret(NS, "site-tls", crt, key)],
+        );
+        let l = only(&m);
+        l.resolved_refs.clone()?;
+        assert_eq!(l.certificates.len(), 1);
+        Ok(l.certificates[0].clone())
+    }
+
+    #[test]
+    fn pem_is_re_encoded_from_what_was_checked() {
+        let (leaf, key) = self_signed();
+        let (second, _) = self_signed_with(&rcgen::PKCS_ED25519);
+        let messy_crt = crlf(&format!(
+            "Bag Attributes\n    friendlyName: site\n{leaf}# a comment between blocks\n\n{second}trailing text\n"
+        ));
+        let messy_key = crlf(&format!(
+            "-----BEGIN EC PARAMETERS-----\nBggqhkjOPQMBBw==\n-----END EC PARAMETERS-----\n{key}"
+        ));
+        let c = resolved(&messy_crt, &messy_key).expect("accepted");
+        let want = canonical(&format!("{leaf}{second}"), &key);
+        assert_eq!(c.pem, want);
+        assert_eq!(c.pem, format!("{leaf}{second}{key}"));
+        assert_eq!(c.pem.matches("-----BEGIN CERTIFICATE-----").count(), 2);
+        assert_eq!(c.pem.matches("-----BEGIN ").count(), 3);
+        assert_eq!(c.pem.matches("PRIVATE KEY-----").count(), 2);
+        for extra in [
+            "Bag",
+            "friendlyName",
+            "comment",
+            "trailing",
+            "PARAMETERS",
+            "\r",
+            "\n\n",
+        ] {
+            assert!(!c.pem.contains(extra), "{extra:?} in {}", c.file_name);
+        }
+        assert_eq!(c.file_name, format!("gw.site-tls.{}.pem", sha16(&want)));
+    }
+
+    #[test]
+    fn sections_rustls_skips_never_reach_the_file() {
+        let (crt, key) = self_signed();
+        let trusted = relabel(&crt, "TRUSTED CERTIFICATE");
+        let dsa = relabel(&key, "DSA PRIVATE KEY");
+        let encrypted = relabel(&key, "ENCRYPTED PRIVATE KEY");
+        let cases = [
+            (
+                "TRUSTED CERTIFICATE",
+                format!("{trusted}{crt}"),
+                key.clone(),
+            ),
+            ("DSA PRIVATE KEY", format!("{dsa}{crt}"), key.clone()),
+            (
+                "ENCRYPTED PRIVATE KEY",
+                crt.clone(),
+                format!("{encrypted}{key}"),
+            ),
+        ];
+        for (label, crt_field, key_field) in cases {
+            // Either refused or accepted; when accepted, the file holds only what was checked.
+            if let Ok(c) = resolved(&crt_field, &key_field) {
+                assert!(!c.pem.contains(label), "{label}");
+                assert!(!c.pem.contains("TRUSTED CERTIFICATE"), "{label}");
+                assert!(!c.pem.contains("DSA PRIVATE KEY"), "{label}");
+                assert!(!c.pem.contains("ENCRYPTED PRIVATE KEY"), "{label}");
+                assert_eq!(c.pem, canonical(&crt, &key), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn equal_certificates_give_equal_files_whatever_the_whitespace() {
+        let (crt, key) = self_signed();
+        let lf = resolved(&crt, &key).expect("accepted");
+        let crlf = resolved(&crlf(&crt), &crlf(&key)).expect("accepted");
+        let trimmed = resolved(crt.trim_end(), key.trim_end()).expect("accepted");
+        for other in [&crlf, &trimmed] {
+            assert_eq!(other.pem, lf.pem);
+            assert_eq!(other.file_name, lf.file_name);
+        }
+    }
+
+    #[test]
+    fn re_encoded_pem_parses_back_to_the_same_der() {
+        let (leaf, key) = self_signed();
+        let (second, _) = self_signed_with(&rcgen::PKCS_ECDSA_P384_SHA384);
+        let crt = crlf(&format!("{leaf}{second}"));
+        let c = resolved(&crt, &crlf(&key)).expect("accepted");
+
+        let original: Vec<CertificateDer<'_>> = CertificateDer::pem_slice_iter(crt.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let again: Vec<CertificateDer<'_>> = CertificateDer::pem_slice_iter(c.pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(original.len(), 2);
+        assert_eq!(again, original);
+
+        let original = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        let keys: Vec<PrivateKeyDer<'_>> = PrivateKeyDer::pem_slice_iter(c.pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].secret_der(), original.secret_der());
+    }
+
+    #[test]
+    fn key_blocks_carry_the_label_of_their_form() {
+        // Not keys: only the framing is under test here.
+        let der: Vec<u8> = (0..=99).collect();
+        for (key, label) in [
+            (PrivateKeyDer::Pkcs8(der.clone().into()), "PRIVATE KEY"),
+            (PrivateKeyDer::Pkcs1(der.clone().into()), "RSA PRIVATE KEY"),
+            (PrivateKeyDer::Sec1(der.clone().into()), "EC PRIVATE KEY"),
+        ] {
+            let mut out = String::new();
+            super::push_block(&mut out, label, key.secret_der());
+            assert_eq!(out, block(label, &der));
+            let lines: Vec<&str> = out.lines().collect();
+            // 100 bytes: 136 base64 characters in lines of 64, 64 and 8.
+            assert_eq!(lines.len(), 5);
+            assert_eq!(lines[0], format!("-----BEGIN {label}-----"));
+            assert_eq!(
+                (lines[1].len(), lines[2].len(), lines[3].len()),
+                (64, 64, 8)
+            );
+            assert_eq!(lines[4], format!("-----END {label}-----"));
+            assert!(out.ends_with("-----\n") && !out.contains("\n\n"));
+            let back = PrivateKeyDer::from_pem_slice(out.as_bytes()).unwrap();
+            assert_eq!(back.secret_der(), der.as_slice());
+        }
+    }
+
+    #[test]
+    fn sec1_key_is_written_as_an_ec_private_key() {
+        let (crt, key) = self_signed();
+        // ring's PKCS#8 for P-256: a 27-byte header, then OCTET STRING { ECPrivateKey (SEC1) }.
+        let pkcs8 = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        let der = pkcs8.secret_der();
+        assert_eq!(der[27], 0x04);
+        let len = usize::from(der[28]);
+        assert_eq!(29 + len, der.len());
+        let sec1 = &der[29..];
+        let sec1_pem = block("EC PRIVATE KEY", sec1);
+
+        let c = resolved(&crt, &sec1_pem).expect("accepted");
+        let crt_der = CertificateDer::from_pem_slice(crt.as_bytes()).unwrap();
+        assert_eq!(
+            c.pem,
+            format!("{}{sec1_pem}", block("CERTIFICATE", &crt_der))
+        );
+        assert!(!c.pem.contains("BEGIN PRIVATE KEY"));
     }
 }
