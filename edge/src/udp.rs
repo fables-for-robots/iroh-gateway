@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Packets queued for one UDP port to send to its visitors.
 pub(crate) const REPLY_QUEUE: usize = 256;
@@ -37,6 +37,8 @@ pub struct UdpHub {
     shared: Arc<Shared>,
     /// Reads the current session's datagrams.
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// No rate limit is set, and no UDP port has opened yet.
+    unlimited_warning_due: AtomicBool,
 }
 
 impl UdpHub {
@@ -55,7 +57,24 @@ impl UdpHub {
                 drops: Drops::default(),
             }),
             reader: Mutex::new(None),
+            unlimited_warning_due: AtomicBool::new(rate_limit.is_none()),
         })
+    }
+
+    /// Called when a UDP port has opened. The first time, without a rate limit, warns that a
+    /// flood can stall TCP and HTTP through this edge.
+    pub(crate) fn port_opened(&self) {
+        if self.unlimited_warning_due.swap(false, Ordering::Relaxed) {
+            warn!(
+                "udp is forwarded without a rate limit: a flood can stall tcp and http through \
+                 this edge; --udp-rate-limit bounds it"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unlimited_warning_due(&self) -> bool {
+        self.unlimited_warning_due.load(Ordering::Relaxed)
     }
 
     /// Forwards UDP over `conn` from now on and forgets every flow; None stops forwarding.
@@ -89,27 +108,31 @@ impl UdpHub {
         self.shared.lock().flows.len()
     }
 
-    /// Forwards one visitor packet received on `port`, whose listener has `listener_id`;
-    /// replies to it go to `replies`. Drops it when it cannot be sent at once, or when the
-    /// bytes it becomes in the tunnel (its payload and an 18-byte header per fragment) exceed
-    /// the rate limit.
+    /// Forwards one visitor packet received on `port`, whose listener's current id
+    /// `listener_id` holds; replies to it go to `replies`. The id is read under the lock that
+    /// reads the session, so the packet goes under an id of the session it is sent on. Drops it
+    /// when it cannot be sent at once, or when the bytes it becomes in the tunnel (its payload
+    /// and an 18-byte header per fragment) exceed the rate limit.
     pub(crate) fn forward(
         &self,
         port: u16,
-        listener_id: u32,
+        listener_id: &AtomicU32,
         visitor: SocketAddr,
         payload: &[u8],
         replies: &mpsc::Sender<Reply>,
     ) {
         let drops = &self.shared.drops;
         let now = now();
-        let (conn, max, flow_id, packet_id) = {
+        let (conn, max, listener_id, flow_id, packet_id) = {
             let mut state = self.shared.lock();
             let state = &mut *state;
             let Some(conn) = state.conn.clone() else {
                 drops.no_session.hit();
                 return;
             };
+            // A new session is set under this lock only once the listener set has stored the
+            // ids of its first `Config`, so the id read here is one of this session's.
+            let listener_id = listener_id.load(Ordering::Relaxed);
             // The size changes with the path, so it is read for every packet. A packet that
             // cannot be split at it is dropped before it is charged or makes a flow.
             let Some((max, wire)) = conn
@@ -129,7 +152,7 @@ impl UdpHub {
                 state
                     .flows
                     .outgoing(port, visitor, listener_id, replies, now);
-            (conn, max, flow_id, packet_id)
+            (conn, max, listener_id, flow_id, packet_id)
         };
         let Ok(datagrams) = split(listener_id, flow_id, packet_id, payload, max) else {
             drops.send_error.hit();
@@ -387,7 +410,11 @@ impl TokenBucket {
 struct Drops {
     no_session: Counter,
     rate_limit: Counter,
-    /// The tunnel refused a datagram, or a port's reply queue was full or gone.
+    /// A visitor packet that cannot be split at the session's datagram size (none known, no
+    /// room past the header, or more than `MAX_FRAGMENTS` pieces), a datagram `send_datagram`
+    /// refused (too large for the path, datagrams unsupported, or the connection lost), or a
+    /// reply whose port's queue was full or gone. Not counted: on a full send buffer the QUIC
+    /// layer discards the oldest queued datagram, one piece of some earlier packet, silently.
     send_error: Counter,
     unknown_flow: Counter,
     bad_datagram: Counter,
@@ -592,11 +619,12 @@ mod tests {
     async fn without_a_session_packets_are_dropped_and_counted() {
         let hub = UdpHub::new(8, Duration::from_secs(60), None);
         let (tx, _rx) = replies();
-        hub.forward(53, 7, visitor(1), b"hello", &tx);
+        let id = AtomicU32::new(7);
+        hub.forward(53, &id, visitor(1), b"hello", &tx);
         assert_eq!(hub.shared.drops.no_session.get(), 1);
         assert_eq!(hub.flows(), 0);
         hub.set_session(None);
-        hub.forward(53, 7, visitor(1), b"hello", &tx);
+        hub.forward(53, &id, visitor(1), b"hello", &tx);
         assert_eq!(hub.shared.drops.no_session.get(), 2);
     }
 

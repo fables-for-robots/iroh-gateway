@@ -17,6 +17,7 @@ tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 nix = { workspace = true, features = ["resource"] }
+socket2.workspace = true
 
 [dev-dependencies]
 fastrand.workspace = true

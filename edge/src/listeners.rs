@@ -12,6 +12,7 @@ use iroh_gateway_proto::control::{
 use iroh_gateway_proto::datagram::MAX_PACKET;
 use iroh_gateway_proto::tcp::set_keepalive_and_nodelay;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
+use socket2::SockRef;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -123,6 +124,7 @@ impl ListenerSet {
                         ))
                     }),
                     Protocol::Udp => UdpSocket::bind(addr).await.map(|socket| {
+                        self.udp.port_opened();
                         tokio::spawn(udp_loop(socket, l.port, id.clone(), self.udp.clone()))
                     }),
                 };
@@ -219,19 +221,18 @@ async fn accept_loop(
 }
 
 /// Owns one UDP port's socket: hands each visitor packet to the hub under the listener's
-/// current id, and sends the replies the hub queues for the port.
+/// current id, and sends the replies the hub queues for the port. A reply the kernel does not
+/// take at once is dropped and counted.
 async fn udp_loop(socket: UdpSocket, port: u16, id: Arc<AtomicU32>, hub: Arc<UdpHub>) {
     let (replies_tx, mut replies) = mpsc::channel::<Reply>(REPLY_QUEUE);
     let mut buf = vec![0u8; MAX_PACKET];
     let mut recv_errors = LogThrottle::new(LOG_EVERY);
     let mut send_errors = LogThrottle::new(LOG_EVERY);
+    let mut send_failures: u64 = 0;
     loop {
         tokio::select! {
             received = socket.recv_from(&mut buf) => match received {
-                Ok((n, visitor)) => {
-                    let listener_id = id.load(Ordering::Relaxed);
-                    hub.forward(port, listener_id, visitor, &buf[..n], &replies_tx);
-                }
+                Ok((n, visitor)) => hub.forward(port, &id, visitor, &buf[..n], &replies_tx),
                 Err(e) => {
                     if let Some(suppressed) = recv_errors.hit() {
                         debug!(port, suppressed, "receiving a udp packet failed: {e}");
@@ -240,10 +241,21 @@ async fn udp_loop(socket: UdpSocket, port: u16, id: Arc<AtomicU32>, hub: Arc<Udp
             },
             // Never None: this task holds a sender.
             Some((visitor, payload)) = replies.recv() => {
-                if let Err(e) = socket.send_to(&payload, visitor).await
-                    && let Some(suppressed) = send_errors.hit()
-                {
-                    debug!(port, %visitor, suppressed, "sending a udp reply failed: {e}");
+                // Straight to the kernel, as a non-blocking send: awaiting `send_to` would stop
+                // the port receiving while a send waits, and tokio's `try_send_to` refuses until
+                // the reactor has reported the socket writable, which would drop its first
+                // replies.
+                if let Err(e) = SockRef::from(&socket).send_to(&payload, &visitor.into()) {
+                    send_failures += 1;
+                    if let Some(suppressed) = send_errors.hit() {
+                        debug!(
+                            port,
+                            %visitor,
+                            total = send_failures,
+                            suppressed,
+                            "sending a udp reply failed: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -464,6 +476,27 @@ mod tests {
                 key(Protocol::Udp, hi),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn the_first_udp_port_without_a_rate_limit_warns_once() {
+        let p = free_tcp_and_udp_port(0);
+        let q = free_tcp_and_udp_port(p);
+        let udp = hub();
+        let (mut set, _rx) = ListenerSet::new("127.0.0.1".parse().unwrap(), 10, udp.clone());
+        set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await;
+        assert!(udp.unlimited_warning_due());
+        let st = set
+            .apply(&cfg(2, &[(1, Protocol::Tcp, p), (2, Protocol::Udp, p)]))
+            .await;
+        assert!(st.listeners.iter().all(|l| l.state == BindState::Bound));
+        assert!(!udp.unlimited_warning_due());
+        // With a rate limit, there is nothing to warn about.
+        let limited = UdpHub::new(MAX_UDP_FLOWS, UDP_FLOW_IDLE, Some(1_000));
+        assert!(!limited.unlimited_warning_due());
+        let (mut set, _rx) = ListenerSet::new("127.0.0.1".parse().unwrap(), 10, limited.clone());
+        set.apply(&cfg(1, &[(1, Protocol::Udp, q)])).await;
+        assert!(!limited.unlimited_warning_due());
     }
 
     #[tokio::test]
