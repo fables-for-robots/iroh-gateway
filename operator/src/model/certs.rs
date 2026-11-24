@@ -11,8 +11,9 @@ use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ParsedCertificate;
-use rustls::sign::CertifiedKey;
+use rustls::sign::{CertifiedKey, SigningKey};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use super::{ObjRef, Reject};
 
@@ -23,8 +24,9 @@ pub struct Certificate {
     /// See `file_name`.
     pub file_name: String,
     /// Re-encoded from what was checked, so HAProxy reads nothing else: every certificate of
-    /// `tls.crt`, in order, as a `CERTIFICATE` block, then the private key under the label of its
-    /// form (`PRIVATE KEY`, `RSA PRIVATE KEY` or `EC PRIVATE KEY`). Standard base64 with padding
+    /// `tls.crt`, in order, as a `CERTIFICATE` block, then the private key: PKCS#8 as
+    /// `PRIVATE KEY`, PKCS#1 as `RSA PRIVATE KEY`, and a SEC1 EC key converted to PKCS#8 as
+    /// `PRIVATE KEY` (OpenSSL does not read SEC1 without curve parameters). Standard base64 with padding
     /// in lines of 64 characters; every line ends in one `\n`. Key material.
     pub pem: String,
 }
@@ -177,15 +179,24 @@ fn certificate(key: ObjRef, secret: &Secret) -> Result<Certificate, Reject> {
     if keys.len() != 1 {
         return Err(refuse("tls.key must hold exactly one private key"));
     }
-    let der = keys.remove(0);
-    let key_label = match &der {
-        PrivateKeyDer::Pkcs8(_) => "PRIVATE KEY",
-        PrivateKeyDer::Pkcs1(_) => "RSA PRIVATE KEY",
-        PrivateKeyDer::Sec1(_) => "EC PRIVATE KEY",
-        _ => return Err(refuse("unsupported private key type")),
+    let unsupported = || refuse("unsupported private key type");
+    let (der, key_label, signing_key) = match keys.remove(0) {
+        // OpenSSL refuses a SEC1 key without its optional curve parameters, which ring accepts.
+        PrivateKeyDer::Sec1(sec1) => {
+            let (der, signing_key) =
+                sec1_as_pkcs8(sec1.secret_sec1_der()).ok_or_else(unsupported)?;
+            (der, "PRIVATE KEY", signing_key)
+        }
+        der @ (PrivateKeyDer::Pkcs8(_) | PrivateKeyDer::Pkcs1(_)) => {
+            let signing_key = any_supported_type(&der).map_err(|_| unsupported())?;
+            let label = match der {
+                PrivateKeyDer::Pkcs8(_) => "PRIVATE KEY",
+                _ => "RSA PRIVATE KEY",
+            };
+            (der, label, signing_key)
+        }
+        _ => return Err(unsupported()),
     };
-    let signing_key =
-        any_supported_type(&der).map_err(|_| refuse("unsupported private key type"))?;
     let mut pem = String::new();
     for c in &chain {
         push_block(&mut pem, "CERTIFICATE", c);
@@ -204,6 +215,53 @@ fn certificate(key: ObjRef, secret: &Secret) -> Result<Certificate, Reject> {
         secret: key,
         pem,
     })
+}
+
+/// The start of a PKCS#8 `PrivateKeyInfo` for an EC key, before the `OCTET STRING` that holds
+/// the SEC1 `ECPrivateKey`: `INTEGER 0` (the version), then the `AlgorithmIdentifier`
+/// `SEQUENCE { id-ecPublicKey, <the curve> }`. The same bytes rustls uses in
+/// `crypto/ring/sign.rs` to read a SEC1 key.
+const PKCS8_PREFIXES: [&[u8]; 2] = [
+    // prime256v1
+    b"\x02\x01\x00\
+      \x30\x13\
+      \x06\x07\x2a\x86\x48\xce\x3d\x02\x01\
+      \x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07",
+    // secp384r1
+    b"\x02\x01\x00\
+      \x30\x10\
+      \x06\x07\x2a\x86\x48\xce\x3d\x02\x01\
+      \x06\x05\x2b\x81\x04\x00\x22",
+];
+
+/// A SEC1 EC key as PKCS#8, with the signing key read from that PKCS#8: wrapped with the
+/// algorithm of P-256, else of P-384, whichever ring accepts. ring checks the private key's length
+/// and public key against the curve, and any `[0]` parameters against the algorithm.
+fn sec1_as_pkcs8(sec1: &[u8]) -> Option<(PrivateKeyDer<'static>, Arc<dyn SigningKey>)> {
+    PKCS8_PREFIXES.iter().find_map(|prefix| {
+        let octets = der(0x04, &[sec1]);
+        let der = PrivateKeyDer::Pkcs8(der(0x30, &[prefix, &octets]).into());
+        let signing_key = any_supported_type(&der).ok()?;
+        Some((der, signing_key))
+    })
+}
+
+/// A DER element with `tag` and the concatenation of `parts` as its content.
+fn der(tag: u8, parts: &[&[u8]]) -> Vec<u8> {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    let mut out = vec![tag];
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let skip = bytes.iter().take_while(|&&b| b == 0).count();
+        out.push(0x80 | (bytes.len() - skip) as u8);
+        out.extend_from_slice(&bytes[skip..]);
+    }
+    for p in parts {
+        out.extend_from_slice(p);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1079,24 +1137,112 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sec1_key_is_written_as_an_ec_private_key() {
-        let (crt, key) = self_signed();
-        // ring's PKCS#8 for P-256: a 27-byte header, then OCTET STRING { ECPrivateKey (SEC1) }.
-        let pkcs8 = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
-        let der = pkcs8.secret_der();
-        assert_eq!(der[27], 0x04);
-        let len = usize::from(der[28]);
-        assert_eq!(29 + len, der.len());
-        let sec1 = &der[29..];
-        let sec1_pem = block("EC PRIVATE KEY", sec1);
+    /// One DER element at the start of `der`: its tag, its content, and what follows it.
+    fn tlv(der: &[u8]) -> (u8, &[u8], &[u8]) {
+        let (len, at) = match der[1] {
+            n if n < 0x80 => (usize::from(n), 2),
+            0x81 => (usize::from(der[2]), 3),
+            0x82 => (usize::from(der[2]) << 8 | usize::from(der[3]), 4),
+            n => panic!("length form {n:#x}"),
+        };
+        (der[0], &der[at..at + len], &der[at + len..])
+    }
 
-        let c = resolved(&crt, &sec1_pem).expect("accepted");
-        let crt_der = CertificateDer::from_pem_slice(crt.as_bytes()).unwrap();
+    /// `content` as a DER element with `tag`.
+    fn wrap(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match content.len() {
+            n if n < 0x80 => out.push(n as u8),
+            n if n < 0x100 => out.extend([0x81, n as u8]),
+            n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// The SEC1 `ECPrivateKey` inside a PKCS#8 EC key, and the curve OID of its algorithm.
+    fn sec1_of(pkcs8: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let (tag, info, rest) = tlv(pkcs8);
+        assert_eq!((tag, rest.len()), (0x30, 0));
+        let (_, _version, rest) = tlv(info);
+        let (_, alg, rest) = tlv(rest);
+        let (_, _ec_public_key, curve) = tlv(alg);
+        let (tag, sec1, _) = tlv(rest);
+        assert_eq!(tag, 0x04);
+        (sec1.to_vec(), curve.to_vec())
+    }
+
+    /// `sec1` with the `[0]` curve parameters `curve` (a full OID element) after the private key.
+    fn with_parameters(sec1: &[u8], curve: &[u8]) -> Vec<u8> {
+        let (tag, content, _) = tlv(sec1);
+        assert_eq!(tag, 0x30);
+        let (_, _, after_version) = tlv(content);
+        let (_, _, after_key) = tlv(after_version);
+        assert_eq!(after_key[0], 0xa1, "ring writes no parameters");
+        let head = &content[..content.len() - after_key.len()];
+        let mut inner = head.to_vec();
+        inner.extend(wrap(0xa0, curve));
+        inner.extend_from_slice(after_key);
+        wrap(0x30, &inner)
+    }
+
+    #[test]
+    fn sec1_key_is_written_as_pkcs8() {
+        use rustls::crypto::ring::sign::any_supported_type;
+        use rustls::sign::CertifiedKey;
+
+        for alg in [
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+        ] {
+            let (crt, key) = self_signed_with(alg);
+            let pkcs8 = PrivateKeyDer::from_pem_slice(key.as_bytes()).unwrap();
+            let (bare, curve) = sec1_of(pkcs8.secret_der());
+            let full = with_parameters(&bare, &curve);
+            assert_ne!(bare, full);
+            let crt_der = CertificateDer::from_pem_slice(crt.as_bytes()).unwrap();
+            for sec1 in [&bare, &full] {
+                let sec1_pem = block("EC PRIVATE KEY", sec1);
+                // rustls itself reads the SEC1 form.
+                assert!(matches!(
+                    PrivateKeyDer::from_pem_slice(sec1_pem.as_bytes()).unwrap(),
+                    PrivateKeyDer::Sec1(_)
+                ));
+                let c = resolved(&crt, &sec1_pem).expect("accepted");
+                assert!(!c.pem.contains("EC PRIVATE KEY"), "{alg:?}");
+                let (cert_block, key_block) = c
+                    .pem
+                    .split_at(c.pem.find("-----BEGIN PRIVATE KEY").unwrap());
+                assert_eq!(cert_block, block("CERTIFICATE", &crt_der));
+
+                // The key parses back as PKCS#8 holding exactly the SEC1 structure given, under
+                // the algorithm of the certificate's curve.
+                let written = PrivateKeyDer::from_pem_slice(key_block.as_bytes()).unwrap();
+                assert!(matches!(written, PrivateKeyDer::Pkcs8(_)), "{alg:?}");
+                assert_eq!(sec1_of(written.secret_der()), (sec1.clone(), curve.clone()));
+                if sec1 == &bare {
+                    // Without parameters it is the PKCS#8 key rcgen made.
+                    assert_eq!(written.secret_der(), pkcs8.secret_der());
+                }
+                let signing = any_supported_type(&written).expect("a key rustls can use");
+                CertifiedKey::new(vec![crt_der.clone()], signing)
+                    .keys_match()
+                    .expect("matches the certificate");
+            }
+        }
+    }
+
+    #[test]
+    fn sec1_key_of_another_curve_than_its_certificate_is_refused() {
+        let (crt, _) = self_signed();
+        let (_, p384) = self_signed_with(&rcgen::PKCS_ECDSA_P384_SHA384);
+        let pkcs8 = PrivateKeyDer::from_pem_slice(p384.as_bytes()).unwrap();
+        let (sec1, _) = sec1_of(pkcs8.secret_der());
+        let r = resolved(&crt, &block("EC PRIVATE KEY", &sec1)).expect_err("refused");
+        invalid(&r);
         assert_eq!(
-            c.pem,
-            format!("{}{sec1_pem}", block("CERTIFICATE", &crt_der))
+            r.message,
+            "secret gw/site-tls: the private key does not match the certificate"
         );
-        assert!(!c.pem.contains("BEGIN PRIVATE KEY"));
     }
 }
