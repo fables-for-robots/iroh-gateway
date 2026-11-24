@@ -111,21 +111,26 @@ struct Candidate<'a> {
     index: (usize, usize),
 }
 
+/// The order of hosts, more specific first: exact, then wildcards with the longer suffix first,
+/// then any.
+fn host_order(host: &HostMatch) -> (u8, Reverse<usize>) {
+    match host {
+        HostMatch::Exact(_) => (0, Reverse(0)),
+        HostMatch::Wildcard(s) => (1, Reverse(s.chars().count())),
+        HostMatch::Any => (2, Reverse(0)),
+    }
+}
+
 impl Candidate<'_> {
     /// Smaller is tried first: see [`ports`].
     fn order(&self) -> impl Ord + '_ {
-        let (host, suffix) = match &self.rule.host {
-            HostMatch::Exact(_) => (0u8, 0),
-            HostMatch::Wildcard(s) => (1, s.chars().count()),
-            HostMatch::Any => (2, 0),
-        };
+        let host = host_order(&self.rule.host);
         let (path, prefix) = match &self.rule.path {
             PathMatch::Exact(_) => (0u8, 0),
             PathMatch::Prefix(p) => (1, p.chars().count()),
         };
         (
             host,
-            Reverse(suffix),
             path,
             Reverse(prefix),
             self.rule.method.is_none(),
@@ -146,6 +151,12 @@ impl Candidate<'_> {
 /// none, more header matches, the older route (one without a creation time last), the route key,
 /// the rule and the match. Of two rules equal in host, path, method and headers only the first
 /// is kept.
+///
+/// A listener owns its host against the routes of less specific listeners of its port: a route
+/// host reached through a listener is left out when another listener of the port, accepted and
+/// not conflicted (serving or not), has a more specific hostname (in the host order above) that
+/// the route host falls under. A request that matches none of the owner's rules can still fall
+/// through to a rule for a wildcard or any host.
 pub(super) fn ports(gateways: &mut [GatewayModel], attached: Vec<Attached>) {
     for (g, gw) in gateways.iter_mut().enumerate() {
         let mut serving: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
@@ -157,9 +168,25 @@ pub(super) fn ports(gateways: &mut [GatewayModel], attached: Vec<Attached>) {
         gw.http_ports = serving
             .into_iter()
             .map(|(port, listeners)| {
-                let here: Vec<&Attached> = attached
+                // Every listener that may own a host on this port, serving or not.
+                let owners: Vec<&HostMatch> = gw
+                    .listeners
+                    .iter()
+                    .filter(|l| l.port == port && l.accepted.is_ok() && l.conflicted.is_none())
+                    .map(|l| &l.hostname)
+                    .collect();
+                let here: Vec<(&Attached, Vec<&HostMatch>)> = attached
                     .iter()
                     .filter(|a| a.slot.0 == g && listeners.contains(&a.slot.1))
+                    .map(|a| {
+                        let own = &gw.listeners[a.slot.1].hostname;
+                        let hosts = a
+                            .hosts
+                            .iter()
+                            .filter(|h| !owned_by_sibling(h, own, &owners))
+                            .collect();
+                        (a, hosts)
+                    })
                     .collect();
                 let listeners: Vec<&ListenerModel> =
                     listeners.iter().map(|&l| &gw.listeners[l]).collect();
@@ -169,7 +196,21 @@ pub(super) fn ports(gateways: &mut [GatewayModel], attached: Vec<Attached>) {
     }
 }
 
-fn port_of(port: u16, listeners: &[&ListenerModel], attached: &[&Attached]) -> HttpPort {
+/// Whether route host `host`, reached through a listener for `own`, belongs to another of
+/// `owners`: one more specific than `own` that `host` falls under.
+fn owned_by_sibling(host: &HostMatch, own: &HostMatch, owners: &[&HostMatch]) -> bool {
+    owners.iter().any(|&sibling| {
+        host_order(sibling) < host_order(own) && host.intersect(sibling).as_ref() == Some(host)
+    })
+}
+
+/// One port; `attached` holds each route attached to one of its serving `listeners`, with the
+/// hosts it keeps there.
+fn port_of(
+    port: u16,
+    listeners: &[&ListenerModel],
+    attached: &[(&Attached, Vec<&HostMatch>)],
+) -> HttpPort {
     let tls = listeners.iter().any(|l| l.protocol == "HTTPS").then(|| {
         let mut certificates: Vec<Certificate> = Vec::new();
         for c in listeners.iter().flat_map(|l| &l.certificates) {
@@ -183,7 +224,7 @@ fn port_of(port: u16, listeners: &[&ListenerModel], attached: &[&Attached]) -> H
 
     // One backend per route rule, however many listeners and matches reach it.
     let mut wanted: BTreeMap<(&ObjRef, usize), &super::HttpRouteRule> = BTreeMap::new();
-    for a in attached {
+    for (a, _) in attached {
         for (i, rule) in a.rules.iter().enumerate() {
             wanted.insert((&a.route, i), rule);
         }
@@ -202,8 +243,8 @@ fn port_of(port: u16, listeners: &[&ListenerModel], attached: &[&Attached]) -> H
     }
 
     let mut candidates = Vec::new();
-    for a in attached {
-        for host in &a.hosts {
+    for (a, hosts) in attached {
+        for &host in hosts {
             for (i, rule) in a.rules.iter().enumerate() {
                 for (j, m) in rule.matches.iter().enumerate() {
                     candidates.push(Candidate {
@@ -785,6 +826,195 @@ mod tests {
             ["a.example.com /* - [] r", "b.example.com /* - [] r"]
         );
         assert_eq!(p.backends.len(), 1);
+    }
+
+    /// gw/public with listeners `wild` (`*.example.com`) and `foo` (`foo.example.com`) on port 80.
+    fn wild_and_foo() -> Gateway {
+        gateway("gw", "public")
+            .listener("wild", 80, "HTTP")
+            .hostname("*.example.com")
+            .listener("foo", 80, "HTTP")
+            .hostname("foo.example.com")
+    }
+
+    #[test]
+    fn more_specific_sibling_listener_owns_its_host() {
+        // The tenant of the wildcard listener names the sibling's host, with an older route and a
+        // more specific path: without ownership its rule would come first.
+        let tenant = http_route("gw", "tenant")
+            .parent("public")
+            .section("wild")
+            .hostname("foo.example.com")
+            .matching(prefix_path("/admin"))
+            .backend("web", 8080)
+            .created(1);
+        let owner = route("owner").section("foo").created(2);
+        let m = model(vec![wild_and_foo()], vec![tenant, owner], vec![]);
+        let g = &m.gateways[0];
+        assert_eq!(g.http_ports.len(), 1);
+        let p = &g.http_ports[0];
+        assert_eq!(lines(p), ["foo.example.com /* - [] owner"]);
+        assert!(
+            !p.rules
+                .iter()
+                .any(|r| p.backends[r.backend].route.name == "tenant"),
+            "{:?}",
+            lines(p)
+        );
+        // The route itself stays attached and accepted.
+        assert_eq!(g.listeners[0].attached_routes, 1);
+        let tenant = m.routes.iter().find(|r| r.key.name == "tenant").unwrap();
+        assert_eq!(tenant.parents[0].accepted, Ok(()));
+    }
+
+    #[test]
+    fn sibling_ownership_does_not_touch_other_hosts() {
+        let tenant = http_route("gw", "tenant")
+            .parent("public")
+            .section("wild")
+            .hostname("*.example.com")
+            .hostname("bar.example.com")
+            .hostname("foo.example.com")
+            .backend("web", 8080);
+        // The owner's rule differs from the tenant's, so the tenant's is not dropped as a repeat.
+        let owner = route("owner").section("foo").matching(exact_path("/o"));
+        let p = the_port(vec![wild_and_foo()], vec![tenant, owner]);
+        assert_eq!(
+            lines(&p),
+            [
+                "foo.example.com =/o - [] owner",
+                "bar.example.com /* - [] tenant",
+                "*.example.com /* - [] tenant",
+            ]
+        );
+        // The owner's own route may name the host of its listener, as before.
+        let owner = route("owner").section("foo").hostname("foo.example.com");
+        let p = the_port(vec![wild_and_foo()], vec![owner]);
+        assert_eq!(lines(&p), ["foo.example.com /* - [] owner"]);
+    }
+
+    #[test]
+    fn sibling_that_is_not_serving_still_owns_its_host() {
+        // No route attaches to `foo`, so it does not serve; it still owns foo.example.com.
+        let tenant = http_route("gw", "tenant")
+            .parent("public")
+            .section("wild")
+            .hostname("foo.example.com")
+            .hostname("bar.example.com")
+            .backend("web", 8080);
+        let m = model(vec![wild_and_foo()], vec![tenant], vec![]);
+        let g = &m.gateways[0];
+        assert!(!g.listeners[1].serving());
+        assert_eq!(lines(&g.http_ports[0]), ["bar.example.com /* - [] tenant"]);
+
+        // Nor does an HTTPS sibling without a certificate.
+        let gw = gateway("gw", "public")
+            .listener("wild", 443, "HTTPS")
+            .hostname("*.example.com")
+            .certificate("site")
+            .listener("foo", 443, "HTTPS")
+            .hostname("foo.example.com")
+            .certificate("missing");
+        let tenant = http_route("gw", "tenant")
+            .parent("public")
+            .hostname("foo.example.com")
+            .hostname("bar.example.com")
+            .backend("web", 8080);
+        let m = model(vec![gw], vec![tenant], secrets(&["site"]));
+        let g = &m.gateways[0];
+        assert!(!g.listeners[1].serving());
+        assert_eq!(lines(&g.http_ports[0]), ["bar.example.com /* - [] tenant"]);
+    }
+
+    #[test]
+    fn conflicted_or_refused_sibling_owns_nothing() {
+        let tenant = || {
+            http_route("gw", "tenant")
+                .parent("public")
+                .section("wild")
+                .hostname("foo.example.com")
+                .backend("web", 8080)
+        };
+        // Two listeners for foo.example.com conflict, and neither owns it.
+        let gw = wild_and_foo()
+            .listener("foo2", 80, "HTTP")
+            .hostname("foo.example.com");
+        let m = model(vec![gw], vec![tenant()], vec![]);
+        let g = &m.gateways[0];
+        assert!(g.listeners[1].conflicted.is_some());
+        assert!(g.listeners[2].conflicted.is_some());
+        assert_eq!(lines(&g.http_ports[0]), ["foo.example.com /* - [] tenant"]);
+
+        // A refused listener (HTTPS with tls.mode Passthrough) owns nothing either.
+        let gw = gateway("gw", "public")
+            .listener("wild", 443, "HTTPS")
+            .hostname("*.example.com")
+            .certificate("site")
+            .listener("foo", 443, "HTTPS")
+            .hostname("foo.example.com")
+            .tls(gateway_api::gateways::v1::GatewayListenersTls {
+                mode: Some(gateway_api::gateways::v1::GatewayListenersTlsMode::Passthrough),
+                ..Default::default()
+            });
+        let m = model(vec![gw], vec![tenant()], secrets(&["site"]));
+        let g = &m.gateways[0];
+        assert!(g.listeners[1].accepted.is_err());
+        assert_eq!(lines(&g.http_ports[0]), ["foo.example.com /* - [] tenant"]);
+
+        // Nor does a listener of another port.
+        let gw = gateway("gw", "public")
+            .listener("wild", 80, "HTTP")
+            .hostname("*.example.com")
+            .listener("foo", 8080, "HTTP")
+            .hostname("foo.example.com");
+        let p = &ports_of(vec![gw], vec![tenant()])[0];
+        assert_eq!(p.port, 80);
+        assert_eq!(lines(p), ["foo.example.com /* - [] tenant"]);
+    }
+
+    #[test]
+    fn any_host_listener_yields_to_every_named_sibling() {
+        let gw = gateway("gw", "public")
+            .listener("any", 80, "HTTP")
+            .listener("wild", 80, "HTTP")
+            .hostname("*.example.com")
+            .listener("deep", 80, "HTTP")
+            .hostname("*.a.example.com")
+            .listener("foo", 80, "HTTP")
+            .hostname("foo.example.com");
+        let tenant = http_route("gw", "tenant")
+            .parent("public")
+            .section("any")
+            .hostname("foo.example.com")
+            .hostname("x.example.com")
+            .hostname("*.example.com")
+            .hostname("x.a.example.com")
+            .hostname("example.org")
+            .backend("web", 8080);
+        // A route without hostnames answers for any host on the any listener: that stays.
+        let all = route("all").section("any");
+        let p = the_port(vec![gw], vec![tenant, all]);
+        assert_eq!(
+            lines(&p),
+            ["example.org /* - [] tenant", "(any) /* - [] all"]
+        );
+
+        // The wildcard listener in turn yields to the longer wildcard and the exact host, and
+        // keeps what is its own.
+        let gw = gateway("gw", "public")
+            .listener("wild", 80, "HTTP")
+            .hostname("*.example.com")
+            .listener("deep", 80, "HTTP")
+            .hostname("*.a.example.com");
+        let tenant = http_route("gw", "tenant")
+            .parent("public")
+            .section("wild")
+            .hostname("x.a.example.com")
+            .hostname("*.a.example.com")
+            .hostname("x.example.com")
+            .backend("web", 8080);
+        let p = the_port(vec![gw], vec![tenant]);
+        assert_eq!(lines(&p), ["x.example.com /* - [] tenant"]);
     }
 
     /// The certificates of Secrets `names`, as the model reads them.
