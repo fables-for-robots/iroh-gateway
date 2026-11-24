@@ -210,6 +210,7 @@ mod tests {
             allowed_namespaces: Default::default(),
             attached_routes: 1,
             backends,
+            certificates: Vec::new(),
         }
     }
 

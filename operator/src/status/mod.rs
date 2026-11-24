@@ -321,6 +321,12 @@ fn listener_status(
         cond("Programmed", false, "Invalid", rej.message.clone())
     } else if let Some(rej) = &l.conflicted {
         cond("Programmed", false, "Invalid", rej.message.clone())
+    } else if l.protocol == "HTTPS" && l.certificates.is_empty() {
+        let message = match &l.resolved_refs {
+            Err(rej) => rej.message.clone(),
+            Ok(()) => "the listener has no usable certificate".to_owned(),
+        };
+        cond("Programmed", false, "Invalid", message)
     } else if let Err(rej) = &g.accepted {
         cond(
             "Programmed",
@@ -514,6 +520,7 @@ mod tests {
             } else {
                 vec![]
             },
+            certificates: Vec::new(),
         }
     }
 
@@ -925,6 +932,64 @@ mod tests {
         let l = get(&g.listeners[0].conditions, "Programmed");
         check(l, false, "Invalid");
         assert!(l.message.contains("nope"));
+    }
+
+    #[test]
+    fn https_listener_without_usable_certificates_is_not_programmed() {
+        let https = |certificates: Vec<crate::model::Certificate>| {
+            let mut l = listener("tls", 443, false);
+            l.protocol = "HTTPS".into();
+            l.supported_kinds = vec!["HTTPRoute".into()];
+            l.attached_routes = 1;
+            if certificates.is_empty() {
+                l.resolved_refs = Err(Reject::new(
+                    "InvalidCertificateRef",
+                    "secret ns/site-tls not found",
+                ));
+            }
+            l.certificates = certificates;
+            l
+        };
+        let edge_facts = || facts(vec![("e", up(vec![bound(80, Ok(())), bound(443, Ok(()))]))]);
+
+        let m = model(
+            gateway(vec![listener("a", 80, true), https(vec![])], &["e"]),
+            vec![edge("e", Ok(()))],
+        );
+        let d = compute(&m, &edge_facts());
+        let g = &d.gateways[0];
+        let tls = &g.listeners[1].conditions;
+        check(get(tls, "Accepted"), true, "Accepted");
+        check(get(tls, "Conflicted"), false, "NoConflicts");
+        check(get(tls, "ResolvedRefs"), false, "InvalidCertificateRef");
+        let p = get(tls, "Programmed");
+        check(p, false, "Invalid");
+        assert_eq!(p.message, "secret ns/site-tls not found");
+        // The rest of the Gateway is not held back.
+        check(
+            get(&g.listeners[0].conditions, "Programmed"),
+            true,
+            "Programmed",
+        );
+        check(get(&g.conditions, "Programmed"), true, "Programmed");
+
+        // With a certificate, the same listener is programmed.
+        let certificate = crate::model::Certificate {
+            secret: ObjRef::new("ns", "site-tls"),
+            file_name: "ns.site-tls.0000000000000000.pem".into(),
+            pem: String::new(),
+        };
+        let m = model(
+            gateway(
+                vec![listener("a", 80, true), https(vec![certificate])],
+                &["e"],
+            ),
+            vec![edge("e", Ok(()))],
+        );
+        let d = compute(&m, &edge_facts());
+        let tls = &d.gateways[0].listeners[1].conditions;
+        check(get(tls, "ResolvedRefs"), true, "ResolvedRefs");
+        check(get(tls, "Programmed"), true, "Programmed");
     }
 
     #[test]

@@ -104,6 +104,7 @@ impl World {
                 port: backend.port(),
                 weight: 1,
             }],
+            certificates: Vec::new(),
         }
     }
 

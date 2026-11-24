@@ -8,14 +8,15 @@ use gateway_api::gateways::v1::{
     GatewayListenersAllowedRoutesKinds, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersAllowedRoutesNamespacesSelector,
     GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewayListenersTls,
-    GatewaySpec,
+    GatewayListenersTlsCertificateRefs, GatewaySpec,
 };
 use gateway_api::httproutes::v1::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};
 use gateway_api::tcproutes::v1::{
     TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteRulesBackendRefs, TcpRouteSpec,
 };
 use iroh_gateway_proto::transport::Relay;
-use k8s_openapi::api::core::v1::{Namespace, Service, ServicePort, ServiceSpec};
+use k8s_openapi::ByteString;
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service, ServicePort, ServiceSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 
 use super::Settings;
@@ -57,11 +58,14 @@ pub fn gateway(ns: &str, name: &str) -> Gateway {
 pub trait GatewayExt: Sized {
     fn class(self, name: &str) -> Self;
     fn listener(self, name: &str, port: i32, protocol: &str) -> Self;
-    /// Applies to the last listener.
     /// Sets the hostname of the last listener.
     fn hostname(self, hostname: &str) -> Self;
     /// Sets `tls` on the last listener.
     fn tls(self, tls: GatewayListenersTls) -> Self;
+    /// Adds a `certificateRef` to the Secret `name`, group and kind left out, to the last
+    /// listener's `tls`.
+    fn certificate(self, name: &str) -> Self;
+    /// Sets `allowedRoutes.kinds` of the last listener: (group, kind).
     fn allowed_kinds(self, kinds: &[(&str, &str)]) -> Self;
     fn allow_all_namespaces(self) -> Self;
     fn allow_selector(self, labels: &[(&str, &str)]) -> Self;
@@ -109,6 +113,19 @@ impl GatewayExt for Gateway {
 
     fn tls(mut self, tls: GatewayListenersTls) -> Self {
         last(&mut self).tls = Some(tls);
+        self
+    }
+
+    fn certificate(mut self, name: &str) -> Self {
+        last(&mut self)
+            .tls
+            .get_or_insert_with(GatewayListenersTls::default)
+            .certificate_refs
+            .get_or_insert_with(Vec::new)
+            .push(GatewayListenersTlsCertificateRefs {
+                name: name.into(),
+                ..Default::default()
+            });
         self
     }
 
@@ -485,4 +502,43 @@ impl ServiceExt for Service {
         spec.external_name = Some("db.example.com".into());
         self
     }
+}
+
+/// A Secret of type `kubernetes.io/tls` with the given `tls.crt` and `tls.key`.
+pub fn tls_secret(ns: &str, name: &str, crt_pem: &str, key_pem: &str) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            namespace: Some(ns.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        },
+        type_: Some("kubernetes.io/tls".into()),
+        data: Some(BTreeMap::from([
+            (
+                "tls.crt".to_owned(),
+                ByteString(crt_pem.as_bytes().to_vec()),
+            ),
+            (
+                "tls.key".to_owned(),
+                ByteString(key_pem.as_bytes().to_vec()),
+            ),
+        ])),
+        ..Default::default()
+    }
+}
+
+/// A fresh self-signed certificate for `app.example.com` and its ECDSA P-256 key, as PEM:
+/// (certificate, key).
+pub fn self_signed() -> (String, String) {
+    self_signed_with(&rcgen::PKCS_ECDSA_P256_SHA256)
+}
+
+/// [`self_signed`] with a key of the given algorithm.
+pub fn self_signed_with(alg: &'static rcgen::SignatureAlgorithm) -> (String, String) {
+    let key = rcgen::KeyPair::generate_for(alg).expect("generate a key");
+    let cert = rcgen::CertificateParams::new(vec!["app.example.com".to_owned()])
+        .expect("valid names")
+        .self_signed(&key)
+        .expect("sign");
+    (cert.pem(), key.serialize_pem())
 }

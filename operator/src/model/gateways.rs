@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use k8s_openapi::api::core::v1::Secret;
 use kube::ResourceExt;
 
 use gateway_api::gateways::v1::{
@@ -9,6 +10,7 @@ use gateway_api::gateways::v1::{
     GatewayListenersTlsMode,
 };
 
+use super::certs;
 use super::generation;
 use super::{
     ClassModel, GatewayModel, HostMatch, LabelRequirement, LabelSelector, ListenerModel, ObjRef,
@@ -38,19 +40,28 @@ pub(super) fn gateways(
     settings: &Settings,
     classes: &[ClassModel],
 ) -> Vec<GatewayModel> {
+    let secrets: BTreeMap<ObjRef, &Secret> = snapshot
+        .secrets
+        .iter()
+        .map(|s| (ObjRef::of(s), s))
+        .collect();
     let mut out: Vec<GatewayModel> = snapshot
         .gateways
         .iter()
         .filter(|g| classes.iter().any(|c| c.name == g.spec.gateway_class_name))
-        .map(|g| gateway(g, settings))
+        .map(|g| gateway(g, settings, &secrets))
         .collect();
     out.sort_by(|a, b| a.key.cmp(&b.key));
     out
 }
 
-fn gateway(gw: &gateway_api::gateways::v1::Gateway, settings: &Settings) -> GatewayModel {
+fn gateway(
+    gw: &gateway_api::gateways::v1::Gateway,
+    settings: &Settings,
+    secrets: &BTreeMap<ObjRef, &Secret>,
+) -> GatewayModel {
     let key = ObjRef::of(gw);
-    let listeners = listeners(&gw.spec.listeners);
+    let listeners = listeners(&gw.spec.listeners, &key.namespace, secrets);
     let accepted = if !settings.gateway_namespaces.contains(&key.namespace) {
         Err(Reject::new(
             "NamespaceNotAllowed",
@@ -86,8 +97,15 @@ fn gateway(gw: &gateway_api::gateways::v1::Gateway, settings: &Settings) -> Gate
     }
 }
 
-fn listeners(specs: &[gateway_api::gateways::v1::GatewayListeners]) -> Vec<ListenerModel> {
-    let mut out: Vec<ListenerModel> = specs.iter().map(listener).collect();
+fn listeners(
+    specs: &[gateway_api::gateways::v1::GatewayListeners],
+    gateway_ns: &str,
+    secrets: &BTreeMap<ObjRef, &Secret>,
+) -> Vec<ListenerModel> {
+    let mut out: Vec<ListenerModel> = specs
+        .iter()
+        .map(|spec| listener(spec, gateway_ns, secrets))
+        .collect();
 
     // Listeners sharing a port conflict: on the protocol when it differs; on the hostname when
     // it is HTTP or HTTPS, where several hostnames can share a port; on the port otherwise.
@@ -140,7 +158,11 @@ fn listeners(specs: &[gateway_api::gateways::v1::GatewayListeners]) -> Vec<Liste
     out
 }
 
-fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel {
+fn listener(
+    spec: &gateway_api::gateways::v1::GatewayListeners,
+    gateway_ns: &str,
+    secrets: &BTreeMap<ObjRef, &Secret>,
+) -> ListenerModel {
     let mut accepted = Ok(());
     let mut resolved_refs = Ok(());
     let mut hostname = HostMatch::Any;
@@ -216,6 +238,16 @@ fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel
         }
     }
 
+    // Only an accepted HTTPS listener has its certificates resolved. A certificate problem is the
+    // one that stops the listener, so it replaces an `InvalidRouteKinds` found above.
+    let mut certificates = Vec::new();
+    if spec.protocol == "HTTPS" && accepted.is_ok() {
+        match certs::resolve(spec.tls.as_ref(), gateway_ns, secrets) {
+            Ok(c) => certificates = c,
+            Err(reject) => resolved_refs = Err(reject),
+        }
+    }
+
     ListenerModel {
         name: spec.name.clone(),
         port,
@@ -232,6 +264,7 @@ fn listener(spec: &gateway_api::gateways::v1::GatewayListeners) -> ListenerModel
         ),
         attached_routes: 0,
         backends: Vec::new(),
+        certificates,
     }
 }
 
@@ -515,6 +548,22 @@ mod tests {
     }
 
     #[test]
+    fn refused_listener_takes_no_part_in_hostname_conflicts() {
+        let g = one(&snap(
+            gateway("infra", "gw")
+                .listener("any", 80, "HTTP")
+                .listener("bad", 80, "HTTP")
+                .hostname("ex'ample.com"),
+        ));
+        assert_eq!(reason(&g.listeners[1].accepted), "UnsupportedValue");
+        // Both would answer for any host if the refused one counted; it does not.
+        assert_eq!(g.listeners[0].accepted, Ok(()));
+        assert_eq!(g.listeners[0].conflicted, None);
+        assert_eq!(g.listeners[1].conflicted, None);
+        assert_eq!(g.accepted, Ok(()));
+    }
+
+    #[test]
     fn https_listeners_share_a_port_by_hostname() {
         let g = one(&snap(
             gateway("infra", "gw")
@@ -617,13 +666,6 @@ mod tests {
         assert!(l.serving());
         l.conflicted = Some(Reject::new("HostnameConflict", "x"));
         assert!(!l.serving());
-    }
-
-    #[test]
-    fn https_listener_does_not_serve_yet() {
-        let mut g = one(&snap(gateway("infra", "gw").listener("tls", 443, "HTTPS")));
-        g.listeners[0].attached_routes = 1;
-        assert!(!g.listeners[0].serving());
     }
 
     #[test]

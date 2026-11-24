@@ -732,6 +732,7 @@ async fn rendered_config_passes_haproxy_validation() {
             allowed_namespaces: Default::default(),
             attached_routes: 1,
             backends,
+            certificates: Vec::new(),
         }
     }
     fn backend(ip: &str, port: u16, weight: u32) -> Backend {

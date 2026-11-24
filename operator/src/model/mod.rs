@@ -3,6 +3,7 @@
 //! [`build`] takes a [`Snapshot`] of the watched resources and the operator's [`Settings`] and
 //! returns a [`Model`]. It does no I/O and reads no clock, so equal inputs give equal models.
 
+mod certs;
 mod edges;
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -31,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crd::Edge;
 
+pub use certs::Certificate;
 pub use http::HostMatch;
 pub(crate) use routes::parent_key;
 
@@ -327,6 +329,9 @@ pub struct ListenerModel {
     pub allowed_namespaces: RouteNamespaces,
     pub attached_routes: i32,
     pub backends: Vec<Backend>,
+    /// The certificates of its `certificateRefs`, in order; empty unless it is an accepted HTTPS
+    /// listener and every reference is usable.
+    pub certificates: Vec<Certificate>,
 }
 
 /// The namespaces a listener admits routes from.
@@ -358,15 +363,16 @@ pub struct LabelRequirement {
 
 impl ListenerModel {
     /// Accepted, not conflicted, and ready for traffic: a TCP listener needs a backend, an HTTP
-    /// one a route (which can answer without a backend, like a redirect), an HTTPS one cannot
-    /// serve yet. Only serving listeners get an HAProxy frontend and an open port on the edges.
+    /// one a route (which can answer without a backend, like a redirect), an HTTPS one a route
+    /// and its certificates. Only serving listeners get an HAProxy frontend and an open port on
+    /// the edges.
     pub fn serving(&self) -> bool {
         if self.accepted.is_err() || self.conflicted.is_some() {
             return false;
         }
         match self.protocol.as_str() {
             "HTTP" => self.attached_routes > 0,
-            "HTTPS" => false,
+            "HTTPS" => self.attached_routes > 0 && !self.certificates.is_empty(),
             _ => !self.backends.is_empty(),
         }
     }
