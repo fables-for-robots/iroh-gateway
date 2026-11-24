@@ -17,6 +17,7 @@ use gateway_api::gatewayclasses::v1::GatewayClass;
 use gateway_api::gateways::v1::Gateway;
 use gateway_api::httproutes::v1::HttpRoute;
 use gateway_api::tcproutes::v1::TcpRoute;
+use gateway_api::udproutes::v1::UdpRoute;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use kube::core::DeserializeGuard;
 use kube::runtime::reflector::{self, Store};
@@ -47,7 +48,7 @@ pub trait SnapshotSource: Send {
     fn changed(&mut self) -> impl Future<Output = ()> + Send;
 }
 
-/// Cluster-wide watches of GatewayClasses, Gateways, TCPRoutes, HTTPRoutes, Edges, Services and
+/// Cluster-wide watches of GatewayClasses, Gateways, TCPRoutes, UDPRoutes, HTTPRoutes, Edges, Services and
 /// Namespaces, and one watch of the Secrets of type `kubernetes.io/tls` in each gateway
 /// namespace. Dropping it stops the watches.
 ///
@@ -56,7 +57,7 @@ pub trait SnapshotSource: Send {
 /// does not list until it may, by design: [`SnapshotSource::synced`] keeps waiting and names it
 /// (`Secret in <namespace>`) in its warning every 30 s, and nothing is applied meanwhile.
 ///
-/// TCPRoutes and HTTPRoutes are watched through [`DeserializeGuard`]: a route the operator's
+/// TCPRoutes, UDPRoutes and HTTPRoutes are watched through [`DeserializeGuard`]: a route the operator's
 /// types cannot read (a filter type from the experimental channel, say) is left out of the
 /// snapshot and logged by namespace and name, once per `resourceVersion`, and every other route
 /// is served. Every other kind is watched typed: an object that does not read is never taken
@@ -67,6 +68,7 @@ pub struct Stores {
     gateway_classes: Store<GatewayClass>,
     gateways: Store<Gateway>,
     tcp_routes: Store<DeserializeGuard<TcpRoute>>,
+    udp_routes: Store<DeserializeGuard<UdpRoute>>,
     http_routes: Store<DeserializeGuard<HttpRoute>>,
     edges: Store<Edge>,
     services: Store<Service>,
@@ -86,6 +88,7 @@ impl Stores {
         let gateway_classes = watch_all(&client, "GatewayClass", &notify, &mut watches);
         let gateways = watch_all(&client, "Gateway", &notify, &mut watches);
         let tcp_routes = watch_guarded(&client, "TCPRoute", &notify, &mut watches);
+        let udp_routes = watch_guarded(&client, "UDPRoute", &notify, &mut watches);
         let http_routes = watch_guarded(&client, "HTTPRoute", &notify, &mut watches);
         let edges = watch_all(&client, "Edge", &notify, &mut watches);
         let services = watch_all(&client, "Service", &notify, &mut watches);
@@ -108,6 +111,7 @@ impl Stores {
             gateway_classes,
             gateways,
             tcp_routes,
+            udp_routes,
             http_routes,
             edges,
             services,
@@ -125,6 +129,7 @@ impl SnapshotSource for Stores {
             ready("GatewayClass", &self.gateway_classes),
             ready("Gateway", &self.gateways),
             ready("TCPRoute", &self.tcp_routes),
+            ready("UDPRoute", &self.udp_routes),
             ready("HTTPRoute", &self.http_routes),
             ready("Edge", &self.edges),
             ready("Service", &self.services),
@@ -150,8 +155,7 @@ impl SnapshotSource for Stores {
             gateways: cloned(&self.gateways),
             tcp_routes: readable(&self.tcp_routes),
             http_routes: readable(&self.http_routes),
-            // Not watched yet: no UDPRoute is attached, so no UDP listener serves.
-            udp_routes: Vec::new(),
+            udp_routes: readable(&self.udp_routes),
             edges: cloned(&self.edges),
             services: cloned(&self.services),
             namespaces: cloned(&self.namespaces),
@@ -425,6 +429,27 @@ mod tests {
             .map(|r| r.metadata.name.clone().unwrap())
             .collect();
         assert_eq!(names, ["db"]);
+
+        // And for UDPRoutes.
+        let udp = json!([
+            {"apiVersion": "gateway.networking.k8s.io/v1", "kind": "UDPRoute",
+             "metadata": {"namespace": "apps", "name": "dns"},
+             "spec": {"rules": [{"backendRefs": [{"name": "dns", "port": 53}]}]}},
+            {"apiVersion": "gateway.networking.k8s.io/v1", "kind": "UDPRoute",
+             "metadata": {"namespace": "apps", "name": "bad"},
+             "spec": {"rules": "not a list"}},
+        ]);
+        assert!(serde_json::from_value::<Vec<UdpRoute>>(udp.clone()).is_err());
+        let guarded: Vec<DeserializeGuard<UdpRoute>> = serde_json::from_value(udp).unwrap();
+        let (reader, mut writer) = reflector::store::<DeserializeGuard<UdpRoute>>();
+        for g in &guarded {
+            writer.apply_watcher_event(&watcher::Event::Apply(g.clone()));
+        }
+        let names: Vec<String> = readable(&reader)
+            .iter()
+            .map(|r| r.metadata.name.clone().unwrap())
+            .collect();
+        assert_eq!(names, ["dns"]);
     }
 
     #[test]

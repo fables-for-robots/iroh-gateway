@@ -214,6 +214,7 @@ fn patches(
         }
     }
     route_patches(&snapshot.tcp_routes, desired, controller, now, &mut out);
+    route_patches(&snapshot.udp_routes, desired, controller, now, &mut out);
     route_patches(&snapshot.http_routes, desired, controller, now, &mut out);
     for want in &desired.edges {
         if let Some(edge) = snapshot.edges.iter().find(|e| ObjRef::of(*e) == want.key)
@@ -451,7 +452,7 @@ mod tests {
     use super::*;
     use crate::crd::EdgeListenerStatus;
     use crate::model::fixtures::{
-        CONTROLLER, HttpRouteExt, RouteExt, class, edge, gateway, http_route, tcp_route,
+        CONTROLLER, HttpRouteExt, RouteExt, class, edge, gateway, http_route, tcp_route, udp_route,
     };
     use crate::model::{GatewayAddress, build};
     use crate::status::{Cond, Facts, compute};
@@ -767,6 +768,32 @@ mod tests {
             parents_of(&out[0].body),
             [triple(CONTROLLER, "a", "Accepted")]
         );
+    }
+
+    #[test]
+    fn udp_route_gets_our_parent_entry_and_a_tcp_route_of_the_same_name_is_left_alone() {
+        let mut want = want_route(1, &[("a", "Accepted")]);
+        want.kind = RouteKind::Udp;
+        want.key = ObjRef::new("apps", "dns");
+        let mut udp = udp_route("apps", "dns").parent("a");
+        udp.metadata.resource_version = Some("42".into());
+        let snapshot = Snapshot {
+            tcp_routes: vec![with_status(tcp_route("apps", "dns").parent("a"), vec![])],
+            udp_routes: vec![udp],
+            ..Snapshot::default()
+        };
+        let out = patches(&desired_routes(vec![want]), &snapshot, CONTROLLER, &at(100));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].target,
+            Target::Route(RouteKind::Udp, ObjRef::new("apps", "dns"))
+        );
+        assert_eq!(out[0].target.to_string(), "UDPRoute apps/dns");
+        assert_eq!(
+            parents_of(&out[0].body),
+            [triple(CONTROLLER, "a", "Accepted")]
+        );
+        assert_eq!(out[0].body["metadata"]["resourceVersion"], "42");
     }
 
     fn gateway_want() -> GatewayStatusOut {

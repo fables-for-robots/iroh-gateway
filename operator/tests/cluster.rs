@@ -12,11 +12,12 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use common::envtest::Envtest;
-use common::{edge_options, free_tcp_port, refused, short_dir};
+use common::{edge_options, free_tcp_and_udp_port, free_tcp_port, refused, short_dir};
 use gateway_api::gatewayclasses::v1::GatewayClass;
 use gateway_api::gateways::v1::{Gateway, GatewayStatusListeners};
 use gateway_api::httproutes::v1::HttpRoute;
 use gateway_api::tcproutes::v1::TcpRoute;
+use gateway_api::udproutes::v1::UdpRoute;
 use iroh::SecretKey;
 use iroh_gateway_edge::{Edge as EdgeProcess, EdgeHandle};
 use iroh_gateway_operator::cluster::{StatusSink, StatusWriter, Stores, identity};
@@ -40,6 +41,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::io::ErrorKind;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -1318,6 +1320,252 @@ async fn tcp_and_http_listeners_work_side_by_side() {
     edge.shutdown().await;
 }
 
+/// Service `dns` in `NS` with one port, 5353, of `protocol`.
+async fn dns_service(client: &Client, protocol: &str) {
+    create::<Service>(
+        &api(client, NS),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "dns", "namespace": NS },
+            "spec": { "ports": [{ "port": 5353, "protocol": protocol }] },
+        }),
+    )
+    .await;
+}
+
+/// UDPRoute `dns` in `NS`, attached to the listener `section` of Gateway `public`, sending
+/// everything to Service `dns`, port 5353.
+async fn udp_route(client: &Client, section: &str) {
+    create::<UdpRoute>(
+        &api(client, NS),
+        json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "UDPRoute",
+            "metadata": { "name": "dns", "namespace": NS },
+            "spec": {
+                "parentRefs": [{ "name": "public", "sectionName": section }],
+                "rules": [{ "backendRefs": [{ "name": "dns", "port": 5353 }] }],
+            },
+        }),
+    )
+    .await;
+}
+
+/// Ok when binding 127.0.0.1:`port` for UDP fails because something holds it.
+fn udp_held(port: u16) -> Result<(), String> {
+    match std::net::UdpSocket::bind(("127.0.0.1", port)) {
+        Err(e) if e.kind() == ErrorKind::AddrInUse => Ok(()),
+        Err(e) => Err(format!("binding UDP port {port}: {e}")),
+        Ok(_) => Err(format!("UDP port {port} is free")),
+    }
+}
+
+/// Ok when binding 127.0.0.1:`port` for UDP succeeds.
+fn udp_free(port: u16) -> Result<(), String> {
+    std::net::UdpSocket::bind(("127.0.0.1", port))
+        .map(drop)
+        .map_err(|e| format!("binding UDP port {port}: {e}"))
+}
+
+/// Ok when the status of Edge `e1` lists `protocol` port `port` as bound.
+async fn edge_binds(client: &Client, protocol: &str, port: u16) -> Result<(), String> {
+    let edge: Edge = get(client, NS, "e1").await;
+    let listeners = edge.status.unwrap_or_default().listeners;
+    match listeners
+        .iter()
+        .find(|l| l.protocol == protocol && l.port == port)
+    {
+        Some(l) if l.bound => Ok(()),
+        _ => Err(format!("edge listeners {listeners:?}")),
+    }
+}
+
+/// Ok when UDPRoute `dns` has exactly one parent entry of ours with the `wanted` conditions.
+async fn udp_route_is(client: &Client, wanted: &[(&str, &str)]) -> Result<(), String> {
+    let route: UdpRoute = get(client, NS, "dns").await;
+    let parents = route.status.map(|s| s.parents).unwrap_or_default();
+    let [parent] = parents.as_slice() else {
+        return Err(format!("parents {parents:?}"));
+    };
+    if parent.controller_name != CONTROLLER {
+        return Err(format!("controllerName {}", parent.controller_name));
+    }
+    has(&parent.conditions, wanted)
+}
+
+/// GatewayClass, namespace `gw`, Gateway `public` with a UDP listener `dns` on `port`, a Service
+/// `dns` with a UDP port 5353, UDPRoute `dns` and an Edge for `edge`.
+async fn udp_world(env: &Envtest, edge: &EdgeHandle, port: u16) {
+    let client = &env.client;
+    env.namespace(NS).await;
+    class(client).await;
+    gateway_with(
+        client,
+        json!([{ "name": "dns", "port": port, "protocol": "UDP" }]),
+    )
+    .await;
+    dns_service(client, "UDP").await;
+    udp_route(client, "dns").await;
+    edge_object(client, NS, edge).await;
+}
+
+const PROGRAMMED: &[(&str, &str)] = &[
+    ("Accepted", "True"),
+    ("ResolvedRefs", "True"),
+    ("Programmed", "True"),
+];
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn udp_gateway_route_and_edge_become_programmed() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_and_udp_port();
+    udp_world(&env, &edge, port).await;
+
+    eventually("the UDP listener programmed", || {
+        listener_is(client, "dns", 1, "UDPRoute", PROGRAMMED)
+    })
+    .await;
+    eventually("the route accepted", || {
+        udp_route_is(client, &[("Accepted", "True"), ("ResolvedRefs", "True")])
+    })
+    .await;
+    eventually("the Edge lists the UDP port as bound", || {
+        edge_binds(client, "UDP", port)
+    })
+    .await;
+    eventually("the edge holds the UDP port", || async { udp_held(port) }).await;
+    // No traffic: the API server's cluster IP leads nowhere here.
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn deleting_the_udp_route_closes_the_port() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_and_udp_port();
+    udp_world(&env, &edge, port).await;
+    eventually("the edge holds the UDP port", || async { udp_held(port) }).await;
+
+    api::<UdpRoute>(client, NS)
+        .delete("dns", &DeleteParams::default())
+        .await
+        .unwrap();
+    eventually("the listener without routes", || {
+        listener_is(client, "dns", 0, "UDPRoute", &[("Accepted", "True")])
+    })
+    .await;
+    eventually("the UDP port is closed", || async { udp_free(port) }).await;
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn udp_and_tcp_listeners_on_one_port_are_both_programmed() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_and_udp_port();
+    env.namespace(NS).await;
+    class(client).await;
+    gateway_with(
+        client,
+        json!([
+            { "name": "db", "port": port, "protocol": "TCP" },
+            { "name": "dns", "port": port, "protocol": "UDP" },
+        ]),
+    )
+    .await;
+    service(client).await;
+    route(client).await;
+    dns_service(client, "UDP").await;
+    udp_route(client, "dns").await;
+    edge_object(client, NS, &edge).await;
+
+    eventually("both listeners programmed", || async {
+        listener_is(client, "db", 1, "TCPRoute", PROGRAMMED).await?;
+        listener_is(client, "dns", 1, "UDPRoute", PROGRAMMED).await
+    })
+    .await;
+    eventually("both routes accepted", || async {
+        udp_route_is(client, &[("Accepted", "True"), ("ResolvedRefs", "True")]).await?;
+        let route: TcpRoute = get(client, NS, "db").await;
+        let parents = route.status.map(|s| s.parents).unwrap_or_default();
+        let [parent] = parents.as_slice() else {
+            return Err(format!("TCPRoute parents {parents:?}"));
+        };
+        has(
+            &parent.conditions,
+            &[("Accepted", "True"), ("ResolvedRefs", "True")],
+        )
+    })
+    .await;
+    eventually("the Edge lists both ports as bound", || async {
+        edge_binds(client, "TCP", port).await?;
+        edge_binds(client, "UDP", port).await
+    })
+    .await;
+    eventually("the TCP port accepts", || connects(port)).await;
+    eventually("the edge holds the UDP port", || async { udp_held(port) }).await;
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn udp_route_to_a_tcp_service_port_reports_backend_not_found() {
+    let env = Envtest::start().await;
+    let client = &env.client;
+    let operator = Operator::start(client, &[NS]).await;
+    let edge = operator.edge().await;
+    let port = free_tcp_and_udp_port();
+    env.namespace(NS).await;
+    class(client).await;
+    gateway_with(
+        client,
+        json!([{ "name": "dns", "port": port, "protocol": "UDP" }]),
+    )
+    .await;
+    // The Service's port 5353 is TCP.
+    dns_service(client, "TCP").await;
+    udp_route(client, "dns").await;
+    edge_object(client, NS, &edge).await;
+
+    eventually("the route's backend not found", || async {
+        let route: UdpRoute = get(client, NS, "dns").await;
+        let parents = route.status.map(|s| s.parents).unwrap_or_default();
+        let [parent] = parents.as_slice() else {
+            return Err(format!("parents {parents:?}"));
+        };
+        has(&parent.conditions, &[("Accepted", "True")])?;
+        has_reason(
+            &parent.conditions,
+            "ResolvedRefs",
+            "False",
+            "BackendNotFound",
+        )
+    })
+    .await;
+    // Nothing is behind the listener, so the edge does not open the port.
+    eventually("the listener has no backend", || {
+        listener_is(client, "dns", 1, "UDPRoute", &[("Accepted", "True")])
+    })
+    .await;
+    udp_free(port).unwrap();
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
 /// Kills the child when dropped, so a failed test leaves no process behind.
 struct Child(std::process::Child);
 
@@ -1650,7 +1898,13 @@ async fn deploy_manifests_apply_cleanly() {
         gateway_rules,
         [
             (
-                owned(&["gatewayclasses", "gateways", "tcproutes", "httproutes"]),
+                owned(&[
+                    "gatewayclasses",
+                    "gateways",
+                    "tcproutes",
+                    "udproutes",
+                    "httproutes",
+                ]),
                 owned(&["get", "list", "watch"]),
             ),
             (
@@ -1658,6 +1912,7 @@ async fn deploy_manifests_apply_cleanly() {
                     "gatewayclasses/status",
                     "gateways/status",
                     "tcproutes/status",
+                    "udproutes/status",
                     "httproutes/status",
                 ]),
                 owned(&["patch"]),
