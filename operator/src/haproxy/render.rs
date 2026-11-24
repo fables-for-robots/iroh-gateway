@@ -7,7 +7,8 @@
 //! Strings from cluster resources (host names, paths, header names and values) reach the
 //! configuration only through [`quote`] and [`quote_format`], or, where a word cannot be quoted
 //! (a header name inside a sample fetch's parentheses), with every character outside
-//! `[A-Za-z0-9_-]` replaced.
+//! `[A-Za-z0-9_-]` replaced. They never stand inside an anonymous `{ … }` ACL: every condition
+//! of a rule is a named ACL.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Write as _};
@@ -55,9 +56,6 @@ pub struct PortPlan {
     /// certificate after its own, so a new certificate is a new fingerprint.
     pub fingerprint: String,
 }
-
-/// The most words HAProxy reads on one line of its configuration.
-const MAX_LINE_WORDS: usize = 64;
 
 pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
     let dir = runtime_dir.display();
@@ -259,77 +257,70 @@ fn http_sections(
     s
 }
 
-/// The `use_backend` line, or two for a path prefix other than `/`, of rule number `r`: its
-/// conditions in the order host, path, method, headers. Header matches that would take the
-/// line beyond [`MAX_LINE_WORDS`] become named ACLs `h<r>_<i>` on lines of their own before it.
+/// The ACLs of rule number `r`, each on a line of its own, and then its `use_backend` line.
+///
+/// Every condition is a named ACL, never an anonymous `{ … }` one: HAProxy finds the end of an
+/// anonymous ACL by comparing words after unquoting, so a value of exactly `}` would end it.
+/// The ACLs are `r<r>_host`, `r<r>_path`, `r<r>_method` and `r<r>_h<j>` for header `j`, in that
+/// order, each declared only when it applies. A path prefix other than `/` declares `r<r>_path`
+/// twice, for the path itself and for what lies below it; HAProxy ORs the declarations of one
+/// name. A rule without conditions is `use_backend` without `if`.
 fn use_backend(s: &mut String, id: &str, r: usize, rule: &HttpRule) {
-    // Each condition with its number of words.
-    let host = match &rule.host {
-        HostMatch::Any => None,
-        HostMatch::Exact(h) => Some(format!(
-            "{{ req.hdr(host),host_only,lower -m str -- {} }}",
-            quote(h)
-        )),
-        HostMatch::Wildcard(suffix) => Some(format!(
-            "{{ req.hdr(host),host_only,lower -m end -- {} }}",
-            quote(suffix)
-        )),
-    }
-    .map(|c| (c, 7));
-    let paths: Vec<Option<(String, usize)>> = match &rule.path {
-        PathMatch::Exact(p) => vec![Some(format!("{{ path -m str -- {} }}", quote(p)))],
-        PathMatch::Prefix(p) if p == "/" => vec![None],
-        PathMatch::Prefix(p) => vec![
-            Some(format!("{{ path -m str -- {} }}", quote(p))),
-            Some(format!("{{ path -m beg -- {} }}", quote(&format!("{p}/")))),
-        ],
-    }
-    .into_iter()
-    .map(|c| c.map(|c| (c, 7)))
-    .collect();
-    let method = rule
-        .method
-        .as_ref()
-        .map(|m| (format!("{{ method {} }}", quote(m)), 4));
-    let fetch = |name: &str| format!("req.fhdr({}) -m str --", header_name(name));
-    let mut headers: Vec<(String, usize)> = rule
-        .headers
-        .iter()
-        .map(|(n, v)| (format!("{{ {} {} }}", fetch(n), quote(v)), 7))
-        .collect();
-
-    // `use_backend be_… if`, then the conditions.
-    let words = 3
-        + host.iter().map(|c| c.1).sum::<usize>()
-        + paths[0].as_ref().map_or(0, |c| c.1)
-        + method.iter().map(|c| c.1).sum::<usize>()
-        + headers.iter().map(|c| c.1).sum::<usize>();
-    if words > MAX_LINE_WORDS {
-        headers = rule
-            .headers
-            .iter()
-            .enumerate()
-            .map(|(i, (n, v))| {
-                let _ = writeln!(s, "    acl h{r}_{i} {} {}", fetch(n), quote(v));
-                (format!("h{r}_{i}"), 1)
-            })
-            .collect();
-    }
-
-    for path in paths {
-        let conditions: Vec<&str> = host
-            .iter()
-            .chain(path.iter())
-            .chain(method.iter())
-            .chain(headers.iter())
-            .map(|(c, _)| c.as_str())
-            .collect();
-        let _ = write!(s, "    use_backend be_{id}_{}", rule.backend);
-        if !conditions.is_empty() {
-            let _ = write!(s, " if {}", conditions.join(" "));
+    let mut names = Vec::new();
+    let mut acl = |s: &mut String, name: String, test: String| {
+        let _ = writeln!(s, "    acl {name} {test}");
+        if !names.contains(&name) {
+            names.push(name);
         }
-        s.push('\n');
+    };
+    match &rule.host {
+        HostMatch::Any => {}
+        HostMatch::Exact(h) => acl(
+            s,
+            format!("r{r}_host"),
+            format!("req.hdr(host),host_only,lower -m str -- {}", quote(h)),
+        ),
+        HostMatch::Wildcard(suffix) => acl(
+            s,
+            format!("r{r}_host"),
+            format!("req.hdr(host),host_only,lower -m end -- {}", quote(suffix)),
+        ),
     }
+    match &rule.path {
+        PathMatch::Prefix(p) if p == "/" => {}
+        PathMatch::Exact(p) => acl(
+            s,
+            format!("r{r}_path"),
+            format!("path -m str -- {}", quote(p)),
+        ),
+        PathMatch::Prefix(p) => {
+            acl(
+                s,
+                format!("r{r}_path"),
+                format!("path -m str -- {}", quote(p)),
+            );
+            acl(
+                s,
+                format!("r{r}_path"),
+                format!("path -m beg -- {}", quote(&format!("{p}/"))),
+            );
+        }
+    }
+    if let Some(m) = &rule.method {
+        acl(s, format!("r{r}_method"), format!("method {}", quote(m)));
+    }
+    for (j, (name, value)) in rule.headers.iter().enumerate() {
+        acl(
+            s,
+            format!("r{r}_h{j}"),
+            format!("req.fhdr({}) -m str -- {}", header_name(name), quote(value)),
+        );
+    }
+    let _ = write!(s, "    use_backend be_{id}_{}", rule.backend);
+    if !names.is_empty() {
+        let _ = write!(s, " if {}", names.join(" "));
+    }
+    s.push('\n');
 }
 
 /// A header name as a sample fetch argument, which cannot be quoted: every character outside
@@ -395,7 +386,10 @@ fn location(r: &Redirect, tls: bool, port: u16) -> String {
 
 /// `s` as one HAProxy configuration word: in single quotes, each `'` written as `'\''`, control
 /// characters dropped. Inside single quotes HAProxy expands nothing.
+///
+/// `s` must not be empty: HAProxy takes an empty word for the end of a line's arguments.
 pub(crate) fn quote(s: &str) -> String {
+    debug_assert!(!s.is_empty(), "quote needs a non-empty string");
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -903,7 +897,6 @@ mod tests {
         assert_eq!(quote("a\nb\r\0c\x7f"), "'abc'");
         assert_eq!(quote_format("100% it's"), r"'100%% it'\''s'");
         // More of the same.
-        assert_eq!(quote(""), "''");
         assert_eq!(quote("''"), r"''\'''\'''");
         assert_eq!(quote("end\\"), "'end\\'");
         assert_eq!(quote("gr\u{fc}\u{df}e"), "'gr\u{fc}\u{df}e'");
@@ -1021,8 +1014,17 @@ mod tests {
         );
     }
 
+    /// The lines of the frontend from the first `acl` or `use_backend` line up to
+    /// `default_backend`, without their indent.
+    fn rule_lines(cfg: &str) -> Vec<&str> {
+        cfg.lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with("acl ") || l.starts_with("use_backend "))
+            .collect()
+    }
+
     #[test]
-    fn prefix_gives_two_lines_and_root_prefix_none() {
+    fn prefix_gives_two_path_acls_and_root_prefix_none() {
         let r = render_ports(vec![http_port(
             80,
             None,
@@ -1038,13 +1040,13 @@ mod tests {
         )]);
         let id = port_id(&gw("gw", "public"), 80);
         assert_eq!(
-            lines_of(&r.haproxy_cfg, "use_backend"),
+            rule_lines(&r.haproxy_cfg),
             [
-                format!("use_backend be_{id}_0 if {{ path -m str -- '/foo' }}"),
-                format!("use_backend be_{id}_0 if {{ path -m beg -- '/foo/' }}"),
-                format!(
-                    "use_backend be_{id}_1 if {{ req.hdr(host),host_only,lower -m str -- 'a.example.com' }}"
-                ),
+                "acl r0_path path -m str -- '/foo'".to_owned(),
+                "acl r0_path path -m beg -- '/foo/'".to_owned(),
+                format!("use_backend be_{id}_0 if r0_path"),
+                "acl r1_host req.hdr(host),host_only,lower -m str -- 'a.example.com'".to_owned(),
+                format!("use_backend be_{id}_1 if r1_host"),
                 format!("use_backend be_{id}_1"),
             ]
         );
@@ -1055,7 +1057,7 @@ mod tests {
         let r = render_ports(vec![simple_port(80, None)]);
         let id = port_id(&gw("gw", "public"), 80);
         assert_eq!(
-            lines_of(&r.haproxy_cfg, "use_backend"),
+            rule_lines(&r.haproxy_cfg),
             [format!("use_backend be_{id}_0")]
         );
         assert!(
@@ -1071,60 +1073,100 @@ mod tests {
         let mut port = simple_port(80, None);
         port.rules = vec![rule];
         let r = render_ports(vec![port]);
-        let lines = lines_of(&r.haproxy_cfg, "use_backend");
-        assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0].ends_with(" if { req.fhdr(x_y_z) -m str -- 'v' }"),
-            "{}",
-            lines[0]
+        let id = port_id(&gw("gw", "public"), 80);
+        assert_eq!(
+            rule_lines(&r.haproxy_cfg),
+            [
+                "acl r0_h0 req.fhdr(x_y_z) -m str -- 'v'".to_owned(),
+                format!("use_backend be_{id}_0 if r0_h0"),
+            ]
         );
         assert!(!r.haproxy_cfg.contains("x)y"));
     }
 
     #[test]
-    fn header_matches_beyond_haproxys_word_limit_become_named_acls() {
-        // HAProxy reads at most 64 words on a line: host, path and method take 21 with the
-        // keyword, the backend and `if`, each header match 7.
-        let rule = |headers: usize| {
-            let mut r = http_rule(exact("a.example.com"), PathMatch::Exact("/x".into()), 0);
+    fn conditions_are_named_acls() {
+        // Values that are HAProxy syntax on their own.
+        let words = ["}", "{", "||", "!", "if", "unless", "--", "-m", "-i", "or"];
+        let mut rules = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            let mut r = http_rule(
+                if i % 2 == 0 {
+                    exact("a.example.com")
+                } else {
+                    HostMatch::Wildcard(".example.com".into())
+                },
+                if i % 3 == 0 {
+                    PathMatch::Exact(format!("/{w}"))
+                } else {
+                    prefix(&format!("/{w}"))
+                },
+                0,
+            );
             r.method = Some("GET".into());
-            r.headers = (0..headers)
-                .map(|i| (format!("x-h{i:02}"), format!("v{i}")))
-                .collect();
-            r
-        };
+            r.headers = vec![("x-a".into(), (*w).into()), ("x-b".into(), "{ }".into())];
+            rules.push(r);
+        }
+        rules.push(http_rule(HostMatch::Any, prefix("/"), 0));
         let mut port = simple_port(80, None);
-        port.rules = vec![rule(6), rule(7), rule(16)];
+        port.rules = rules;
+        port.backends[0].request_headers.set = vec![("x-c".into(), "}".into())];
+        let r = render_ports(vec![port]);
+        let cfg = &r.haproxy_cfg;
+        for (i, w) in words.iter().enumerate() {
+            assert!(
+                cfg.contains(&format!(
+                    "    acl r{i}_h0 req.fhdr(x-a) -m str -- {}\n",
+                    quote(w)
+                )),
+                "{w}\n{cfg}"
+            );
+        }
+        // Braces only inside quoted words, never as words of their own.
+        let mut stripped = cfg.clone();
+        for q in ["'{ }'", "'}'", "'{'", "'/}'", "'/{'", "'/}/'", "'/{/'"] {
+            stripped = stripped.replace(q, "<quoted>");
+        }
+        assert!(!stripped.contains('{'), "{stripped}");
+        assert!(!stripped.contains('}'), "{stripped}");
+        // Every `use_backend` line is the keyword, the backend, and ACL names.
+        let id = port_id(&gw("gw", "public"), 80);
+        let lines = lines_of(cfg, "use_backend");
+        assert_eq!(lines.len(), words.len() + 1);
+        for (i, line) in lines[..words.len()].iter().enumerate() {
+            assert_eq!(
+                *line,
+                format!("use_backend be_{id}_0 if r{i}_host r{i}_path r{i}_method r{i}_h0 r{i}_h1")
+            );
+        }
+        assert_eq!(lines[words.len()], format!("use_backend be_{id}_0"));
+    }
+
+    #[test]
+    fn sixteen_header_matches_are_named_acls_on_one_line() {
+        let mut rule = http_rule(exact("a.example.com"), PathMatch::Exact("/x".into()), 0);
+        rule.method = Some("GET".into());
+        rule.headers = (0..16)
+            .map(|i| (format!("x-h{i:02}"), format!("v{i}")))
+            .collect();
+        let mut port = simple_port(80, None);
+        port.rules = vec![rule];
         let r = render_ports(vec![port]);
         let id = port_id(&gw("gw", "public"), 80);
-        let use_lines = lines_of(&r.haproxy_cfg, "use_backend");
-        assert_eq!(use_lines.len(), 3);
-        for l in &use_lines {
-            assert!(l.split_whitespace().count() <= 64, "{l}");
-        }
-        let common = format!(
-            "use_backend be_{id}_0 if {{ req.hdr(host),host_only,lower -m str -- 'a.example.com' }} \
-             {{ path -m str -- '/x' }} {{ method 'GET' }}"
-        );
-        // Six fit on the line: 63 words.
-        let six: String = (0..6)
-            .map(|i| format!(" {{ req.fhdr(x-h{i:02}) -m str -- 'v{i}' }}"))
-            .collect();
-        assert_eq!(use_lines[0], format!("{common}{six}"));
-        assert_eq!(use_lines[0].split_whitespace().count(), 63);
-        // Seven do not: each becomes an ACL of its own, named after the rule and the header.
-        let named =
-            |rule: usize, n: usize| -> String { (0..n).map(|i| format!(" h{rule}_{i}")).collect() };
-        assert_eq!(use_lines[1], format!("{common}{}", named(1, 7)));
-        assert_eq!(use_lines[2], format!("{common}{}", named(2, 16)));
-        let acls = lines_of(&r.haproxy_cfg, "acl ");
-        assert_eq!(acls.len(), 7 + 16);
-        assert_eq!(acls[0], "acl h1_0 req.fhdr(x-h00) -m str -- 'v0'");
-        assert_eq!(acls[22], "acl h2_15 req.fhdr(x-h15) -m str -- 'v15'");
-        // Each ACL comes before the line that uses it.
-        let cfg = &r.haproxy_cfg;
-        assert!(cfg.find("acl h2_15 ").unwrap() < cfg.find(" h2_15\n").unwrap());
-        assert!(cfg.find(" h1_6\n").unwrap() < cfg.find("acl h2_0 ").unwrap());
+        let mut want = vec![
+            "acl r0_host req.hdr(host),host_only,lower -m str -- 'a.example.com'".to_owned(),
+            "acl r0_path path -m str -- '/x'".to_owned(),
+            "acl r0_method method 'GET'".to_owned(),
+        ];
+        want.extend((0..16).map(|i| format!("acl r0_h{i} req.fhdr(x-h{i:02}) -m str -- 'v{i}'")));
+        let names: String = (0..16).map(|i| format!(" r0_h{i}")).collect();
+        want.push(format!(
+            "use_backend be_{id}_0 if r0_host r0_path r0_method{names}"
+        ));
+        let got = rule_lines(&r.haproxy_cfg);
+        assert_eq!(got, want);
+        // Well within the 64 words HAProxy reads on a line.
+        assert_eq!(got.last().unwrap().split_whitespace().count(), 3 + 3 + 16);
     }
 
     /// The `location` of a port with one redirecting rule, and its status code.

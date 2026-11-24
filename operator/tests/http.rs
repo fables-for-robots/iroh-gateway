@@ -517,8 +517,8 @@ async fn rendered_http_configuration_is_valid() {
         remove: vec!["x-backend".into()],
     };
     let rules = vec![
-        // The longest line of anonymous conditions there is (63 words), and the named ACLs
-        // that take over beyond it.
+        // Six and sixteen header matches (sixteen is the most a route may have), with host,
+        // path and method.
         header_rule(6, 0),
         header_rule(16, 0),
         rule(exact("a.example.com"), exact_path("/x"), 0),
@@ -578,7 +578,11 @@ async fn rendered_http_configuration_is_valid() {
         .await
         .unwrap();
     let rendered = render(&m, &runtime);
-    assert!(rendered.haproxy_cfg.contains("acl h1_15 "));
+    assert!(
+        rendered
+            .haproxy_cfg
+            .contains("    acl r1_h15 req.fhdr(x-h15) -m str -- 'v15'\n")
+    );
     // Two certificates and their list.
     assert_eq!(rendered.files.len(), 3, "{:?}", rendered.files);
     let applied = sup.apply(&rendered.haproxy_cfg, &rendered.files).await;
@@ -749,7 +753,7 @@ async fn method_and_header_matches_select_the_backend() {
     post.method = Some("POST".into());
     let mut header = any(1);
     header.headers = vec![("x-env".into(), "prod".into())];
-    // Sixteen header matches, the most a route may have, beyond what fits on one line.
+    // Sixteen header matches, the most a route may have.
     let sixteen: Vec<(String, String)> = (0..16)
         .map(|i| (format!("x-h{i:02}"), format!("v{i}")))
         .collect();
@@ -1012,16 +1016,44 @@ async fn hostile_strings_cannot_inject_configuration() {
     let match_value = "'; } default_backend be_none #\\";
     let mut header_rule = any(3);
     header_rule.headers = vec![("x-match".into(), match_value.into())];
-    let m = model(vec![http_port(
-        80,
-        vec![
-            rule(HostMatch::Any, exact_path(literal_path), 1),
-            rule(HostMatch::Any, exact_path(sendable_path), 2),
-            header_rule,
-            any(0),
-        ],
-        vec![with_headers, to(literal), to(sendable), to(matched)],
-    )]);
+    // Values that are HAProxy syntax on their own, as whole words: each header match has a
+    // backend of its own, and each set value must arrive as it is.
+    let words: [(&str, &'static str); 9] = [
+        ("}", "W0"),
+        ("{", "W1"),
+        ("||", "W2"),
+        ("!", "W3"),
+        ("if", "W4"),
+        ("unless", "W5"),
+        ("--", "W6"),
+        ("-m", "W7"),
+        ("-i", "W8"),
+    ];
+    let set_words = [
+        ("x-w1", "}"),
+        ("x-w2", "if"),
+        ("x-w3", "unless"),
+        ("x-w4", "--"),
+    ];
+    with_headers.request_headers.set.extend(
+        set_words
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), (*v).to_owned())),
+    );
+    let mut rules = vec![
+        rule(HostMatch::Any, exact_path(literal_path), 1),
+        rule(HostMatch::Any, exact_path(sendable_path), 2),
+        header_rule,
+    ];
+    let mut backends = vec![with_headers, to(literal), to(sendable), to(matched)];
+    for (k, (word, tag)) in words.iter().enumerate() {
+        let mut r = any(4 + k);
+        r.headers = vec![("x-word".into(), (*word).into())];
+        rules.push(r);
+        backends.push(to(backend(tag).await));
+    }
+    rules.push(any(0));
+    let m = model(vec![http_port(80, rules, backends)]);
     let s = Served::start(&m).await;
 
     // The configuration has each value only as its quoted word.
@@ -1098,6 +1130,28 @@ async fn hostile_strings_cannot_inject_configuration() {
             .tag(),
         "D"
     );
+    // Each syntax word stands as a quoted pattern of its own ACL, and selects its backend only
+    // for exactly that value.
+    for (k, (word, tag)) in words.iter().enumerate() {
+        let acl = format!(
+            "    acl r{}_h0 req.fhdr(x-word) -m str -- '{word}'\n",
+            3 + k
+        );
+        assert!(cfg.contains(&acl), "{acl}\n{cfg}");
+        let with = |v: &str| request_with("GET", "a", "/", &[("X-Word", v)]);
+        assert_eq!(s.get(80, &with(word)).await.tag(), *tag, "{word}");
+        for other in [format!("{word}x"), format!("x{word}"), word.to_uppercase()] {
+            if other != *word {
+                assert_eq!(s.get(80, &with(&other)).await.tag(), "D", "{other}");
+            }
+        }
+    }
+    let r = s.get(80, &request("a", "/")).await;
+    for (name, value) in set_words {
+        let line = format!("    http-request set-header '{name}' '{value}'\n");
+        assert!(cfg.contains(&line), "{line}\n{cfg}");
+        assert_eq!(r.seen(name), [value.as_bytes().to_vec()], "{name}");
+    }
     s.shutdown().await;
 }
 
