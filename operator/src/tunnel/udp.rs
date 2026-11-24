@@ -21,6 +21,7 @@ use iroh_gateway_proto::datagram::{
 };
 use iroh_gateway_proto::idle::IdleMap;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
+use socket2::SockRef;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -292,7 +293,12 @@ impl Forwarder {
                 socket
             }
         };
-        if socket.try_send(&packet.payload).is_err() {
+        // Straight to the kernel, as a non-blocking send: tokio's `try_send` refuses until the
+        // reactor has reported a new socket writable, which would drop a flow's first packets.
+        if SockRef::from(socket.as_ref())
+            .send(&packet.payload)
+            .is_err()
+        {
             shared.drops.socket_error.hit();
         }
     }

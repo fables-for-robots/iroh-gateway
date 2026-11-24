@@ -18,7 +18,7 @@ use iroh_gateway_proto::frame::write_frame;
 use iroh_gateway_proto::transport::Relay;
 use iroh_gateway_proto::{CLOSE_SHUTDOWN, RESET_BAD_HEADER, RESET_UNKNOWN_LISTENER};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{Instant, timeout};
 
 fn bound(keys: &[u16]) -> Vec<ListenerState> {
@@ -863,6 +863,30 @@ async fn shutdown_closes_with_shutdown_code() {
 async fn udp_echoes_through_edge_and_operator() {
     let (rig, p) = udp_rig().await;
     assert_eq!(udp_roundtrip(public(p), b"hello").await, b"hello");
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_single_packet_from_a_new_visitor_is_answered() {
+    let (rig, p) = udp_rig().await;
+    // Sent exactly once, against the rule to send again: a datagram on an established loopback
+    // QUIC session is not lost, and resending is what hid first packets of new flows being
+    // dropped.
+    let visitor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    visitor.send_to(b"once", public(p)).await.unwrap();
+    let mut buf = [0u8; 64];
+    let answer = timeout(STEP, async {
+        loop {
+            match visitor.recv_from(&mut buf).await {
+                Ok((n, from)) if from == public(p) => return buf[..n].to_vec(),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("a single packet from a new visitor was not answered");
+    assert_eq!(answer, b"once");
     rig.link.shutdown().await;
     rig.edge.shutdown().await;
 }

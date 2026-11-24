@@ -294,6 +294,46 @@ async fn packet_reaches_the_backend_and_the_reply_returns_under_the_flow() {
     t.shutdown().await;
 }
 
+// The next two tests send each packet exactly once, against the rule to send again: a
+// datagram on an established loopback QUIC session is not lost, and resending is what hid
+// first packets of new flows being dropped.
+
+#[tokio::test]
+async fn first_packet_of_a_new_flow_reaches_the_backend() {
+    let a = backend().await;
+    let t = setup(&[], &[5300], &[(5300, addr(&a))], |_| {}).await;
+    let id = t.id(udp(5300));
+    send_packet(t.conn(), id, 1, next_packet_id(), b"only once");
+    assert!(
+        arrival(&a, b"only once", &[], STEP).await.is_some(),
+        "the first packet of a new flow did not reach the backend"
+    );
+    t.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_burst_at_the_start_of_a_flow_all_arrives() {
+    let a = backend().await;
+    let t = setup(&[], &[5300], &[(5300, addr(&a))], |_| {}).await;
+    let id = t.id(udp(5300));
+    let payloads: [&[u8]; 5] = [b"b0", b"b1", b"b2", b"b3", b"b4"];
+    for payload in payloads {
+        send_packet(t.conn(), id, 1, next_packet_id(), payload);
+    }
+    let mut missing: Vec<&[u8]> = payloads.to_vec();
+    let mut buf = vec![0u8; MAX_PACKET];
+    let all = timeout(STEP, async {
+        while !missing.is_empty() {
+            if let Ok((n, _)) = a.recv_from(&mut buf).await {
+                missing.retain(|p| *p != &buf[..n]);
+            }
+        }
+    })
+    .await;
+    assert!(all.is_ok(), "never arrived: {missing:?}");
+    t.shutdown().await;
+}
+
 #[tokio::test]
 async fn two_flows_reach_the_backend_from_two_ports() {
     let a = backend().await;
