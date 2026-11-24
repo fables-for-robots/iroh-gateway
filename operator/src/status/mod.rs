@@ -222,10 +222,13 @@ fn gateway_status(g: &GatewayModel, facts: &Facts) -> GatewayStatusOut {
         .collect();
     let any_ready = problems.iter().any(|(_, p)| p.is_none());
 
-    let all_listeners_fine = g
-        .listeners
-        .iter()
-        .all(|l| l.accepted.is_ok() && l.conflicted.is_none());
+    // An HTTPS listener without a usable certificate can never serve: it counts as not valid,
+    // as a refused or conflicted one does.
+    let all_listeners_fine = g.listeners.iter().all(|l| {
+        l.accepted.is_ok()
+            && l.conflicted.is_none()
+            && !(l.protocol == "HTTPS" && l.certificates.is_empty())
+    });
     let accepted = match &g.accepted {
         Ok(()) if all_listeners_fine => cond("Accepted", true, "Accepted", ""),
         Ok(()) => cond(
@@ -991,6 +994,54 @@ mod tests {
         let tls = &d.gateways[0].listeners[1].conditions;
         check(get(tls, "ResolvedRefs"), true, "ResolvedRefs");
         check(get(tls, "Programmed"), true, "Programmed");
+    }
+
+    #[test]
+    fn gateway_with_an_https_listener_without_certificates_says_listeners_not_valid() {
+        let https = |certificates: Vec<crate::model::Certificate>| {
+            let mut l = listener("tls", 443, false);
+            l.protocol = "HTTPS".into();
+            l.supported_kinds = vec!["HTTPRoute".into()];
+            l.attached_routes = 1;
+            if certificates.is_empty() {
+                l.resolved_refs = Err(Reject::new(
+                    "InvalidCertificateRef",
+                    "secret ns/site-tls not found",
+                ));
+            }
+            l.certificates = certificates;
+            l
+        };
+        let edge_facts = || facts(vec![("e", up(vec![bound(80, Ok(())), bound(443, Ok(()))]))]);
+        let m = model(
+            gateway(vec![listener("a", 80, true), https(vec![])], &["e"]),
+            vec![edge("e", Ok(()))],
+        );
+        let d = compute(&m, &edge_facts());
+        let g = &d.gateways[0];
+        let accepted = get(&g.conditions, "Accepted");
+        check(accepted, true, "ListenersNotValid");
+        assert_eq!(
+            accepted.message,
+            "some listeners are not valid; see the listener conditions"
+        );
+        check(get(&g.conditions, "Programmed"), true, "Programmed");
+
+        // With its certificate the Gateway is plainly accepted.
+        let certificate = crate::model::Certificate {
+            secret: ObjRef::new("ns", "site-tls"),
+            file_name: "ns.site-tls.0000000000000000.pem".into(),
+            pem: String::new(),
+        };
+        let m = model(
+            gateway(
+                vec![listener("a", 80, true), https(vec![certificate])],
+                &["e"],
+            ),
+            vec![edge("e", Ok(()))],
+        );
+        let d = compute(&m, &edge_facts());
+        check(get(&d.gateways[0].conditions, "Accepted"), true, "Accepted");
     }
 
     #[test]
