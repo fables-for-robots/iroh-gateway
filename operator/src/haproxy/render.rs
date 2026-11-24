@@ -222,7 +222,11 @@ fn http_sections(
          \x20   bind unix@{dir}/s/{id}.sock accept-proxy mode 600{tls}\n\
          \x20   option httplog\n\
          \x20   http-request set-header X-Forwarded-For %[src]\n\
-         \x20   http-request set-header X-Forwarded-Proto {proto}\n"
+         \x20   http-request set-header X-Forwarded-Proto {proto}\n\
+         \x20   http-request set-header X-Forwarded-Host %[req.hdr(host)]\n\
+         \x20   http-request set-header X-Forwarded-Port %[dst_port]\n\
+         \x20   http-request del-header Forwarded\n\
+         \x20   http-request del-header X-Real-IP\n"
     );
     for (r, rule) in port.rules.iter().enumerate() {
         use_backend(&mut s, id, r, rule);

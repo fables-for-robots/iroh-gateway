@@ -945,16 +945,25 @@ async fn x_forwarded_headers_are_set_and_cannot_be_forged() {
     let s = Served::start(&model(vec![http_port(80, vec![any(0)], vec![to(a)])])).await;
     let req = request_with(
         "GET",
-        "a",
+        "app.example.com",
         "/",
         &[
             ("X-Forwarded-For", "1.2.3.4"),
             ("X-Forwarded-Proto", "https"),
+            ("X-Forwarded-Host", "evil.example.com"),
+            ("X-Forwarded-Port", "8443"),
+            ("Forwarded", "for=1.2.3.4;host=evil.example.com;proto=https"),
+            ("X-Real-IP", "1.2.3.4"),
         ],
     );
     let r = s.get(80, &req).await;
     assert_eq!(r.seen("x-forwarded-for"), [b"198.51.100.9".to_vec()]);
     assert_eq!(r.seen("x-forwarded-proto"), [b"http".to_vec()]);
+    // The request's own host, and the port the visitor connected to (the PROXY header's).
+    assert_eq!(r.seen("x-forwarded-host"), [b"app.example.com".to_vec()]);
+    assert_eq!(r.seen("x-forwarded-port"), [b"80".to_vec()]);
+    assert!(r.seen("forwarded").is_empty(), "{}", r.describe());
+    assert!(r.seen("x-real-ip").is_empty(), "{}", r.describe());
     s.shutdown().await;
 }
 
