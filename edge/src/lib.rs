@@ -3,10 +3,12 @@
 pub mod listeners;
 mod pending;
 mod session;
+pub mod udp;
 
 use std::future::pending;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -20,6 +22,7 @@ use tokio::time::Sleep;
 use tracing::{debug, error, info, warn};
 
 pub use listeners::{Accepted, ListenerSet, canonical};
+pub use udp::UdpHub;
 
 use pending::PendingHandshakes;
 use session::{ApplyRequest, Session};
@@ -46,6 +49,12 @@ pub struct EdgeOptions {
     /// How long listeners stay open without a configured session.
     pub tunnel_grace: Duration,
     pub relay: Relay,
+    /// Most UDP flows at once; at the cap a new flow replaces the least recently used.
+    pub max_udp_flows: usize,
+    /// How long a flow lives without a packet in either direction.
+    pub udp_flow_idle: Duration,
+    /// Most UDP payload bytes per second forwarded from visitors into the tunnel; None: no limit.
+    pub udp_rate_limit: Option<u64>,
 }
 
 pub struct Edge;
@@ -79,7 +88,9 @@ impl Edge {
             .context("iroh endpoint has no bound socket")?;
         let endpoint_id = endpoint.id();
 
-        let (listeners, accepted) = ListenerSet::new(opts.public_bind, opts.max_connections);
+        let udp = UdpHub::new(opts.max_udp_flows, opts.udp_flow_idle, opts.udp_rate_limit);
+        let (listeners, accepted) =
+            ListenerSet::new(opts.public_bind, opts.max_connections, udp.clone());
         let (apply_tx, apply_rx) = mpsc::channel(APPLY_QUEUE);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (running, running_rx) = watch::channel(());
@@ -89,6 +100,7 @@ impl Edge {
             operator: opts.operator,
             grace: opts.tunnel_grace,
             listeners,
+            udp,
             accepted,
             apply_tx,
             apply_rx,
@@ -151,6 +163,8 @@ struct Supervisor {
     operator: EndpointId,
     grace: Duration,
     listeners: ListenerSet,
+    /// Forwards UDP over the current session once it is configured.
+    udp: Arc<UdpHub>,
     accepted: mpsc::Receiver<Accepted>,
     apply_tx: mpsc::Sender<ApplyRequest>,
     apply_rx: mpsc::Receiver<ApplyRequest>,
@@ -188,6 +202,7 @@ impl Supervisor {
                     }
                 }
                 () = session_ended(&mut self.current) => {
+                    self.udp.set_session(None);
                     if let Some(session) = self.current.take() {
                         session.close_ended();
                     }
@@ -239,6 +254,8 @@ impl Supervisor {
 
     /// Makes `conn` the current session, replacing any running one.
     fn install(&mut self, conn: Connection) {
+        // Until its first `Config`, no UDP is forwarded over the new session.
+        self.udp.set_session(None);
         if let Some(old) = self.current.take() {
             old.close(CLOSE_REPLACED, b"replaced");
             self.start_grace();
@@ -275,6 +292,9 @@ impl Supervisor {
             return;
         };
         let status = self.listeners.apply(&req.cfg).await;
+        if !session.configured {
+            self.udp.set_session(Some(session.conn().clone()));
+        }
         session.configured = true;
         self.grace_timer = None;
         info!(
@@ -294,6 +314,7 @@ impl Supervisor {
     }
 
     async fn shutdown(mut self) {
+        self.udp.set_session(None);
         if let Some(session) = self.current.take() {
             session.close(CLOSE_SHUTDOWN, b"shutdown");
         }

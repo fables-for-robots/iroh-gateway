@@ -1863,6 +1863,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "fastrand",
  "humantime",
  "iroh",
  "iroh-gateway-proto",

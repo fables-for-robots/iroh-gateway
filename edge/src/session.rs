@@ -46,6 +46,10 @@ impl Session {
         }
     }
 
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Forwards a visitor over this session's connection as one stream.
     pub fn forward(&mut self, accepted: Accepted) {
         self.visitors.spawn(forward(self.conn.clone(), accepted));

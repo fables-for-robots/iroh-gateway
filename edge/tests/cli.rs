@@ -1,7 +1,6 @@
 //! The `iroh-gateway-edge` binary, run as a child process.
 #![cfg(unix)]
 
-#[allow(dead_code)]
 mod common;
 
 use std::io::{BufRead, BufReader, Read};
@@ -251,6 +250,21 @@ fn run_rejects_out_of_range_max_connections() {
         let out = edge(&["run", "--operator", &operator, "--max-connections", n]);
         assert!(!out.status.success(), "{n}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("max-connections"));
+    }
+}
+
+#[test]
+fn run_rejects_out_of_range_udp_flags() {
+    let operator = SecretKey::generate().public().to_string();
+    for (flag, value) in [
+        ("--max-udp-flows", "0"),
+        ("--max-udp-flows", "4097"),
+        ("--udp-rate-limit", "0"),
+    ] {
+        let out = edge(&["run", "--operator", &operator, flag, value]);
+        assert!(!out.status.success(), "{flag} {value}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(flag), "{flag} {value}: {stderr}");
     }
 }
 

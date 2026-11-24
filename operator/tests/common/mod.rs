@@ -18,6 +18,7 @@ use iroh_gateway_proto::ALPN;
 use iroh_gateway_proto::control::{
     BindState, Config, ListenerKey, ListenerStatus, Protocol, Status, StreamHeader,
 };
+use iroh_gateway_proto::datagram::{MAX_UDP_FLOWS, UDP_FLOW_IDLE};
 use iroh_gateway_proto::frame::{read_frame, write_frame};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,6 +93,9 @@ pub fn edge_options(operator: EndpointId, key: SecretKey, iroh_listen: SocketAdd
         max_connections: 100,
         tunnel_grace: Duration::from_millis(300),
         relay: Relay::Disabled,
+        max_udp_flows: MAX_UDP_FLOWS,
+        udp_flow_idle: UDP_FLOW_IDLE,
+        udp_rate_limit: None,
     }
 }
 

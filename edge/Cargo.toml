@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 nix = { workspace = true, features = ["resource"] }
 
 [dev-dependencies]
+fastrand.workspace = true
 nix.workspace = true
 socket2.workspace = true
 tempfile.workspace = true
