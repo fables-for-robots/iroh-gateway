@@ -894,6 +894,52 @@ async fn request_and_response_header_filters_apply() {
 }
 
 #[tokio::test]
+async fn response_header_filters_apply_to_redirects_and_errors() {
+    let a = backend("A").await;
+    let response_headers = HeaderMods {
+        set: vec![("strict-transport-security".into(), "max-age=60".into())],
+        add: vec![("x-added".into(), "yes".into())],
+        remove: vec!["x-backend".into()],
+    };
+    let with_headers = |mut b: HttpBackend| {
+        b.response_headers = response_headers.clone();
+        b
+    };
+    let m = model(vec![http_port(
+        80,
+        vec![
+            rule(HostMatch::Any, prefix("/redirect"), 0),
+            rule(HostMatch::Any, prefix("/fail"), 1),
+            any(2),
+        ],
+        vec![
+            with_headers(action(HttpAction::Redirect(Redirect {
+                scheme: Some("https".into()),
+                hostname: None,
+                port: None,
+                status: 301,
+            }))),
+            with_headers(action(HttpAction::Fail)),
+            with_headers(to(a)),
+        ],
+    )]);
+    let s = Served::start(&m).await;
+    for (path, status) in [("/redirect", 301), ("/fail", 500), ("/", 200)] {
+        let r = s.get(80, &request("example.com", path)).await;
+        assert_eq!(r.status, status, "{}", r.describe());
+        assert_eq!(
+            r.header("strict-transport-security"),
+            ["max-age=60"],
+            "{path}: {}",
+            r.describe()
+        );
+        assert_eq!(r.header("x-added"), ["yes"], "{path}");
+        assert!(r.header("x-backend").is_empty(), "{path}");
+    }
+    s.shutdown().await;
+}
+
+#[tokio::test]
 async fn x_forwarded_headers_are_set_and_cannot_be_forged() {
     let a = backend("A").await;
     let s = Served::start(&model(vec![http_port(80, vec![any(0)], vec![to(a)])])).await;

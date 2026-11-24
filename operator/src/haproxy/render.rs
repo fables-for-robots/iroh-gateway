@@ -235,7 +235,9 @@ fn http_sections(
         }
         let _ = write!(s, "\nbackend be_{id}_{n}\n    mode http\n");
         header_mods(&mut s, "http-request", &backend.request_headers);
-        header_mods(&mut s, "http-response", &backend.response_headers);
+        // `http-after-response`, not `http-response`: it also applies to the responses HAProxy
+        // makes itself, a redirect's and a 500's.
+        header_mods(&mut s, "http-after-response", &backend.response_headers);
         match &backend.action {
             HttpAction::Forward(backends) => servers(&mut s, backends),
             HttpAction::Fail => s.push_str("    http-request return status 500\n"),
@@ -337,7 +339,7 @@ fn header_name(name: &str) -> String {
         .collect()
 }
 
-/// The `http-request` or `http-response` rules of `mods`: set, add, then remove.
+/// The `http-request` or `http-after-response` rules of `mods`: set, add, then remove.
 fn header_mods(s: &mut String, directive: &str, mods: &HeaderMods) {
     for (name, value) in &mods.set {
         let _ = writeln!(
@@ -939,12 +941,21 @@ mod tests {
             vec![
                 filtered,
                 forward(vec![backend("fd00::12", 8080, 1)]),
-                http_backend(HttpAction::Redirect(Redirect {
-                    scheme: Some("https".into()),
-                    hostname: None,
-                    port: None,
-                    status: 301,
-                })),
+                HttpBackend {
+                    response_headers: HeaderMods {
+                        set: vec![(
+                            "strict-transport-security".into(),
+                            "max-age=31536000".into(),
+                        )],
+                        ..Default::default()
+                    },
+                    ..http_backend(HttpAction::Redirect(Redirect {
+                        scheme: Some("https".into()),
+                        hostname: None,
+                        port: None,
+                        status: 301,
+                    }))
+                },
                 http_backend(HttpAction::Fail),
             ],
         )
