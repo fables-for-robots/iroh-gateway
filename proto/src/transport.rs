@@ -22,6 +22,11 @@ pub const MAX_TUNNEL_STREAMS: u32 = 4_096;
 pub const STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 /// How much one edge may send across all streams before the operator reads it.
 pub const OPERATOR_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+/// Datagrams queued for sending, per connection. When it is full the oldest are dropped, which
+/// is what UDP does under load.
+pub const DATAGRAM_SEND_BUFFER: usize = 256 * 1024;
+/// Datagrams received and not yet read, per connection; the oldest are dropped beyond it.
+pub const DATAGRAM_RECEIVE_BUFFER: usize = 1024 * 1024;
 
 /// `incoming_bidi_streams` is how many streams the peer may have open towards us.
 ///
@@ -41,6 +46,8 @@ pub fn transport_config(incoming_bidi_streams: u32, role: Role) -> QuicTransport
     };
     builder
         .max_concurrent_uni_streams(VarInt::from_u32(0))
+        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER)
+        .datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER))
         .keep_alive_interval(KEEP_ALIVE)
         .max_idle_timeout(Some(
             IDLE_TIMEOUT
@@ -130,6 +137,7 @@ pub fn endpoint_builder(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use iroh::{EndpointAddr, tls::CaTlsConfig};
 
     use super::*;
@@ -155,6 +163,40 @@ mod tests {
         let (conn_b, conn_a) = tokio::join!(b.connect(addr, ALPN), accept);
         assert_eq!(conn_b.unwrap().remote_id(), a.id());
         assert_eq!(conn_a.remote_id(), b.id());
+    }
+
+    #[tokio::test]
+    async fn datagrams_pass_between_two_endpoints() {
+        let a = endpoint_builder(SecretKey::generate(), 4, &Relay::Disabled, Role::Edge)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let b = endpoint_builder(SecretKey::generate(), 4, &Relay::Disabled, Role::Operator)
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let addr = EndpointAddr::new(a.id()).with_ip_addr(a.bound_sockets()[0]);
+        let accept = async { a.accept().await.unwrap().await.unwrap() };
+        let (conn_b, conn_a) = tokio::join!(b.connect(addr, ALPN), accept);
+        let conn_b = conn_b.unwrap();
+        for (from, to) in [(&conn_a, &conn_b), (&conn_b, &conn_a)] {
+            let size = from.max_datagram_size();
+            assert!(
+                size.is_some_and(|n| n >= 1100 + crate::datagram::HEADER_LEN),
+                "{size:?}"
+            );
+            from.send_datagram(Bytes::from_static(b"ping")).unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(10), to.read_datagram())
+                .await
+                .expect("datagram arrives")
+                .unwrap();
+            assert_eq!(got.as_ref(), b"ping");
+        }
     }
 
     #[test]
@@ -227,6 +269,8 @@ mod tests {
                 format!("max_concurrent_bidi_streams: {streams},"),
                 "max_concurrent_uni_streams: 0,".to_string(),
                 "max_idle_timeout: Some(20000),".to_string(),
+                format!("datagram_receive_buffer_size: Some({DATAGRAM_RECEIVE_BUFFER}),"),
+                format!("datagram_send_buffer_size: {DATAGRAM_SEND_BUFFER},"),
                 format!("stream_receive_window: {STREAM_RECEIVE_WINDOW},"),
                 "keep_alive_interval: Some(5s),".to_string(),
                 "default_path_max_idle_timeout: Some(15s),".to_string(),

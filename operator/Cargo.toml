@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+bytes.workspace = true
 clap.workspace = true
 fastrand.workspace = true
 futures.workspace = true
