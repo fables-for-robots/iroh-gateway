@@ -126,6 +126,7 @@ impl World {
                         .collect(),
                     addresses: vec![],
                     addresses_dropped: 0,
+                    http_ports: Vec::new(),
                 })
                 .collect(),
             edges: edges

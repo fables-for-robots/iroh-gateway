@@ -34,7 +34,10 @@ use serde::{Deserialize, Serialize};
 use crate::crd::Edge;
 
 pub use certs::Certificate;
-pub use http::{HeaderMods, HostMatch, HttpAction, HttpMatch, HttpRouteRule, PathMatch, Redirect};
+pub use http::{
+    HeaderMods, HostMatch, HttpAction, HttpBackend, HttpMatch, HttpPort, HttpRouteRule, HttpRule,
+    PathMatch, Redirect,
+};
 pub(crate) use routes::parent_key;
 
 /// A namespaced object, by name.
@@ -272,6 +275,9 @@ pub struct GatewayModel {
     pub addresses: Vec<GatewayAddress>,
     /// How many more addresses the edges have than `addresses` lists.
     pub addresses_dropped: usize,
+    /// The ports that serve HTTP or HTTPS, ascending: one per port with a serving HTTP or HTTPS
+    /// listener.
+    pub http_ports: Vec<HttpPort>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -449,9 +455,12 @@ pub fn build(snapshot: &Snapshot, settings: &Settings) -> Model {
     // Routes pass: attach TCPRoutes and HTTPRoutes to listeners, fill `attached_routes`, and
     // `backends` for TCP.
     let mut routes = routes::routes(snapshot, &mut gateways);
-    let (http_routes, _attached) = http_routes::routes(snapshot, &mut gateways);
+    let (http_routes, attached) = http_routes::routes(snapshot, &mut gateways);
     routes.extend(http_routes);
     routes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
+
+    // HTTP pass: the rules of each port, in the order to try them.
+    http::ports(&mut gateways, attached);
 
     Model {
         classes,

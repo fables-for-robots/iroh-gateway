@@ -533,6 +533,7 @@ mod tests {
             edges: edges.iter().map(|e| ObjRef::new("ns", *e)).collect(),
             addresses: vec![],
             addresses_dropped: 0,
+            http_ports: Vec::new(),
         }
     }
 

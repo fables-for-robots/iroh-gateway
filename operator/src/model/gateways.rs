@@ -94,6 +94,7 @@ fn gateway(
         edges: Vec::new(),
         addresses: Vec::new(),
         addresses_dropped: 0,
+        http_ports: Vec::new(),
     }
 }
 

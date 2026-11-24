@@ -25,7 +25,6 @@ use super::{
 const UNSUPPORTED: &str = "UnsupportedValue";
 
 /// One accepted route on one listener.
-#[cfg_attr(not(test), expect(dead_code, reason = "read by the next task"))]
 pub(super) struct Attached {
     /// Gateway index, listener index.
     pub slot: (usize, usize),
