@@ -95,6 +95,7 @@ impl SnapshotSource for Stores {
             edges: cloned(&self.edges),
             services: cloned(&self.services),
             namespaces: cloned(&self.namespaces),
+            ..Default::default()
         }
     }
 

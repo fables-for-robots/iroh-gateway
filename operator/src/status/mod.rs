@@ -12,7 +12,7 @@ use iroh_gateway_proto::control::Protocol;
 use crate::crd::EdgeListenerStatus;
 use crate::model::{
     EdgeModel, GatewayAddress, GatewayModel, ListenerModel, MAX_GATEWAY_ADDRESSES, Model, ObjRef,
-    ParentKey, Reject,
+    ParentKey, Reject, RouteKind,
 };
 use crate::tunnel::{EdgeState, ListenerState};
 
@@ -67,6 +67,7 @@ pub struct ListenerStatusOut {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteStatusOut {
+    pub kind: RouteKind,
     pub key: ObjRef,
     pub generation: i64,
     pub parents: Vec<(ParentKey, Vec<Cond>)>,
@@ -139,13 +140,14 @@ pub fn compute(model: &Model, facts: &Facts) -> DesiredStatus {
                 .collect();
             parents.sort_by(|a, b| a.0.cmp(&b.0));
             RouteStatusOut {
+                kind: r.kind,
                 key: r.key.clone(),
                 generation: r.generation,
                 parents,
             }
         })
         .collect();
-    routes.sort_by(|a, b| a.key.cmp(&b.key));
+    routes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
 
     let mut edges: Vec<EdgeStatusOut> = model
         .edges
@@ -985,6 +987,7 @@ mod tests {
         };
         let mut m = model(gateway(vec![], &[]), vec![]);
         m.routes = vec![crate::model::RouteModel {
+            kind: crate::model::RouteKind::Tcp,
             key: ObjRef::new("ns", "r"),
             generation: 6,
             parents: vec![
@@ -1008,6 +1011,7 @@ mod tests {
         }];
         let d = compute(&m, &facts(vec![]));
         let r = &d.routes[0];
+        assert_eq!(r.kind, crate::model::RouteKind::Tcp);
         assert_eq!(r.generation, 6);
         assert_eq!(r.parents[0].0, key("a"));
         assert_eq!(types(&r.parents[0].1), ["Accepted", "ResolvedRefs"]);
@@ -1024,6 +1028,51 @@ mod tests {
             "BackendNotFound",
         );
         assert_eq!(get(&r.parents[1].1, "ResolvedRefs").message, "no svc");
+    }
+
+    #[test]
+    fn route_status_carries_its_kind() {
+        use crate::model::{RouteKind, RouteModel, RouteParent};
+        let parent = ParentKey {
+            group: "gateway.networking.k8s.io".into(),
+            kind: "Gateway".into(),
+            namespace: "ns".into(),
+            name: "gw".into(),
+            section_name: None,
+            port: None,
+        };
+        let route = |kind, name: &str, generation| RouteModel {
+            kind,
+            key: ObjRef::new("ns", name),
+            generation,
+            parents: vec![RouteParent {
+                parent: parent.clone(),
+                accepted: Ok(()),
+                resolved_refs: Ok(()),
+            }],
+        };
+        let mut m = model(gateway(vec![], &[]), vec![]);
+        // Same key, both kinds; given out of order.
+        m.routes = vec![
+            route(RouteKind::Http, "web", 2),
+            route(RouteKind::Tcp, "web", 1),
+            route(RouteKind::Http, "a", 3),
+        ];
+        let d = compute(&m, &facts(vec![]));
+        let got: Vec<(RouteKind, &str, i64)> = d
+            .routes
+            .iter()
+            .map(|r| (r.kind, r.key.name.as_str(), r.generation))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (RouteKind::Tcp, "web", 1),
+                (RouteKind::Http, "a", 3),
+                (RouteKind::Http, "web", 2),
+            ]
+        );
+        assert!(d.routes.iter().all(|r| r.parents.len() == 1));
     }
 
     #[test]

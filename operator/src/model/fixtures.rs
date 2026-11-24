@@ -9,6 +9,7 @@ use gateway_api::gateways::v1::{
     GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersAllowedRoutesNamespacesSelector,
     GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewaySpec,
 };
+use gateway_api::httproutes::v1::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};
 use gateway_api::tcproutes::v1::{
     TcpRoute, TcpRouteParentRefs, TcpRouteRules, TcpRouteRulesBackendRefs, TcpRouteSpec,
 };
@@ -386,6 +387,43 @@ impl RouteExt for TcpRoute {
 
     fn created(mut self, seconds: i64) -> Self {
         self.metadata.creation_timestamp = Some(time(seconds));
+        self
+    }
+}
+
+/// An HTTPRoute with no parents, hostnames or rules.
+pub fn http_route(ns: &str, name: &str) -> HttpRoute {
+    let mut r = HttpRoute::new(name, HttpRouteSpec::default());
+    r.metadata.namespace = Some(ns.into());
+    r
+}
+
+pub trait HttpRouteExt: Sized {
+    /// A parent gateway in the route's namespace.
+    fn parent(self, gateway: &str) -> Self;
+    /// Applies to the last parent.
+    fn section(self, name: &str) -> Self;
+}
+
+impl HttpRouteExt for HttpRoute {
+    fn parent(mut self, gateway: &str) -> Self {
+        self.spec
+            .parent_refs
+            .get_or_insert_with(Vec::new)
+            .push(HttpRouteParentRefs {
+                name: gateway.into(),
+                ..Default::default()
+            });
+        self
+    }
+
+    fn section(mut self, name: &str) -> Self {
+        self.spec
+            .parent_refs
+            .as_mut()
+            .and_then(|p| p.last_mut())
+            .expect("add a parent first")
+            .section_name = Some(name.into());
         self
     }
 }
