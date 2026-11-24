@@ -61,8 +61,9 @@ fn gateway(
     secrets: &BTreeMap<ObjRef, &Secret>,
 ) -> GatewayModel {
     let key = ObjRef::of(gw);
-    let listeners = listeners(&gw.spec.listeners, &key.namespace, secrets);
-    let accepted = if !settings.gateway_namespaces.contains(&key.namespace) {
+    let served = settings.gateway_namespaces.contains(&key.namespace);
+    let listeners = listeners(&gw.spec.listeners, &key.namespace, served, secrets);
+    let accepted = if !served {
         Err(Reject::new(
             "NamespaceNotAllowed",
             format!(
@@ -101,11 +102,12 @@ fn gateway(
 fn listeners(
     specs: &[gateway_api::gateways::v1::GatewayListeners],
     gateway_ns: &str,
+    served: bool,
     secrets: &BTreeMap<ObjRef, &Secret>,
 ) -> Vec<ListenerModel> {
     let mut out: Vec<ListenerModel> = specs
         .iter()
-        .map(|spec| listener(spec, gateway_ns, secrets))
+        .map(|spec| listener(spec, gateway_ns, served, secrets))
         .collect();
 
     // Listeners sharing a port conflict: on the protocol when it differs; on the hostname when
@@ -159,9 +161,11 @@ fn listeners(
     out
 }
 
+/// One listener; `served` says whether the Gateway's namespace is one the operator serves.
 fn listener(
     spec: &gateway_api::gateways::v1::GatewayListeners,
     gateway_ns: &str,
+    served: bool,
     secrets: &BTreeMap<ObjRef, &Secret>,
 ) -> ListenerModel {
     let mut accepted = Ok(());
@@ -239,10 +243,11 @@ fn listener(
         }
     }
 
-    // Only an accepted HTTPS listener has its certificates resolved. A certificate problem is the
-    // one that stops the listener, so it replaces an `InvalidRouteKinds` found above.
+    // Only an accepted HTTPS listener of a served Gateway has its certificates resolved. A
+    // certificate problem is the one that stops the listener, so it replaces an
+    // `InvalidRouteKinds` found above.
     let mut certificates = Vec::new();
-    if spec.protocol == "HTTPS" && accepted.is_ok() {
+    if spec.protocol == "HTTPS" && accepted.is_ok() && served {
         match certs::resolve(spec.tls.as_ref(), gateway_ns, secrets) {
             Ok(c) => certificates = c,
             Err(reject) => resolved_refs = Err(reject),

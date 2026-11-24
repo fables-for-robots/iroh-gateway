@@ -833,6 +833,46 @@ mod tests {
     }
 
     #[test]
+    fn gateway_outside_the_served_namespaces_resolves_no_certificates() {
+        let (crt, key) = self_signed();
+        for secrets in [
+            vec![],
+            vec![tls_secret("elsewhere", "site-tls", &crt, &key)],
+        ] {
+            let gw = gateway("elsewhere", "public")
+                .listener("tls", 443, "HTTPS")
+                .hostname("app.example.com")
+                .certificate("site-tls");
+            let m = model_of(vec![gw], secrets);
+            let g = &m.gateways[0];
+            assert_eq!(
+                g.accepted.as_ref().unwrap_err().reason,
+                "NamespaceNotAllowed"
+            );
+            let l = &g.listeners[0];
+            assert_eq!(l.resolved_refs, Ok(()), "{l:?}");
+            assert!(l.certificates.is_empty(), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn refused_https_listener_resolves_no_certificates() {
+        let gw = https_with(GatewayListenersTls {
+            mode: Some(GatewayListenersTlsMode::Passthrough),
+            certificate_refs: Some(vec![cert_ref(None, None, None, "missing")]),
+            ..Default::default()
+        });
+        let m = model_of(vec![gw], vec![]);
+        let l = &m.gateways[0].listeners[0];
+        assert_eq!(
+            l.accepted.as_ref().unwrap_err().reason,
+            "UnsupportedProtocol"
+        );
+        assert!(l.certificates.is_empty(), "{l:?}");
+        assert_eq!(l.resolved_refs, Ok(()), "{l:?}");
+    }
+
+    #[test]
     fn certificate_problem_replaces_invalid_route_kinds() {
         let kinds = [
             ("gateway.networking.k8s.io", "HTTPRoute"),

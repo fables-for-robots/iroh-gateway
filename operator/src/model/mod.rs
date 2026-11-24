@@ -338,7 +338,7 @@ pub struct ListenerModel {
     pub attached_routes: i32,
     pub backends: Vec<Backend>,
     /// The certificates of its `certificateRefs`, in order; empty unless it is an accepted HTTPS
-    /// listener and every reference is usable.
+    /// listener of a Gateway in a served namespace and every reference is usable.
     pub certificates: Vec<Certificate>,
 }
 
