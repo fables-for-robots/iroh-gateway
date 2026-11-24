@@ -319,7 +319,7 @@ mod tests {
         for (want, e, settings) in cases {
             let mut s = snap(vec![e]);
             s.gateways
-                .push(gateway("infra", "broken").listener("a", 80, "HTTP"));
+                .push(gateway("infra", "broken").listener("a", 80, "UDP"));
             let m = build(&s, &settings);
             assert_eq!(reason(&m.edges[0]), want);
         }
@@ -384,7 +384,7 @@ mod tests {
             good("younger", 1).gateway("broken").created(20),
         ]);
         s.gateways
-            .push(gateway("infra", "broken").listener("a", 80, "HTTP"));
+            .push(gateway("infra", "broken").listener("a", 80, "UDP"));
         let m = build(&s, &settings(&["infra"]));
         assert_eq!(reason(&m.edges[0]), "GatewayNotAccepted");
         assert_eq!(reason(&m.edges[1]), "GatewayNotAccepted");
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn edge_of_unaccepted_gateway() {
         let mut s = snap(vec![good("e", 1)]);
-        s.gateways = vec![gateway("infra", "public").listener("a", 80, "HTTP")];
+        s.gateways = vec![gateway("infra", "public").listener("a", 80, "UDP")];
         let m = build(&s, &settings(&["infra"]));
         assert_eq!(reason(&m.edges[0]), "GatewayNotAccepted");
         assert!(m.gateways[0].edges.is_empty());

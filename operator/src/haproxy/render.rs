@@ -180,7 +180,7 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::model::{Backend, EdgeModel, GatewayModel, ListenerModel, Reject};
+    use crate::model::{Backend, EdgeModel, GatewayModel, HostMatch, ListenerModel, Reject};
 
     const DIR: &str = "/run/igw";
 
@@ -202,6 +202,7 @@ mod tests {
             name: format!("l{port}"),
             port,
             protocol: "TCP".into(),
+            hostname: HostMatch::Any,
             accepted: Ok(()),
             conflicted: None,
             resolved_refs: Ok(()),

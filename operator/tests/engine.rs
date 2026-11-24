@@ -17,7 +17,7 @@ use iroh_gateway_operator::engine::{Engine, EngineEvent, EngineOptions};
 use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::{Rendered, port_id, render};
 use iroh_gateway_operator::model::{
-    Backend, EdgeModel, GatewayModel, ListenerModel, Model, ObjRef,
+    Backend, EdgeModel, GatewayModel, HostMatch, ListenerModel, Model, ObjRef,
 };
 use iroh_gateway_operator::status::Facts;
 use iroh_gateway_operator::tunnel::{ListenerState, bind_endpoint};
@@ -91,6 +91,7 @@ impl World {
             name: format!("l{port}"),
             port,
             protocol: "TCP".into(),
+            hostname: HostMatch::Any,
             accepted: Ok(()),
             conflicted: None,
             resolved_refs: Ok(()),

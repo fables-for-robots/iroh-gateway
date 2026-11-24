@@ -7,6 +7,7 @@ mod edges;
 #[cfg(test)]
 pub(crate) mod fixtures;
 mod gateways;
+mod http;
 mod routes;
 
 use std::collections::BTreeSet;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crd::Edge;
 
+pub use http::HostMatch;
 pub(crate) use routes::parent_key;
 
 /// A namespaced object, by name.
@@ -315,6 +317,8 @@ pub struct ListenerModel {
     pub name: String,
     pub port: u16,
     pub protocol: String,
+    /// The hosts the listener answers for; always `Any` for TCP.
+    pub hostname: HostMatch,
     pub accepted: Result<(), Reject>,
     pub conflicted: Option<Reject>,
     pub resolved_refs: Result<(), Reject>,
@@ -353,10 +357,18 @@ pub struct LabelRequirement {
 }
 
 impl ListenerModel {
-    /// Accepted, not conflicted, and with at least one backend. Only serving listeners get an
-    /// HAProxy frontend and an open port on the edges.
+    /// Accepted, not conflicted, and ready for traffic: a TCP listener needs a backend, an HTTP
+    /// one a route (which can answer without a backend, like a redirect), an HTTPS one cannot
+    /// serve yet. Only serving listeners get an HAProxy frontend and an open port on the edges.
     pub fn serving(&self) -> bool {
-        self.accepted.is_ok() && self.conflicted.is_none() && !self.backends.is_empty()
+        if self.accepted.is_err() || self.conflicted.is_some() {
+            return false;
+        }
+        match self.protocol.as_str() {
+            "HTTP" => self.attached_routes > 0,
+            "HTTPS" => false,
+            _ => !self.backends.is_empty(),
+        }
     }
 }
 

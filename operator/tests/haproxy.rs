@@ -715,13 +715,16 @@ async fn apply_after_a_timed_out_reload_reloads_again() {
 #[tokio::test]
 async fn rendered_config_passes_haproxy_validation() {
     use iroh_gateway_operator::haproxy::render::render;
-    use iroh_gateway_operator::model::{Backend, GatewayModel, ListenerModel, Model, ObjRef};
+    use iroh_gateway_operator::model::{
+        Backend, GatewayModel, HostMatch, ListenerModel, Model, ObjRef,
+    };
 
     fn listener(port: u16, backends: Vec<Backend>) -> ListenerModel {
         ListenerModel {
             name: format!("l{port}"),
             port,
             protocol: "TCP".into(),
+            hostname: HostMatch::Any,
             accepted: Ok(()),
             conflicted: None,
             resolved_refs: Ok(()),

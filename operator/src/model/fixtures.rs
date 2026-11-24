@@ -7,7 +7,8 @@ use gateway_api::gateways::v1::{
     Gateway, GatewayAddresses, GatewayListeners, GatewayListenersAllowedRoutes,
     GatewayListenersAllowedRoutesKinds, GatewayListenersAllowedRoutesNamespaces,
     GatewayListenersAllowedRoutesNamespacesFrom, GatewayListenersAllowedRoutesNamespacesSelector,
-    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewaySpec,
+    GatewayListenersAllowedRoutesNamespacesSelectorMatchExpressions, GatewayListenersTls,
+    GatewaySpec,
 };
 use gateway_api::httproutes::v1::{HttpRoute, HttpRouteParentRefs, HttpRouteSpec};
 use gateway_api::tcproutes::v1::{
@@ -57,6 +58,10 @@ pub trait GatewayExt: Sized {
     fn class(self, name: &str) -> Self;
     fn listener(self, name: &str, port: i32, protocol: &str) -> Self;
     /// Applies to the last listener.
+    /// Sets the hostname of the last listener.
+    fn hostname(self, hostname: &str) -> Self;
+    /// Sets `tls` on the last listener.
+    fn tls(self, tls: GatewayListenersTls) -> Self;
     fn allowed_kinds(self, kinds: &[(&str, &str)]) -> Self;
     fn allow_all_namespaces(self) -> Self;
     fn allow_selector(self, labels: &[(&str, &str)]) -> Self;
@@ -94,6 +99,16 @@ impl GatewayExt for Gateway {
             protocol: protocol.into(),
             ..Default::default()
         });
+        self
+    }
+
+    fn hostname(mut self, hostname: &str) -> Self {
+        last(&mut self).hostname = Some(hostname.into());
+        self
+    }
+
+    fn tls(mut self, tls: GatewayListenersTls) -> Self {
+        last(&mut self).tls = Some(tls);
         self
     }
 

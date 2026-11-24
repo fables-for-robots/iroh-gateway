@@ -497,6 +497,7 @@ mod tests {
             name: name.into(),
             port,
             protocol: "TCP".into(),
+            hostname: crate::model::HostMatch::Any,
             accepted: Ok(()),
             conflicted: None,
             resolved_refs: Ok(()),
