@@ -55,6 +55,7 @@ pub(super) fn routes(
     let mut attached = Vec::new();
     for (key, route) in routes {
         let (rules, resolved_refs) = translate(route, &services);
+        // Computed once; `attach` reports a refusal of it on every parent.
         let hosts = route_hosts(route);
         let mut seen = BTreeSet::new();
         // The listeners the route attaches to, through any of its parentRefs.
@@ -89,7 +90,8 @@ pub(super) fn routes(
         if parents.is_empty() {
             continue;
         }
-        // A slot means a parent was accepted, which needs the rules and the hostnames.
+        // `attach` accepts a parent only when the hostnames and the rules are both usable, so
+        // there is a slot only if they are.
         if let (Ok(rules), Ok(hosts)) = (&rules, &hosts) {
             for (g, l) in slots {
                 let listener = &mut gateways[g].listeners[l];
@@ -102,6 +104,11 @@ pub(super) fn routes(
                     rules: rules.clone(),
                 });
             }
+        } else {
+            debug_assert!(
+                slots.is_empty(),
+                "a parent was accepted with unusable content"
+            );
         }
         models.push(RouteModel {
             kind: HttpRoute::KIND,
@@ -123,24 +130,25 @@ fn attach(
     rules: &Result<Vec<HttpRouteRule>, Reject>,
 ) -> Result<Vec<usize>, Reject> {
     let mut kept = admitted(RouteKind::Http, route_ns, parent, gw, namespaces)?;
-    // A route hostname that does not parse is for the translation to report.
-    if let Ok(hosts) = hosts {
-        kept.retain(|&l| !on_listener(&gw.listeners[l].hostname, hosts).is_empty());
-        if kept.is_empty() {
-            return Err(Reject::new(
-                "NoMatchingListenerHostname",
-                format!(
-                    "no listener of gateway {} that admits the route shares a hostname with it",
-                    gw.key
-                ),
-            ));
-        }
+    // The one place a refused hostname is reported; the rules' refusal comes after.
+    let hosts = hosts.as_ref().map_err(Clone::clone)?;
+    kept.retain(|&l| !on_listener(&gw.listeners[l].hostname, hosts).is_empty());
+    if kept.is_empty() {
+        return Err(Reject::new(
+            "NoMatchingListenerHostname",
+            format!(
+                "no listener of gateway {} that admits the route shares a hostname with it",
+                gw.key
+            ),
+        ));
     }
     rules.as_ref().map_err(Clone::clone)?;
     Ok(kept)
 }
 
-/// The route's `hostnames`, parsed; `UnsupportedValue` for the first that does not parse.
+/// The route's `hostnames`, parsed; `UnsupportedValue` for the first that does not parse. An
+/// empty one is refused: for a listener `""` means every host, for a route it would widen the
+/// route to every host of the listener.
 fn route_hosts(route: &HttpRoute) -> Result<Vec<HostMatch>, Reject> {
     route
         .spec
@@ -148,6 +156,9 @@ fn route_hosts(route: &HttpRoute) -> Result<Vec<HostMatch>, Reject> {
         .iter()
         .flatten()
         .map(|h| {
+            if h.is_empty() {
+                return Err(Reject::new(UNSUPPORTED, "route hostname \"\" is empty"));
+            }
             HostMatch::parse(Some(h)).map_err(|e| Reject::new(UNSUPPORTED, format!("route {e}")))
         })
         .collect()
@@ -211,8 +222,7 @@ pub(super) fn translate(
             rule_of(rule, backends)
                 .map_err(|what| Reject::new(UNSUPPORTED, format!("rule {i}: {what}")))
         })
-        .collect::<Result<Vec<_>, _>>()
-        .and_then(|rules| route_hosts(route).map(|_| rules));
+        .collect::<Result<Vec<_>, _>>();
     (translated, resolved_refs)
 }
 
@@ -239,6 +249,31 @@ fn rule_of(rule: &HttpRouteRules, backends: Vec<Backend>) -> Result<HttpRouteRul
         let ty = filter_name(&f.r#type);
         let twice = || format!("two {ty} filters in one rule are not supported");
         let without = |field: &str| format!("a {ty} filter without {field}");
+        let own = match f.r#type {
+            HttpRouteRulesFiltersType::RequestHeaderModifier => "requestHeaderModifier",
+            HttpRouteRulesFiltersType::ResponseHeaderModifier => "responseHeaderModifier",
+            HttpRouteRulesFiltersType::RequestMirror => "requestMirror",
+            HttpRouteRulesFiltersType::RequestRedirect => "requestRedirect",
+            HttpRouteRulesFiltersType::UrlRewrite => "urlRewrite",
+            HttpRouteRulesFiltersType::ExtensionRef => "extensionRef",
+            HttpRouteRulesFiltersType::Cors => "cors",
+        };
+        // Nothing is silently ignored: a body of another type than the filter's is refused.
+        let bodies = [
+            ("requestHeaderModifier", f.request_header_modifier.is_some()),
+            (
+                "responseHeaderModifier",
+                f.response_header_modifier.is_some(),
+            ),
+            ("requestMirror", f.request_mirror.is_some()),
+            ("requestRedirect", f.request_redirect.is_some()),
+            ("urlRewrite", f.url_rewrite.is_some()),
+            ("extensionRef", f.extension_ref.is_some()),
+            ("cors", f.cors.is_some()),
+        ];
+        if let Some((stray, _)) = bodies.iter().find(|(name, set)| *set && *name != own) {
+            return Err(format!("a {ty} filter also has {stray}"));
+        }
         match f.r#type {
             HttpRouteRulesFiltersType::RequestHeaderModifier => {
                 if request_headers.is_some() {
@@ -519,7 +554,7 @@ mod tests {
         Backend, HeaderMods, HostMatch, HttpAction, HttpMatch, HttpRouteRule, ListenerModel, Model,
         ObjRef, PathMatch, Redirect, Reject, RouteKind, RouteModel, Snapshot, build, gateways,
     };
-    use super::{Attached, routes, translate};
+    use super::{Attached, route_hosts, routes, translate};
 
     // ---- helpers ----
 
@@ -1222,9 +1257,45 @@ mod tests {
         assert!(r.message.contains("rule 1"), "{}", r.message);
         // A route hostname is refused as such.
         for bad in ["*", "10.0.0.1", "a..example.com", "a\n.example.com"] {
-            let r = refusal(&base().hostname(bad));
+            let r = route_hosts(&base().hostname(bad)).expect_err("refused");
             assert_eq!(r.reason, "UnsupportedValue", "{bad:?}");
             assert!(r.message.contains("hostname"), "{}", r.message);
+        }
+    }
+
+    #[test]
+    fn filter_with_the_body_of_another_type_is_refused() {
+        use HttpRouteRulesFiltersType as T;
+        let cases = [
+            (
+                "urlRewrite",
+                HttpRouteRulesFilters {
+                    url_rewrite: Some(HttpRouteRulesFiltersUrlRewrite::default()),
+                    ..set_request_header("x-a", "1")
+                },
+            ),
+            (
+                "requestHeaderModifier",
+                HttpRouteRulesFilters {
+                    request_header_modifier: Some(
+                        HttpRouteRulesFiltersRequestHeaderModifier::default(),
+                    ),
+                    ..redirect_to_host("example.org")
+                },
+            ),
+            (
+                "requestRedirect",
+                HttpRouteRulesFilters {
+                    request_redirect: Some(HttpRouteRulesFiltersRequestRedirect::default()),
+                    ..filter(T::ResponseHeaderModifier)
+                },
+            ),
+        ];
+        for (stray, f) in cases {
+            let r = refusal(&base().rule().filter(f));
+            assert_eq!(r.reason, "UnsupportedValue", "{stray}");
+            assert!(r.message.contains("rule 1"), "{stray}: {}", r.message);
+            assert!(r.message.contains(stray), "{stray}: {}", r.message);
         }
     }
 
@@ -1494,6 +1565,38 @@ mod tests {
         assert_eq!(accepted(&m, "gw", "r"), "UnsupportedValue");
         assert_eq!(listener(&m, "web").attached_routes, 0);
         assert!(attached.is_empty());
+    }
+
+    #[test]
+    fn empty_route_hostname_refuses_the_route() {
+        for hostnames in [vec![""], vec!["a.example.com", ""]] {
+            let mut r = base().parent("public");
+            for h in &hostnames {
+                r = r.hostname(h);
+            }
+            let (m, attached) = run_http(vec![public()], vec![r]);
+            assert_eq!(accepted(&m, "gw", "r"), "UnsupportedValue", "{hostnames:?}");
+            assert_eq!(listener(&m, "web").attached_routes, 0);
+            assert!(attached.is_empty());
+        }
+    }
+
+    #[test]
+    fn route_with_a_bad_hostname_is_refused_on_every_parent() {
+        let other = gateway("gw", "other").listener("web", 8080, "HTTP");
+        let r = base().parent("public").parent("other").hostname("*");
+        let (m, attached) = run_http(vec![public(), other], vec![r]);
+        let parents = &route(&m, "gw", "r").parents;
+        assert_eq!(parents.len(), 2);
+        for p in parents {
+            assert_eq!(reason(&p.accepted), "UnsupportedValue", "{}", p.parent.name);
+        }
+        assert!(attached.is_empty());
+        assert!(
+            m.gateways
+                .iter()
+                .all(|g| g.listeners[0].attached_routes == 0)
+        );
     }
 
     #[test]
