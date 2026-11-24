@@ -70,8 +70,8 @@ enum Command {
             value_parser = clap::value_parser!(u32).range(1..=4096)
         )]
         max_udp_flows: u32,
-        /// Most UDP payload bytes per second forwarded from visitors into the tunnel; no limit
-        /// when unset.
+        /// Most UDP bytes per second sent from visitors into the tunnel, counted as each
+        /// packet's payload plus an 18-byte header per fragment; no limit when unset.
         #[arg(
             long,
             env = "IROH_GATEWAY_EDGE_UDP_RATE_LIMIT",

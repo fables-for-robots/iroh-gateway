@@ -10,7 +10,7 @@ use iroh::endpoint::Connection;
 use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions};
 use iroh_gateway_proto::control::{BindState, ListenerStatus, Protocol, Status};
 use iroh_gateway_proto::datagram::{
-    Header, Packet, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler,
+    HEADER_LEN, Header, Packet, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
@@ -504,6 +504,34 @@ async fn rate_limit_drops_what_exceeds_it() {
         }
     }
     assert!((1..=20).contains(&arrived), "{arrived} packets arrived");
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn rate_limit_counts_empty_packets() {
+    // The smallest limit: the bucket holds one largest packet with a header per fragment,
+    // 65,535 + 64 × 18 bytes, which is 3,704 empty packets of 18 bytes each.
+    const SENT: usize = 6_000;
+    const FIT: usize = (65_535 + 64 * HEADER_LEN) / HEADER_LEN + 1;
+    let (edge, mut fake, _) = start(|o| o.udp_rate_limit = Some(1)).await;
+    let p = udp_port(&mut fake).await;
+    let v = udp_visitor().await;
+    for i in 0..SENT {
+        v.send_to(&[], ("127.0.0.1", p)).await.unwrap();
+        // Paced, so that loopback buffers do not drop what the limit would let through.
+        if i % 100 == 99 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
+    let mut arrived = 0;
+    while let Ok((_, got)) = timeout(Duration::from_secs(1), recv_datagram(&fake.conn)).await {
+        assert!(got.is_empty());
+        arrived += 1;
+    }
+    assert!(
+        (1..=FIT).contains(&arrived) && arrived < SENT,
+        "{arrived} of {SENT} empty packets arrived"
+    );
     edge.shutdown().await;
 }
 

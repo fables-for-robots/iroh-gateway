@@ -53,7 +53,8 @@ pub struct EdgeOptions {
     pub max_udp_flows: usize,
     /// How long a flow lives without a packet in either direction.
     pub udp_flow_idle: Duration,
-    /// Most UDP payload bytes per second forwarded from visitors into the tunnel; None: no limit.
+    /// Most UDP bytes per second sent from visitors into the tunnel, counted as each packet's
+    /// payload plus an 18-byte header per fragment; None: no limit.
     pub udp_rate_limit: Option<u64>,
 }
 

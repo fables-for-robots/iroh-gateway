@@ -128,6 +128,19 @@ pub fn split(
         .collect())
 }
 
+/// How many bytes [`split`] turns a payload of `payload_len` bytes into at `max_datagram`: the
+/// payload plus one header per fragment, at least one. None where `split` refuses.
+pub fn wire_len(payload_len: usize, max_datagram: usize) -> Option<usize> {
+    if max_datagram <= HEADER_LEN || payload_len > MAX_PACKET {
+        return None;
+    }
+    let count = payload_len.div_ceil(max_datagram - HEADER_LEN).max(1);
+    if count > MAX_FRAGMENTS {
+        return None;
+    }
+    Some(payload_len + count * HEADER_LEN)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub listener_id: u32,
@@ -444,6 +457,29 @@ mod tests {
         assert_eq!(
             split(1, 1, 1, &vec![0; MAX_PACKET], 1200).unwrap().len(),
             56
+        );
+    }
+
+    #[test]
+    fn wire_len_is_what_split_sends() {
+        let room = 1200 - HEADER_LEN;
+        for len in [0, 1, room, room + 1, 9_000, MAX_PACKET] {
+            let sent: usize = split(1, 1, 1, &vec![0; len], 1200)
+                .unwrap()
+                .iter()
+                .map(Bytes::len)
+                .sum();
+            assert_eq!(wire_len(len, 1200), Some(sent), "{len} bytes");
+        }
+        assert_eq!(wire_len(0, 1200), Some(HEADER_LEN));
+        assert_eq!(wire_len(room + 1, 1200), Some(room + 1 + 2 * HEADER_LEN));
+        // Where split refuses.
+        assert_eq!(wire_len(10, HEADER_LEN), None);
+        assert_eq!(wire_len(MAX_PACKET + 1, 1200), None);
+        assert_eq!(wire_len(64 * 100 + 1, HEADER_LEN + 100), None);
+        assert_eq!(
+            wire_len(64 * 100, HEADER_LEN + 100),
+            Some(64 * 100 + 64 * HEADER_LEN)
         );
     }
 

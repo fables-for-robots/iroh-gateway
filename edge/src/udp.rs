@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use iroh::endpoint::Connection;
 use iroh_gateway_proto::datagram::{
-    Header, MAX_PACKET, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler, split,
+    HEADER_LEN, Header, MAX_FRAGMENTS, MAX_PACKET, REASSEMBLY_BYTES, REASSEMBLY_WINDOW,
+    Reassembler, split, wire_len,
 };
 use iroh_gateway_proto::idle::IdleMap;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
@@ -39,7 +40,8 @@ pub struct UdpHub {
 }
 
 impl UdpHub {
-    /// Panics if `max_flows` is 0.
+    /// `rate_limit` counts the UDP bytes sent into the tunnel: each visitor packet's payload
+    /// plus an 18-byte header per fragment. Panics if `max_flows` is 0.
     pub fn new(max_flows: usize, idle: Duration, rate_limit: Option<u64>) -> Arc<Self> {
         let now = now();
         Arc::new(Self {
@@ -88,7 +90,9 @@ impl UdpHub {
     }
 
     /// Forwards one visitor packet received on `port`, whose listener has `listener_id`;
-    /// replies to it go to `replies`. Drops it when it cannot be sent at once.
+    /// replies to it go to `replies`. Drops it when it cannot be sent at once, or when the
+    /// bytes it becomes in the tunnel (its payload and an 18-byte header per fragment) exceed
+    /// the rate limit.
     pub(crate) fn forward(
         &self,
         port: u16,
@@ -99,15 +103,24 @@ impl UdpHub {
     ) {
         let drops = &self.shared.drops;
         let now = now();
-        let (conn, flow_id, packet_id) = {
+        let (conn, max, flow_id, packet_id) = {
             let mut state = self.shared.lock();
             let state = &mut *state;
             let Some(conn) = state.conn.clone() else {
                 drops.no_session.hit();
                 return;
             };
+            // The size changes with the path, so it is read for every packet. A packet that
+            // cannot be split at it is dropped before it is charged or makes a flow.
+            let Some((max, wire)) = conn
+                .max_datagram_size()
+                .and_then(|max| Some((max, wire_len(payload.len(), max)?)))
+            else {
+                drops.send_error.hit();
+                return;
+            };
             if let Some(bucket) = &mut state.bucket
-                && !bucket.take(payload.len(), now)
+                && !bucket.take(wire, now)
             {
                 drops.rate_limit.hit();
                 return;
@@ -116,12 +129,7 @@ impl UdpHub {
                 state
                     .flows
                     .outgoing(port, visitor, listener_id, replies, now);
-            (conn, flow_id, packet_id)
-        };
-        // The size changes with the path, so it is read for every packet.
-        let Some(max) = conn.max_datagram_size() else {
-            drops.send_error.hit();
-            return;
+            (conn, max, flow_id, packet_id)
         };
         let Ok(datagrams) = split(listener_id, flow_id, packet_id, payload, max) else {
             drops.send_error.hit();
@@ -331,7 +339,13 @@ impl Flows {
     }
 }
 
-/// `rate` bytes per second, holding at most `max(rate, MAX_PACKET)` bytes; starts full.
+/// The largest charge of one packet: the largest payload in the most fragments.
+const MAX_WIRE_LEN: usize = MAX_PACKET + MAX_FRAGMENTS * HEADER_LEN;
+
+/// The rate limit on what visitors send into the tunnel: `rate` bytes per second, holding at
+/// most `max(rate, MAX_WIRE_LEN)` bytes so that the largest packet can pass a small limit;
+/// starts full. A packet is charged with the bytes it becomes as datagrams, its payload plus
+/// one header per fragment, so that empty and tiny packets are not free.
 struct TokenBucket {
     rate: f64,
     capacity: f64,
@@ -341,7 +355,7 @@ struct TokenBucket {
 
 impl TokenBucket {
     fn new(rate: u64, now: Instant) -> Self {
-        let capacity = rate.max(MAX_PACKET as u64) as f64;
+        let capacity = rate.max(MAX_WIRE_LEN as u64) as f64;
         Self {
             rate: rate as f64,
             capacity,
@@ -441,18 +455,27 @@ mod tests {
         mpsc::channel(REPLY_QUEUE)
     }
 
+    /// What a packet of `len` bytes is charged on a path that takes 1,200-byte datagrams.
+    fn charge(len: usize) -> usize {
+        wire_len(len, 1200).unwrap()
+    }
+
     #[test]
-    fn bucket_starts_full_refills_at_the_rate_and_drops_what_does_not_fit() {
+    fn bucket_charges_the_datagram_bytes_and_drops_what_does_not_fit() {
         let t = Instant::now();
+        assert_eq!(charge(9_000), 9_000 + 8 * HEADER_LEN);
         let mut b = TokenBucket::new(70_000, t);
         for _ in 0..7 {
-            assert!(b.take(9_000, t));
+            assert!(b.take(charge(9_000), t));
         }
-        // 7,000 left: a packet that does not fit is dropped whole and costs nothing.
-        assert!(!b.take(9_000, t));
-        assert!(b.take(7_000, t));
-        assert!(!b.take(1, t));
-        assert!(b.take(0, t));
+        let left = 70_000 - 7 * charge(9_000);
+        // A packet that does not fit is dropped whole and costs nothing.
+        assert!(!b.take(charge(9_000), t));
+        assert!(b.take(left - HEADER_LEN, t));
+        // An empty packet is charged its header, and an empty bucket refuses it.
+        assert_eq!(charge(0), HEADER_LEN);
+        assert!(b.take(charge(0), t));
+        assert!(!b.take(charge(0), t));
         // 100 ms earn 7,000 bytes.
         assert!(!b.take(7_001, t + MS(100)));
         assert!(b.take(7_000, t + MS(100)));
@@ -464,8 +487,9 @@ mod tests {
     #[test]
     fn bucket_holds_at_least_the_largest_packet() {
         let t = Instant::now();
+        assert!(charge(MAX_PACKET) <= MAX_WIRE_LEN);
         let mut b = TokenBucket::new(1_000, t);
-        assert!(b.take(MAX_PACKET, t));
+        assert!(b.take(MAX_WIRE_LEN, t));
         assert!(!b.take(1, t));
         assert!(b.take(1_000, t + MS(1_000)));
         assert!(!b.take(1, t + MS(1_000)));
