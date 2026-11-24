@@ -1029,7 +1029,18 @@ async fn file_names_that_leave_the_directory_are_refused() {
     let good = cfg(&dir, &[("a.sock", echo)]);
     let mut sup = Supervisor::start(opts(&dir), &good).await.unwrap();
     let (text, fine) = with_cert(&dir, echo, "a.pem");
-    for name in ["../x", "a/b", ".hidden", ""] {
+    // Only names of [A-Za-z0-9_.-] not starting with '.' are written: no space, line break or
+    // '#' that could mean something where a file name is written into a configuration.
+    for name in [
+        "../x",
+        "a/b",
+        ".hidden",
+        "",
+        "a b.pem",
+        "a\nb.pem",
+        "a#b.pem",
+        "x\u{e9}.pem",
+    ] {
         let bad = SecretFile {
             name: name.to_owned(),
             contents: "x".to_owned(),

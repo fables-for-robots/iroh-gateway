@@ -92,12 +92,16 @@ struct Running {
 
 impl Engine {
     /// Starts HAProxy with `initial.haproxy_cfg`, then applies `initial` as `apply` does.
-    /// `initial.files` are not written: the initial configuration must name none.
+    /// The initial configuration must name no file: start fails, before HAProxy is started,
+    /// when `initial.files` is not empty.
     pub async fn start(
         endpoint: iroh::Endpoint,
         opts: EngineOptions,
         initial: Rendered,
     ) -> anyhow::Result<Self> {
+        if !initial.files.is_empty() {
+            anyhow::bail!("the initial configuration must not name files");
+        }
         let supervisor = Supervisor::start(opts.supervisor, &initial.haproxy_cfg).await?;
         let mut engine = Self {
             endpoint,

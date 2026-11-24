@@ -585,6 +585,35 @@ async fn start_fails_and_leaves_nothing_when_haproxy_cannot_start() {
 }
 
 #[tokio::test]
+async fn start_refuses_an_initial_configuration_with_files() {
+    let w = World::new().await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let initial = with_cert(
+        &w,
+        w.plan(&[("gw", &[p])], &[at("e", "gw", &edge)]),
+        "a.pem",
+    );
+    assert_eq!(initial.files.len(), 1, "precondition");
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let err = Engine::start(endpoint, w.options(), initial)
+        .await
+        .err()
+        .expect("start succeeded with files in the initial configuration");
+    assert!(
+        format!("{err:#}").contains("the initial configuration must not name files"),
+        "{err:#}"
+    );
+    // Nothing was started: no socket, no file, and the edge never opens p.
+    assert_eq!(sockets_in(w.dir.path()), Vec::<PathBuf>::new());
+    assert!(!w.dir.path().join(CERT_DIR).join("a.pem").exists());
+    stays_refused(p, Duration::from_millis(500)).await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_reload_is_retried() {
     let w = World::new().await;
     let p = free_tcp_port();

@@ -218,8 +218,9 @@ impl Supervisor {
     ///
     /// The caller names files after their content, so that equal `cfg` means equal files: a
     /// file that exists already is not written again, and `cfg` equal to the running text
-    /// touches no file. A name that is empty, contains `/` or starts with `.` fails the call
-    /// with [`ApplyError::Io`] of kind `InvalidInput` before anything is written.
+    /// touches no file. A name that is empty, starts with `.` or has a character outside
+    /// `[A-Za-z0-9_.-]` fails the call with [`ApplyError::Io`] of kind `InvalidInput` before
+    /// anything is written.
     ///
     /// Once the outcome is known, every file in `certs/` that no configuration HAProxy runs or
     /// may run lists is removed: after a success all but `files`; after a refused validation or
@@ -483,13 +484,18 @@ impl Drop for Supervisor {
     }
 }
 
-/// Refuses a name that is empty, contains `/` or starts with `.`: one that could leave
-/// `certs/`, or clash with a temporary file.
+/// Refuses a name that is empty, starts with `.` or has a character outside `[A-Za-z0-9_.-]`:
+/// one that could leave `certs/`, clash with a temporary file, or mean something else where a
+/// configuration names it.
 fn check_names(files: &[SecretFile]) -> io::Result<()> {
-    match files
-        .iter()
-        .find(|f| f.name.is_empty() || f.name.contains('/') || f.name.starts_with('.'))
-    {
+    let bad = |name: &str| {
+        name.is_empty()
+            || name.starts_with('.')
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    };
+    match files.iter().find(|f| bad(&f.name)) {
         Some(f) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid certificate file name {:?}", f.name),
