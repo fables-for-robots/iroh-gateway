@@ -1063,14 +1063,15 @@ mod tests {
             ),
         ];
         for (label, crt_field, key_field) in cases {
-            // Either refused or accepted; when accepted, the file holds only what was checked.
-            if let Ok(c) = resolved(&crt_field, &key_field) {
-                assert!(!c.pem.contains(label), "{label}");
-                assert!(!c.pem.contains("TRUSTED CERTIFICATE"), "{label}");
-                assert!(!c.pem.contains("DSA PRIVATE KEY"), "{label}");
-                assert!(!c.pem.contains("ENCRYPTED PRIVATE KEY"), "{label}");
-                assert_eq!(c.pem, canonical(&crt, &key), "{label}");
-            }
+            // rustls skips a section of a label it does not read, so each Secret is accepted
+            // for the sections it does read, and the file holds only those.
+            let c = resolved(&crt_field, &key_field)
+                .unwrap_or_else(|r| panic!("{label}: refused: {r:?}"));
+            assert!(!c.pem.contains(label), "{label}");
+            assert!(!c.pem.contains("TRUSTED CERTIFICATE"), "{label}");
+            assert!(!c.pem.contains("DSA PRIVATE KEY"), "{label}");
+            assert!(!c.pem.contains("ENCRYPTED PRIVATE KEY"), "{label}");
+            assert_eq!(c.pem, canonical(&crt, &key), "{label}");
         }
     }
 

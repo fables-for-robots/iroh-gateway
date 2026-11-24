@@ -27,6 +27,8 @@
             pkgs.setup-envtest
             pkgs.kubectl
             pkgs.shellcheck
+            # The operator's HTTPS tests make RSA and SEC1 keys with it.
+            pkgs.openssl
           ];
         };
       });

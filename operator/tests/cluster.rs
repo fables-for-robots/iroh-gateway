@@ -1085,6 +1085,40 @@ fn https_listener(name: &str, port: u16, secret: &str) -> Value {
     })
 }
 
+/// Every condition message of Gateway gw/public and of its listeners.
+async fn gateway_messages(client: &Client) -> Vec<String> {
+    let gw: Gateway = get(client, NS, "public").await;
+    let status = gw.status.unwrap_or_default();
+    let listeners = status.listeners.unwrap_or_default();
+    status
+        .conditions
+        .unwrap_or_default()
+        .iter()
+        .chain(listeners.iter().flat_map(|l| &l.conditions))
+        .map(|c| c.message.clone())
+        .collect()
+}
+
+/// Asserts that no condition message of gw/public or its listeners contains any of `secrets`
+/// or a PEM marker.
+async fn no_secret_in_gateway_status(client: &Client, secrets: &[&str]) {
+    let messages = gateway_messages(client).await;
+    assert!(!messages.is_empty());
+    for m in &messages {
+        assert!(!m.contains("-----") && !m.contains("PRIVATE KEY"), "{m}");
+        for s in secrets {
+            assert!(!m.contains(s), "{m}");
+        }
+    }
+}
+
+/// The base64 lines of a PEM text: every line that is not a marker.
+fn pem_lines(pem: &str) -> Vec<&str> {
+    pem.lines()
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+        .collect()
+}
+
 #[tokio::test]
 #[ignore = "needs KUBEBUILDER_ASSETS"]
 async fn https_listener_follows_its_secret() {
@@ -1112,8 +1146,10 @@ async fn https_listener_follows_its_secret() {
     })
     .await;
     eventually("the HTTPS port accepts", || connects(port)).await;
+    no_secret_in_gateway_status(client, &pem_lines(&key)).await;
 
-    replace_tls(client, "site-tls", "garbage", "garbage").await;
+    let (garbage_crt, garbage_key) = ("garbage-crt-q8x2v7", "garbage-key-q8x2v7");
+    replace_tls(client, "site-tls", garbage_crt, garbage_key).await;
     eventually("HTTPS listener refused", || async {
         let l = listener(client, "web").await?;
         has_reason(
@@ -1126,6 +1162,7 @@ async fn https_listener_follows_its_secret() {
     })
     .await;
     eventually("the HTTPS port closed", || closed(port)).await;
+    no_secret_in_gateway_status(client, &[garbage_crt, garbage_key, "q8x2v7"]).await;
 
     let (crt, key) = tls_pair();
     replace_tls(client, "site-tls", &crt, &key).await;
@@ -1134,6 +1171,7 @@ async fn https_listener_follows_its_secret() {
     })
     .await;
     eventually("the HTTPS port accepts again", || connects(port)).await;
+    no_secret_in_gateway_status(client, &pem_lines(&key)).await;
     operator.stop().await;
     edge.shutdown().await;
 }

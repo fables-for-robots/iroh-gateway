@@ -1415,3 +1415,300 @@ async fn a_listener_without_certificates_does_not_break_its_port() {
     assert!(refused.is_err());
     s.shutdown().await;
 }
+
+// ---- every key form, from a Secret through the model ----
+
+/// Runs `openssl` from PATH with `args` in `dir`.
+fn openssl(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("openssl")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("this test needs `openssl` on PATH (the dev shell provides it): {e}")
+        });
+    assert!(
+        out.status.success(),
+        "openssl {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// One DER element at the start of `der`: its tag, its content, and what follows it.
+fn tlv(der: &[u8]) -> (u8, &[u8], &[u8]) {
+    let (len, at) = match der[1] {
+        n if n < 0x80 => (usize::from(n), 2),
+        0x81 => (usize::from(der[2]), 3),
+        0x82 => (usize::from(der[2]) << 8 | usize::from(der[3]), 4),
+        n => panic!("length form {n:#x}"),
+    };
+    (der[0], &der[at..at + len], &der[at + len..])
+}
+
+/// `content` as a DER element with `tag`.
+fn wrap(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    match content.len() {
+        n if n < 0x80 => out.push(n as u8),
+        n if n < 0x100 => out.extend([0x81, n as u8]),
+        n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// A SEC1 `ECPrivateKey` split around its optional `[0]` parameters: what comes before them,
+/// the parameters element if present, and what comes after.
+fn sec1_parts(sec1: &[u8]) -> (&[u8], Option<&[u8]>, &[u8]) {
+    let (tag, content, rest) = tlv(sec1);
+    assert_eq!((tag, rest.len()), (0x30, 0), "a SEC1 key");
+    let (_, _, after_version) = tlv(content);
+    let (_, _, after_key) = tlv(after_version);
+    let head = &content[..content.len() - after_key.len()];
+    if after_key[0] == 0xa0 {
+        let (_, _, tail) = tlv(after_key);
+        let params = &after_key[..after_key.len() - tail.len()];
+        (head, Some(params), tail)
+    } else {
+        (head, None, after_key)
+    }
+}
+
+/// A PEM block of `der` under `label`.
+fn pem_block(label: &str, der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines: Vec<&str> = b64
+        .as_bytes()
+        .chunks(64)
+        .map(|l| std::str::from_utf8(l).unwrap())
+        .collect();
+    format!(
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+        lines.join("\n")
+    )
+}
+
+/// The DER of the one PEM block in `pem` labelled `label`.
+fn pem_der(pem: &str, label: &str) -> Vec<u8> {
+    use base64::Engine;
+    let begin = format!("-----BEGIN {label}-----\n");
+    let start = pem
+        .find(&begin)
+        .unwrap_or_else(|| panic!("no {label} block"))
+        + begin.len();
+    let end = pem[start..].find("-----END").unwrap() + start;
+    let b64: String = pem[start..end].split_whitespace().collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap()
+}
+
+/// A snapshot of gw/public with one HTTPS listener `tls` on port 443 for `app.example.com`, its
+/// certificate in Secret gw/site-tls (`crt`, `key`), and a route of every request to `backend`.
+fn https_snapshot(
+    crt: &str,
+    key: &str,
+    backend: SocketAddr,
+) -> (
+    iroh_gateway_operator::model::Snapshot,
+    iroh_gateway_operator::model::Settings,
+) {
+    use iroh_gateway_operator::model::{Settings, Snapshot};
+    use iroh_gateway_proto::transport::Relay;
+    use k8s_openapi::ByteString;
+    use k8s_openapi::api::core::v1::Secret;
+    use serde_json::{from_value, json};
+
+    let controller = "example.com/iroh-gateway";
+    let mut secret: Secret = from_value(json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"namespace": "gw", "name": "site-tls"},
+        "type": "kubernetes.io/tls",
+    }))
+    .unwrap();
+    secret.data = Some(BTreeMap::from([
+        ("tls.crt".to_owned(), ByteString(crt.as_bytes().to_vec())),
+        ("tls.key".to_owned(), ByteString(key.as_bytes().to_vec())),
+    ]));
+    let snapshot = Snapshot {
+        gateway_classes: vec![
+            from_value(json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "GatewayClass",
+                "metadata": {"name": "ours"},
+                "spec": {"controllerName": controller},
+            }))
+            .unwrap(),
+        ],
+        gateways: vec![
+            from_value(json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "Gateway",
+                "metadata": {"namespace": "gw", "name": "public"},
+                "spec": {
+                    "gatewayClassName": "ours",
+                    "listeners": [
+                        {"name": "tls", "port": 443, "protocol": "HTTPS",
+                         "hostname": "app.example.com",
+                         "tls": {"mode": "Terminate", "certificateRefs": [{"name": "site-tls"}]}},
+                    ],
+                },
+            }))
+            .unwrap(),
+        ],
+        http_routes: vec![
+            from_value(json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "HTTPRoute",
+                "metadata": {"namespace": "gw", "name": "r"},
+                "spec": {
+                    "parentRefs": [{"name": "public"}],
+                    "rules": [{"backendRefs": [{"name": "web", "port": backend.port()}]}],
+                },
+            }))
+            .unwrap(),
+        ],
+        services: vec![
+            from_value(json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"namespace": "gw", "name": "web"},
+                "spec": {"type": "ClusterIP", "clusterIP": backend.ip().to_string(),
+                         "ports": [{"port": backend.port()}]},
+            }))
+            .unwrap(),
+        ],
+        secrets: vec![secret],
+        ..Default::default()
+    };
+    let settings = Settings {
+        controller_name: controller.into(),
+        gateway_namespaces: BTreeSet::from(["gw".to_owned()]),
+        relay: Relay::Disabled,
+    };
+    (snapshot, settings)
+}
+
+#[tokio::test]
+async fn every_key_form_the_model_accepts_loads_in_haproxy() {
+    use iroh_gateway_operator::model::build;
+
+    let a = backend("A").await;
+    let ca = Ca::new();
+    let keys = TempDir::new().unwrap();
+    let dir = keys.path();
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+    let leaf_of = |key: &KeyPair| {
+        let mut params = CertificateParams::new(vec!["app.example.com".to_owned()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.signed_by(key, &*ca.0).unwrap()
+    };
+
+    // (form, tls.crt, tls.key)
+    let mut forms: Vec<(&str, rcgen::Certificate, String)> = Vec::new();
+    for (curve, alg) in [
+        ("P-256", &rcgen::PKCS_ECDSA_P256_SHA256),
+        ("P-384", &rcgen::PKCS_ECDSA_P384_SHA384),
+    ] {
+        let key = KeyPair::generate_for(alg).unwrap();
+        let pkcs8 = key.serialize_pem();
+        let file = format!("{curve}.pem");
+        std::fs::write(dir.join(&file), &pkcs8).unwrap();
+        // OpenSSL writes SEC1 with the named curve as parameters.
+        let sec1_file = format!("{curve}.sec1.pem");
+        openssl(dir, &["ec", "-in", &file, "-out", &sec1_file]);
+        let with_params = read(&sec1_file);
+        let der = pem_der(&with_params, "EC PRIVATE KEY");
+        let (head, params, tail) = sec1_parts(&der);
+        assert!(params.is_some(), "{curve}: openssl wrote no parameters");
+        let without_params = pem_block("EC PRIVATE KEY", &wrap(0x30, &[head, tail].concat()));
+        let (pkcs8_form, with_form, without_form) = match curve {
+            "P-256" => (
+                "ECDSA P-256 PKCS#8",
+                "ECDSA P-256 SEC1 with parameters",
+                "ECDSA P-256 SEC1 without parameters",
+            ),
+            _ => (
+                "ECDSA P-384 PKCS#8",
+                "ECDSA P-384 SEC1 with parameters",
+                "ECDSA P-384 SEC1 without parameters",
+            ),
+        };
+        forms.push((pkcs8_form, leaf_of(&key), pkcs8));
+        forms.push((with_form, leaf_of(&key), with_params));
+        if curve == "P-256" {
+            forms.push((without_form, leaf_of(&key), without_params));
+        }
+    }
+    let ed25519 = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    forms.push(("Ed25519 PKCS#8", leaf_of(&ed25519), ed25519.serialize_pem()));
+    // cert-manager's default: RSA-2048 in PKCS#1.
+    openssl(
+        dir,
+        &["genrsa", "-traditional", "-out", "rsa.pkcs1.pem", "2048"],
+    );
+    openssl(
+        dir,
+        &[
+            "pkcs8",
+            "-topk8",
+            "-nocrypt",
+            "-in",
+            "rsa.pkcs1.pem",
+            "-out",
+            "rsa.pkcs8.pem",
+        ],
+    );
+    let (rsa1, rsa8) = (read("rsa.pkcs1.pem"), read("rsa.pkcs8.pem"));
+    assert!(
+        rsa1.starts_with("-----BEGIN RSA PRIVATE KEY-----"),
+        "PKCS#1"
+    );
+    assert!(rsa8.starts_with("-----BEGIN PRIVATE KEY-----"), "PKCS#8");
+    let rsa = KeyPair::from_pem_and_sign_algo(&rsa8, &rcgen::PKCS_RSA_SHA256).unwrap();
+    forms.push(("RSA-2048 PKCS#1", leaf_of(&rsa), rsa1));
+    forms.push(("RSA-2048 PKCS#8", leaf_of(&rsa), rsa8));
+    assert_eq!(forms.len(), 8);
+
+    let runtime = short_dir();
+    let empty = render(&empty_model(), runtime.path());
+    let mut sup = Supervisor::start(opts(runtime.path()), &empty.haproxy_cfg)
+        .await
+        .unwrap();
+    for (form, leaf, key) in &forms {
+        let (snapshot, settings) = https_snapshot(&leaf.pem(), key, a);
+        let m = build(&snapshot, &settings);
+        let listener = &m.gateways[0].listeners[0];
+        assert_eq!(listener.resolved_refs, Ok(()), "{form}");
+        assert_eq!(listener.certificates.len(), 1, "{form}");
+        assert!(listener.serving(), "{form}");
+        // Renders, validates and loads, or the apply panics naming HAProxy's complaint.
+        let rendered = render(&m, runtime.path());
+        let applied = sup
+            .apply(&rendered.haproxy_cfg, &rendered.files)
+            .await
+            .unwrap_or_else(|e| panic!("{form} does not load: {e}"));
+        assert_eq!(applied, Applied::Reloaded, "{form}");
+
+        let mut conn = tls(
+            runtime.path(),
+            &id(443),
+            "app.example.com",
+            &ca.root(),
+            &[b"http/1.1"],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{form}: handshake: {e}"));
+        assert_eq!(&presented(&conn), leaf.der(), "{form}");
+        assert_eq!(
+            exchange(&mut conn, &request("app.example.com", "/"))
+                .await
+                .tag(),
+            "A",
+            "{form}"
+        );
+    }
+    sup.shutdown().await;
+}
