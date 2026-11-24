@@ -55,6 +55,10 @@ pub struct PortPlan {
     /// `bind` line names its certificate list after the list's content, which names each
     /// certificate after its own, so a new certificate is a new fingerprint.
     pub fingerprint: String,
+    /// An HTTP or HTTPS port, which serves many routes and hosts; `false` for a TCP port. While
+    /// a change is applied, and after HAProxy refused one, a port that is shared in the loaded
+    /// plan and in the new one keeps forwarding to its socket whatever its fingerprint.
+    pub shared: bool,
 }
 
 pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
@@ -100,7 +104,7 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
         let per_gateway = sockets.entry(&gateway.key).or_default();
         // The port's own sections, which its fingerprint covers, after a comment that says
         // whose port it is.
-        let mut add = |port: u16, id: &str, section: String| {
+        let mut add = |port: u16, id: &str, section: String, shared: bool| {
             let _ = write!(cfg, "\n# {} port {port}\n", gateway.key);
             cfg.push_str(&section);
             let digest = hex::encode(Sha256::digest(&section));
@@ -112,6 +116,7 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
                 PortPlan {
                     socket: socket(id),
                     fingerprint: digest[..16].to_owned(),
+                    shared,
                 },
             );
         };
@@ -132,14 +137,14 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
                  backend be_{id}\n"
             );
             servers(&mut section, &listener.backends);
-            add(listener.port, &id, section);
+            add(listener.port, &id, section, false);
         }
         let mut ports: Vec<&HttpPort> = gateway.http_ports.iter().collect();
         ports.sort_by_key(|p| p.port);
         for port in ports {
             let id = port_id(&gateway.key, port.port);
             let section = http_sections(&id, &dir, port, &mut files);
-            add(port.port, &id, section);
+            add(port.port, &id, section, true);
         }
     }
 
@@ -559,6 +564,7 @@ mod tests {
                 PortPlan {
                     socket: PathBuf::from("/run/igw/s/7903a80c6832446b.sock"),
                     fingerprint: digest[..16].to_owned(),
+                    shared: false,
                 }
             )])
         );
@@ -984,6 +990,7 @@ mod tests {
                 PortPlan {
                     socket: PathBuf::from(format!("/run/igw/s/{id}.sock")),
                     fingerprint: digest[..16].to_owned(),
+                    shared: true,
                 }
             )])
         );
@@ -1412,6 +1419,7 @@ mod tests {
                 PortPlan {
                     socket: PathBuf::from(format!("/run/igw/s/{id}.sock")),
                     fingerprint: fingerprint_of(&r.haproxy_cfg, &id),
+                    shared: true,
                 }
             );
         }

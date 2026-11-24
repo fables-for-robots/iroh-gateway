@@ -123,10 +123,12 @@ impl Engine {
     /// files again.
     ///
     /// Links of edges that left the plan, or whose id or address changed, are shut down in any
-    /// case. While HAProxy reloads, each remaining link forwards only on the ports whose
-    /// [`PortPlan`] (socket and fingerprint) in the new plan is the one HAProxy last loaded.
-    /// Only when HAProxy took the configuration are links started and ports added; when it did
-    /// not, each link keeps only those unchanged ports.
+    /// case. While HAProxy reloads, each remaining link forwards only on the ports it may keep:
+    /// those whose key and socket in the new plan are the ones HAProxy last loaded, with the same
+    /// fingerprint, or [`PortPlan::shared`] (HTTP or HTTPS) in both plans. A shared port so keeps
+    /// serving the rules HAProxy last loaded; a TCP port whose backend changes is cut. Only when
+    /// HAProxy took the configuration are links started and ports added; when it did not, each
+    /// link keeps only the ports it may keep.
     ///
     /// Not meant to be cancelled, and the reconcile loop never cancels it. A cancelled call can
     /// leave the links of the edges that left the plan removed and the other links' socket
@@ -153,8 +155,9 @@ impl Engine {
             info!(edge = %key, "stopping the link");
         }
         // Until HAProxy has the new configuration, a visitor on a port that is moving or going
-        // away is refused rather than delivered to what is behind its socket now. The ports
-        // asked of the edges stay as they are until the outcome is known.
+        // away, or on a TCP port whose backend changes, is refused rather than delivered to
+        // what is behind its socket now. The ports asked of the edges stay as they are until the
+        // outcome is known.
         for plan in &rendered.edges {
             if let Some(link) = self.links.get_mut(&plan.key) {
                 link.keep_unchanged(plan);
@@ -325,8 +328,8 @@ impl Engine {
         }
     }
 
-    /// After HAProxy refused the configuration: each link keeps only the ports whose
-    /// [`PortPlan`] in the new plan is the one HAProxy last loaded; nothing is added.
+    /// After HAProxy refused the configuration: each link keeps only the ports it may keep (see
+    /// [`Engine::apply`]); nothing is added.
     fn cut_down(&mut self, plans: &[EdgePlan]) {
         for plan in plans {
             if let Some(link) = self.links.get_mut(&plan.key) {
@@ -366,15 +369,21 @@ impl Running {
         self.sockets = sockets;
     }
 
-    /// Cuts the table to the ports whose [`PortPlan`] in `plan` is the one HAProxy last loaded.
+    /// Cuts the table to the ports whose key and socket in `plan` are the ones HAProxy last
+    /// loaded, and whose fingerprint is too unless the port is shared in both plans: HAProxy's
+    /// socket for a shared port serves the rules it last loaded, which are the port's rules
+    /// until the new ones load.
     fn keep_unchanged(&mut self, plan: &EdgePlan) {
         let kept = self
             .sockets
             .iter()
             .filter(|(key, _)| {
-                plan.sockets
-                    .get(key)
-                    .is_some_and(|port| self.loaded.get(key) == Some(port))
+                let (Some(new), Some(loaded)) = (plan.sockets.get(key), self.loaded.get(key))
+                else {
+                    return false;
+                };
+                new.socket == loaded.socket
+                    && (new.fingerprint == loaded.fingerprint || (new.shared && loaded.shared))
             })
             .map(|(key, port)| (*key, port.clone()))
             .collect();
