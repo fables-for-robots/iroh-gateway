@@ -30,13 +30,17 @@ use crate::tunnel::{
 
 /// Default for [`EngineOptions::retry`].
 pub const DEFAULT_RETRY: Duration = Duration::from_secs(5);
+/// The longest the retry delay grows to: it doubles after each failed attempt, from
+/// [`EngineOptions::retry`].
+pub const MAX_RETRY: Duration = Duration::from_secs(300);
 
 pub struct EngineOptions {
     pub supervisor: SupervisorOptions,
     /// The operator's relay mode, which every link dials with.
     pub relay: Relay,
-    /// After a reload that failed with its outcome unknown, how long until [`Engine::next_event`]
-    /// asks for another pass.
+    /// After a reload that failed, how long until [`Engine::next_event`] asks for another pass.
+    /// The delay doubles after each further failure, up to [`MAX_RETRY`], and is back to this
+    /// after a success.
     pub retry: Duration,
 }
 
@@ -64,7 +68,10 @@ pub enum EngineEvent {
 pub struct Engine {
     endpoint: Endpoint,
     relay: Relay,
+    /// [`EngineOptions::retry`].
     retry: Duration,
+    /// The delay before the retry after the next failed reload.
+    retry_delay: Duration,
     supervisor: Supervisor,
     /// The result of the last HAProxy apply.
     haproxy: Result<(), String>,
@@ -107,6 +114,7 @@ impl Engine {
             endpoint,
             relay: opts.relay,
             retry: opts.retry,
+            retry_delay: opts.retry,
             supervisor,
             haproxy: Ok(()),
             links: BTreeMap::new(),
@@ -173,12 +181,19 @@ impl Engine {
             Ok(_) => {
                 self.haproxy = Ok(());
                 self.retry_at = None;
+                self.retry_delay = self.retry;
                 self.program(&rendered.edges);
             }
             Err(e) => {
                 warn!(error = %e, "haproxy did not take the configuration; adding nothing");
-                self.retry_at = matches!(e, ApplyError::ReloadFailed(_) | ApplyError::Io(_))
-                    .then(|| Instant::now() + self.retry);
+                // Each attempt can be two reloads, and HAProxy ends the connections of workers
+                // older than `mworker-max-reloads` reloads: a failure that persists must not
+                // reload often.
+                self.retry_at = None;
+                if matches!(e, ApplyError::ReloadFailed(_) | ApplyError::Io(_)) {
+                    self.retry_at = Some(Instant::now() + self.retry_delay);
+                    self.retry_delay = backed_off(self.retry_delay);
+                }
                 self.haproxy = Err(e.to_string());
                 self.cut_down(&rendered.edges);
             }
@@ -340,6 +355,11 @@ impl Engine {
     }
 }
 
+/// The retry delay after `delay`: twice as long, at most [`MAX_RETRY`].
+fn backed_off(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(MAX_RETRY)
+}
+
 /// `last_error` of a link whose task has ended although it was not shut down.
 const LINK_STOPPED: &str = "the link stopped unexpectedly";
 
@@ -419,6 +439,20 @@ async fn stop_links(links: impl IntoIterator<Item = LinkHandle>) {
 mod tests {
     use super::*;
     use crate::tunnel::ListenerState;
+
+    #[test]
+    fn retry_delay_doubles_up_to_the_maximum() {
+        let mut delay = DEFAULT_RETRY;
+        let mut seen = vec![delay];
+        while delay < MAX_RETRY {
+            delay = backed_off(delay);
+            seen.push(delay);
+        }
+        let secs: Vec<u64> = seen.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 80, 160, 300]);
+        assert_eq!(backed_off(MAX_RETRY), MAX_RETRY);
+        assert_eq!(backed_off(Duration::MAX), MAX_RETRY);
+    }
 
     #[test]
     fn a_link_whose_task_ended_is_reported_stopped() {

@@ -643,6 +643,57 @@ async fn failed_reload_is_retried() {
     engine.shutdown().await;
 }
 
+/// Applies `rendered`, which must fail, and returns how long until the engine asks for a retry.
+async fn failed_then_waited(engine: &mut Engine, rendered: Rendered) -> Duration {
+    engine.apply(rendered).await;
+    assert!(engine.facts().haproxy.is_err());
+    let failed_at = Instant::now();
+    timeout(STEP, changed(engine))
+        .await
+        .expect("no retry after a failed reload");
+    failed_at.elapsed()
+}
+
+#[tokio::test]
+async fn retry_after_failed_reloads_backs_off_and_resets() {
+    let base = Duration::from_millis(200);
+    let w = World::new().await;
+    let p = free_tcp_port();
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let mut opts = w.options();
+    opts.retry = base;
+    let mut engine = Engine::start(endpoint, opts, w.plan(&[("gw", &[p])], &[]))
+        .await
+        .unwrap();
+    let master = w.dir.path().join("master.sock");
+    let away = w.dir.path().join("master.away");
+    let q = free_tcp_port();
+    let next = || w.plan(&[("gw", &[p, q])], &[]);
+    std::fs::rename(&master, &away).unwrap();
+    let mut gaps = Vec::new();
+    for _ in 0..3 {
+        gaps.push(failed_then_waited(&mut engine, next()).await);
+    }
+    // 200 ms, 400 ms, 800 ms: each at least its due time, and each longer than the one before.
+    for (gap, due) in gaps.iter().zip([base, base * 2, base * 4]) {
+        assert!(*gap >= due - Duration::from_millis(20), "{gaps:?}");
+    }
+    assert!(gaps[0] < gaps[1] && gaps[1] < gaps[2], "{gaps:?}");
+
+    // A success resets the delay: the next failure is retried after the base delay again.
+    std::fs::rename(&away, &master).unwrap();
+    engine.apply(next()).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    std::fs::rename(&master, &away).unwrap();
+    let gap = failed_then_waited(&mut engine, w.plan(&[("gw", &[q])], &[])).await;
+    assert!(gap >= base - Duration::from_millis(20), "{gap:?}");
+    assert!(gap < base * 2, "the delay was not reset: {gap:?}");
+    std::fs::rename(&away, &master).unwrap();
+    engine.shutdown().await;
+}
+
 /// `rendered` with a frontend that binds `<dir>/s/tls.sock` with `ssl crt <dir>/certs/<name>`,
 /// and the file that line names.
 fn with_cert(w: &World, mut rendered: Rendered, name: &str) -> Rendered {
