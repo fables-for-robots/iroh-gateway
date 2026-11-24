@@ -103,6 +103,23 @@ async fn visit(dir: &TempDir, name: &str) -> UnixStream {
     s
 }
 
+/// [`visit`], retrying a refused connection for up to `within`: right after a reload the socket
+/// can refuse for a moment. A refusal that lasts longer fails.
+async fn visit_within(dir: &TempDir, name: &str, within: Duration) -> UnixStream {
+    let path = dir.path().join("s").join(name);
+    let deadline = Instant::now() + within;
+    let mut s = loop {
+        match timeout(STEP, UnixStream::connect(&path)).await.unwrap() {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(20)).await,
+            Err(e) => panic!("connecting to {}: {e}", path.display()),
+        }
+    };
+    let header = proxyv2::header(VISITOR.parse().unwrap(), LOCAL.parse().unwrap());
+    s.write_all(&header).await.unwrap();
+    s
+}
+
 async fn read_exact(s: &mut UnixStream, n: usize) -> Vec<u8> {
     let mut buf = vec![0; n];
     timeout(STEP, s.read_exact(&mut buf))
@@ -319,9 +336,29 @@ async fn failed_reload_restores_the_previous_config() {
         std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
         good
     );
-    let mut s = visit(&dir, "a.sock").await;
+    let mut s = visit_within(&dir, "a.sock", Duration::from_secs(2)).await;
     echoes(&mut s, b"hi").await;
     drop(s);
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_failed_reloads_in_a_row_keep_the_sockets_serving() {
+    let echo = echo_backend(b"").await;
+    let dir = short_dir();
+    let good = cfg(&dir, &[("a.sock", echo)]);
+    let mut sup = Supervisor::start(opts(&dir), &good).await.unwrap();
+    for attempt in 1..=3 {
+        match sup.apply(&fails_to_load(&dir, &good), &[]).await {
+            Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("Success=0"), "{attempt}: {m}"),
+            other => panic!("{attempt}: expected ReloadFailed, got {other:?}"),
+        }
+        let mut s = visit_within(&dir, "a.sock", Duration::from_secs(2)).await;
+        echoes(&mut s, b"hi").await;
+        drop(s);
+    }
+    // The previous configuration is known to run.
+    assert_eq!(sup.apply(&good, &[]).await.unwrap(), Applied::Unchanged);
     sup.shutdown().await;
 }
 
@@ -587,6 +624,15 @@ async fn start_times_out_when_the_master_never_answers() {
 /// Plays the master for the fake once it has started: answers the readiness probe, and takes
 /// each `reload` without ever replying. The counter is the number of `reload` requests.
 fn fake_master(dir: &TempDir) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    fake_master_replying(dir, &[])
+}
+
+/// [`fake_master`], answering the first `reload`s with `replies`, in order, and closing; the
+/// ones after them get no reply.
+fn fake_master_replying(
+    dir: &TempDir,
+    replies: &'static [&'static str],
+) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let master = dir.path().join("master.sock");
     let marker = dir.path().join("haproxy.cfg.pid");
     let reloads = Arc::new(AtomicUsize::new(0));
@@ -608,8 +654,11 @@ fn fake_master(dir: &TempDir) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>)
                 line.push(b[0]);
             }
             if line == b"reload" {
-                counter.fetch_add(1, Ordering::SeqCst);
-                held.push(s);
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                match replies.get(n) {
+                    Some(reply) => s.write_all(reply.as_bytes()).await.unwrap(),
+                    None => held.push(s),
+                }
             } else {
                 s.write_all(b"Name: fake\n").await.unwrap();
             }
@@ -638,6 +687,143 @@ async fn reload_without_a_reply_times_out_and_restores() {
         std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
         "global\n"
     );
+    server.abort();
+    sup.shutdown().await;
+    gone(&[pid]).await;
+}
+
+/// A supervisor of the fake haproxy and master answering `replies`, started with `global\n`.
+async fn faked(
+    dir: &TempDir,
+    replies: &'static [&'static str],
+) -> (
+    Supervisor,
+    tokio::task::JoinHandle<()>,
+    Arc<AtomicUsize>,
+    i32,
+) {
+    let mut o = opts(dir);
+    o.haproxy_bin = fake_haproxy(dir);
+    o.reload_timeout = Duration::from_millis(300);
+    let (server, reloads) = fake_master_replying(dir, replies);
+    let sup = Supervisor::start(o, "global\n").await.unwrap();
+    let pid = fake_pid(dir).await;
+    (sup, server, reloads, pid)
+}
+
+fn secret_file(name: &str) -> SecretFile {
+    SecretFile {
+        name: name.to_owned(),
+        contents: format!("contents of {name}\n"),
+    }
+}
+
+#[tokio::test]
+async fn refused_reload_reloads_the_previous_configuration_once() {
+    let dir = short_dir();
+    let (mut sup, server, reloads, pid) =
+        faked(&dir, &["Success=0\n--\nfailed\n", "Success=1\n--\n"]).await;
+    match sup
+        .apply("global\n    maxconn 10\n", &[secret_file("a.pem")])
+        .await
+    {
+        Err(ApplyError::ReloadFailed(m)) => {
+            assert!(m.contains("Success=0"), "{m}");
+            assert!(!m.contains("afterwards"), "{m}");
+        }
+        other => panic!("expected ReloadFailed, got {other:?}"),
+    }
+    // The new configuration, then the previous one again.
+    assert_eq!(reloads.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
+        "global\n"
+    );
+    // The previous configuration is known to run, and the new one's file is gone.
+    assert!(cert_files(&dir).is_empty());
+    assert_eq!(
+        sup.apply("global\n", &[]).await.unwrap(),
+        Applied::Unchanged
+    );
+    assert_eq!(reloads.load(Ordering::SeqCst), 2);
+    server.abort();
+    sup.shutdown().await;
+    gone(&[pid]).await;
+}
+
+#[tokio::test]
+async fn failed_reload_of_the_previous_configuration_leaves_the_outcome_unknown() {
+    // The second reload refused too, or unanswered.
+    for (replies, second) in [
+        (&["Success=0\n", "Success=0\n--\nagain\n"][..], "again"),
+        (&["Success=0\n"][..], "timed out"),
+    ] {
+        let dir = short_dir();
+        let (mut sup, server, reloads, pid) = faked(&dir, replies).await;
+        match sup
+            .apply("global\n    maxconn 10\n", &[secret_file("a.pem")])
+            .await
+        {
+            Err(ApplyError::ReloadFailed(m)) => {
+                assert!(m.starts_with("Success=0"), "{m}");
+                assert!(
+                    m.contains("reloading the previous configuration afterwards failed"),
+                    "{m}"
+                );
+                assert!(m.contains(second), "{m}");
+            }
+            other => panic!("expected ReloadFailed, got {other:?}"),
+        }
+        assert_eq!(reloads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
+            "global\n"
+        );
+        // Kept as for an unknown outcome.
+        assert_eq!(cert_files(&dir), ["a.pem"]);
+        // Not known to run: the previous text is reloaded again.
+        match sup.apply("global\n", &[]).await {
+            Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
+            other => panic!("expected another reload attempt, got {other:?}"),
+        }
+        assert_eq!(reloads.load(Ordering::SeqCst), 3);
+        server.abort();
+        sup.shutdown().await;
+        gone(&[pid]).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_reload_of_the_previous_configuration_leaves_the_outcome_unknown() {
+    let dir = short_dir();
+    let (mut sup, server, reloads, pid) = faked(&dir, &["Success=0\n"]).await;
+    let files = [secret_file("a.pem")];
+    {
+        let fut = sup.apply("global\n    maxconn 10\n", &files);
+        tokio::pin!(fut);
+        let deadline = Instant::now() + STEP;
+        // Until the second reload, of the previous configuration, is in flight.
+        while reloads.load(Ordering::SeqCst) < 2 {
+            tokio::select! {
+                r = &mut fut => panic!("apply finished before it could be cancelled: {r:?}"),
+                _ = sleep(Duration::from_millis(1)) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the second reload was never sent"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("haproxy.cfg")).unwrap(),
+        "global\n"
+    );
+    assert_eq!(cert_files(&dir), ["a.pem"]);
+    match sup.apply("global\n", &[]).await {
+        Err(ApplyError::ReloadFailed(m)) => assert!(m.contains("timed out"), "{m}"),
+        other => panic!("expected another reload attempt, got {other:?}"),
+    }
+    assert_eq!(reloads.load(Ordering::SeqCst), 3);
     server.abort();
     sup.shutdown().await;
     gone(&[pid]).await;

@@ -222,16 +222,27 @@ impl Supervisor {
     /// `[A-Za-z0-9_.-]` fails the call with [`ApplyError::Io`] of kind `InvalidInput` before
     /// anything is written.
     ///
+    /// When the master answers `Success=0`, the previous configuration is written back and
+    /// reloaded once before the error is returned: after a failed reload HAProxy's master
+    /// re-executes without its listening sockets on the next failure, so two failures in a row
+    /// would leave every socket refusing connections; a successful reload in between prevents
+    /// that. If that second reload does not answer `Success=1` either, the running
+    /// configuration is unknown and the error names both failures.
+    ///
     /// Once the outcome is known, every file in `certs/` that no configuration HAProxy runs or
     /// may run lists is removed: after a success all but `files`; after a refused validation or
-    /// a reload that certainly failed, all but those of the loaded configuration (and of any
+    /// a reload that certainly failed (and, after `Success=0`, a successful reload of the
+    /// previous configuration), all but those of the loaded configuration (and of any
     /// configuration since whose reload outcome is still unknown); after a reload whose outcome
     /// is unknown, nothing.
     ///
-    /// Cancelling it, a timeout, or a broken connection during the reload leaves the running
+    /// Cancelling it, a timeout, or a broken connection during either reload leaves the running
     /// configuration unknown; the next call then reloads whatever text it is given. A cancelled
     /// call removes no file a configuration HAProxy may run lists; files it wrote for `cfg`
-    /// stay until a later call removes them.
+    /// stay until a later call removes them. A call cancelled while it reloads the previous
+    /// configuration leaves `haproxy.cfg` holding that configuration, and the master may not
+    /// have had the successful reload yet: if the next call's configuration fails to load as
+    /// well, that is two failures in a row. [`crate::engine::Engine`] never cancels it.
     pub async fn apply(&mut self, cfg: &str, files: &[SecretFile]) -> Result<Applied, ApplyError> {
         check_names(files)?;
         if self.current.as_deref() == Some(cfg) {
@@ -260,31 +271,28 @@ impl Supervisor {
             self.remove_unlisted();
             return Err(e.into());
         }
-        // Whether the master certainly did not load `cfg`: then `previous` still runs.
-        let (failure, not_loaded) = match timeout(self.opts.reload_timeout, self.reload()).await {
-            Ok(Ok(reply)) if reply.starts_with("Success=1") => {
-                self.current = Some(cfg.to_owned());
-                self.loaded = cfg.to_owned();
-                self.in_use = files.iter().map(|f| f.name.clone()).collect();
-                self.remove_unlisted();
-                info!("haproxy reloaded");
-                return Ok(Applied::Reloaded);
-            }
-            Ok(Ok(reply)) => {
-                // A complete reply; anything but `Success=0` is not one we understand.
-                let definite = reply.starts_with("Success=0");
-                (ApplyError::ReloadFailed(reply), definite)
-            }
-            Ok(Err(ReloadError::Connect(e))) => (ApplyError::Io(e), true),
-            Ok(Err(ReloadError::Exchange(e))) => (ApplyError::Io(e), false),
-            Err(_) => (
-                ApplyError::ReloadFailed(format!(
-                    "timed out: no complete reply to reload within {:?}",
-                    self.opts.reload_timeout
-                )),
-                false,
-            ),
-        };
+        // Whether the master certainly did not load `cfg`: then `previous` still runs. Whether
+        // it said so with `Success=0`: then it has had a failed reload.
+        let (failure, not_loaded, refused) =
+            match timeout(self.opts.reload_timeout, self.reload()).await {
+                Ok(Ok(reply)) if reply.starts_with("Success=1") => {
+                    self.current = Some(cfg.to_owned());
+                    self.loaded = cfg.to_owned();
+                    self.in_use = files.iter().map(|f| f.name.clone()).collect();
+                    self.remove_unlisted();
+                    info!("haproxy reloaded");
+                    return Ok(Applied::Reloaded);
+                }
+                Ok(Ok(reply)) => {
+                    // A complete reply; anything but `Success=0` is not one we understand.
+                    let definite = reply.starts_with("Success=0");
+                    (ApplyError::ReloadFailed(reply), definite, definite)
+                }
+                // Nothing was sent: the master saw no reload at all.
+                Ok(Err(ReloadError::Connect(e))) => (ApplyError::Io(e), true, false),
+                Ok(Err(ReloadError::Exchange(e))) => (ApplyError::Io(e), false, false),
+                Err(_) => (ApplyError::ReloadFailed(self.timed_out()), false, false),
+            };
         if not_loaded {
             self.current = previous;
         }
@@ -308,11 +316,52 @@ impl Supervisor {
                 ),
             )));
         }
+        if refused {
+            // After a failed reload the master re-executes without its listening sockets on
+            // the next failure (it passes them on with `-x` only after a success), so that every
+            // socket would stop answering. A successful reload of the restored configuration
+            // re-arms it.
+            //
+            // Unknown until the reply, so that a cancelled call leaves it unknown; `files` stay
+            // in use until then. Whatever the master does, `haproxy.cfg` is `loaded` now.
+            self.current = None;
+            match timeout(self.opts.reload_timeout, self.reload()).await {
+                Ok(Ok(reply)) if reply.starts_with("Success=1") => {
+                    self.current = Some(self.loaded.clone());
+                    info!("haproxy reloaded the previous configuration");
+                }
+                second => {
+                    let second = match second {
+                        Ok(Ok(reply)) => reply,
+                        Ok(Err(ReloadError::Connect(e) | ReloadError::Exchange(e))) => {
+                            e.to_string()
+                        }
+                        Err(_) => self.timed_out(),
+                    };
+                    warn!(error = %second, "reloading the previous configuration failed");
+                    // `refused` is set only for a `Success=0` reply.
+                    let first = match failure {
+                        ApplyError::ReloadFailed(reply) => reply,
+                        other => other.to_string(),
+                    };
+                    return Err(ApplyError::ReloadFailed(format!(
+                        "{first}\nand reloading the previous configuration afterwards failed:\n{second}"
+                    )));
+                }
+            }
+        }
         if not_loaded {
             self.in_use = previous_in_use;
             self.remove_unlisted();
         }
         Err(failure)
+    }
+
+    fn timed_out(&self) -> String {
+        format!(
+            "timed out: no complete reply to reload within {:?}",
+            self.opts.reload_timeout
+        )
     }
 
     /// Resolves when the HAProxy master process ends on its own.
