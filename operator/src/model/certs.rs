@@ -10,6 +10,7 @@ use k8s_openapi::api::core::v1::Secret;
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::ParsedCertificate;
 use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 
@@ -160,6 +161,16 @@ fn certificate(key: ObjRef, secret: &Secret) -> Result<Certificate, Reject> {
     {
         return Err(refuse("tls.crt holds a private key"));
     }
+    // Every element, not only the end entity: HAProxy refuses the whole configuration over a
+    // chain element it cannot read. The parse error is never formatted.
+    for (n, c) in chain.iter().enumerate() {
+        if ParsedCertificate::try_from(c).is_err() {
+            return Err(refuse(&format!(
+                "certificate {} in tls.crt cannot be read",
+                n + 1
+            )));
+        }
+    }
     let mut keys = PrivateKeyDer::pem_slice_iter(tls_key.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| refuse("tls.key is not valid PEM"))?;
@@ -185,7 +196,7 @@ fn certificate(key: ObjRef, secret: &Secret) -> Result<Certificate, Reject> {
         Err(rustls::Error::InconsistentKeys(_)) => {
             return Err(refuse("the private key does not match the certificate"));
         }
-        Err(_) => return Err(refuse("the first certificate in tls.crt cannot be read")),
+        Err(_) => return Err(refuse("certificate 1 in tls.crt cannot be read")),
     }
 
     Ok(Certificate {
@@ -571,11 +582,7 @@ mod tests {
             (&crt, "not a key", one_key),
             (&crt, &crt, one_key),
             // Well-formed PEM around something that is no certificate.
-            (
-                junk_crt,
-                &key,
-                "the first certificate in tls.crt cannot be read",
-            ),
+            (junk_crt, &key, "certificate 1 in tls.crt cannot be read"),
         ] {
             let r = refusal(
                 https("public", &["site-tls"]),
@@ -597,6 +604,35 @@ mod tests {
                 format!("secret gw/site-tls: {field} is not UTF-8")
             );
         }
+    }
+
+    #[test]
+    fn chain_element_that_is_not_a_certificate_is_invalid() {
+        let (leaf, key) = self_signed();
+        let (second, _) = self_signed_with(&rcgen::PKCS_ECDSA_P384_SHA384);
+        let junk: Vec<u8> = std::iter::repeat_with(|| fastrand::u8(..))
+            .take(300)
+            .collect();
+        let junk = block("CERTIFICATE", &junk);
+        for (crt, n) in [
+            (format!("{leaf}{junk}"), 2),
+            (format!("{leaf}{second}{junk}"), 3),
+            (format!("{leaf}{junk}{second}"), 2),
+            (format!("{junk}{leaf}"), 1),
+        ] {
+            let r = refusal(
+                https("public", &["site-tls"]),
+                vec![tls_secret(NS, "site-tls", &crt, &key)],
+            );
+            invalid(&r);
+            assert_eq!(
+                r.message,
+                format!("secret gw/site-tls: certificate {n} in tls.crt cannot be read")
+            );
+        }
+        // A good chain of three still passes.
+        let c = resolved(&format!("{leaf}{second}{leaf}"), &key).expect("accepted");
+        assert_eq!(c.pem.matches("-----BEGIN CERTIFICATE-----").count(), 3);
     }
 
     #[test]
