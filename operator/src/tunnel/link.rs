@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,7 +33,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::connector::Connector;
-use super::udp::{self, UdpTargets};
+use super::udp::{self, IssuedIds, UdpTargets};
 
 /// How long an incoming stream may take to deliver its `StreamHeader`.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,6 +169,7 @@ impl EdgeLink {
             generation: 0,
             ids: HashMap::new(),
             next_id: 1,
+            issued: Arc::new(AtomicU32::new(1)),
             backend_errors: Arc::default(),
         };
         let task = tokio::spawn(link.run(shutdown_rx).instrument(span));
@@ -220,6 +222,9 @@ struct Link<C> {
     /// as long as the link runs, so on no connection does one id ever stand for two keys.
     ids: HashMap<ListenerKey, u32>,
     next_id: u32,
+    /// The highest `next_id` so far, for the UDP forwarders to tell an id of an earlier config
+    /// from one the link never issued.
+    issued: IssuedIds,
     backend_errors: BackendErrors,
 }
 
@@ -378,6 +383,7 @@ impl<C: Connector> Link<C> {
             udp::forward(
                 conn.clone(),
                 routes.subscribe(),
+                self.issued.clone(),
                 self.udp.clone(),
                 self.opts.udp_max_flows,
                 self.opts.udp_flow_idle,
@@ -610,6 +616,8 @@ impl<C: Connector> Link<C> {
                 port: key.port,
             });
         }
+        // Before the routes: a forwarder that misses an id there knows it was issued.
+        self.issued.fetch_max(self.next_id, Ordering::Release);
         self.generation += 1;
         let cfg = Config {
             generation: self.generation,

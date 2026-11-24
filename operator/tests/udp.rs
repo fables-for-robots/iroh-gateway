@@ -109,6 +109,17 @@ fn target(socket: &UdpSocket, weight: u32) -> UdpTarget {
     }
 }
 
+/// A free UDP port below every ephemeral range (Linux 32768.., macOS 49152..), so no socket bound
+/// to port 0 meanwhile, such as another test's flow socket, can take it before the test binds it.
+fn unassigned_udp_port() -> u16 {
+    loop {
+        let port = fastrand::u16(20_000..30_000);
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
 fn next_packet_id() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -178,13 +189,39 @@ async fn deliver_after(
     backend: &UdpSocket,
 ) -> SocketAddr {
     let forbidden: Vec<&[u8]> = bad.iter().map(|&(_, _, p)| p).collect();
+    let send_bad = || {
+        for &(id, flow, p) in bad {
+            send_packet(conn, id, flow, next_packet_id(), p);
+        }
+    };
+    deliver_after_with(
+        conn,
+        send_bad,
+        &forbidden,
+        listener_id,
+        flow_id,
+        payload,
+        backend,
+    )
+    .await
+}
+
+/// [`deliver_after`] with `send_bad` called before each attempt; panics if one of `forbidden`
+/// reaches `backend`.
+async fn deliver_after_with(
+    conn: &Connection,
+    send_bad: impl Fn(),
+    forbidden: &[&[u8]],
+    listener_id: u32,
+    flow_id: u64,
+    payload: &[u8],
+    backend: &UdpSocket,
+) -> SocketAddr {
     timeout(STEP, async {
         loop {
-            for &(id, flow, p) in bad {
-                send_packet(conn, id, flow, next_packet_id(), p);
-            }
+            send_bad();
             send_packet(conn, listener_id, flow_id, next_packet_id(), payload);
-            if let Some(from) = arrival(backend, payload, &forbidden, RESEND).await {
+            if let Some(from) = arrival(backend, payload, forbidden, RESEND).await {
                 return from;
             }
         }
@@ -417,9 +454,16 @@ async fn target_of_weight_zero_gets_nothing_and_no_target_drops() {
         }
         table
     };
+    // A flow on A ends when A's weight drops to 0: its next packet goes to B, and only B.
+    t.udp.send(table(vec![target(&a, 1)])).unwrap();
+    let on_a = deliver(t.conn(), p, 50, b"to a", &a).await;
     t.udp
         .send(table(vec![target(&a, 0), target(&b, 1)]))
         .unwrap();
+    closed(on_a).await;
+    deliver(t.conn(), p, 50, b"to b", &b).await;
+    nothing_arrives(&a, &[b"to b"]).await;
+
     let payloads: Vec<Vec<u8>> = (1..=20).map(|i| format!("flow {i}").into_bytes()).collect();
     for (flow, payload) in (1..).zip(&payloads) {
         deliver(t.conn(), p, flow, payload, &b).await;
@@ -497,6 +541,24 @@ async fn malformed_datagrams_do_not_end_the_session() {
     let t = setup(&[], &[5300], &[(5300, addr(&a))], |_| {}).await;
     let id = t.id(udp(5300));
     let conn = t.conn();
+    // Incomplete packets of 60,000 bytes, each missing its last fragment: about 11.8 MB, far
+    // more than the 4 MiB reassembly budget holds. Each datagram waits for room in the send
+    // buffer, so none is dropped before it leaves.
+    let max = conn.max_datagram_size().unwrap();
+    let sent_before = conn.stats().frame_tx.datagram;
+    for i in 0..200u32 {
+        let datagrams = split(id, 1, next_packet_id(), &vec![i as u8; 60_000], max).unwrap();
+        for datagram in &datagrams[..datagrams.len() - 1] {
+            conn.send_datagram_wait(datagram.clone()).await.unwrap();
+        }
+    }
+    let sent = conn.stats().frame_tx.datagram - sent_before;
+    let sent_bytes = sent as usize * (max - HEADER_LEN);
+    assert!(
+        sent_bytes > 2 * REASSEMBLY_BYTES,
+        "only {sent} datagrams ({sent_bytes} bytes) left"
+    );
+    // Then the malformed datagrams, sent again ahead of each canary until one arrives.
     let header = |index, count| {
         let h = Header {
             listener_id: id,
@@ -509,22 +571,14 @@ async fn malformed_datagrams_do_not_end_the_session() {
         d.extend_from_slice(b"bad");
         Bytes::from(d)
     };
-    conn.send_datagram(Bytes::from_static(&[1, 2, 3, 4, 5]))
-        .unwrap();
-    for (index, count) in [(0, 0), (0, 65), (3, 2)] {
-        conn.send_datagram(header(index, count)).unwrap();
-    }
-    // Incomplete packets of 60,000 bytes, each missing its last fragment: far more than the
-    // reassembly budget holds.
-    let max = conn.max_datagram_size().unwrap();
-    for i in 0..200u32 {
-        let datagrams = split(id, 1, next_packet_id(), &vec![i as u8; 60_000], max).unwrap();
-        for datagram in &datagrams[..datagrams.len() - 1] {
-            // A full send buffer drops the oldest; what arrives is enough.
-            let _ = conn.send_datagram(datagram.clone());
+    let send_bad = || {
+        conn.send_datagram(Bytes::from_static(&[1, 2, 3, 4, 5]))
+            .unwrap();
+        for (index, count) in [(0, 0), (0, 65), (3, 2)] {
+            conn.send_datagram(header(index, count)).unwrap();
         }
-    }
-    deliver(conn, id, 2, b"after", &a).await;
+    };
+    deliver_after_with(conn, send_bad, &[b"bad"], id, 2, b"after", &a).await;
     t.assert_up();
     t.shutdown().await;
 }
@@ -532,7 +586,7 @@ async fn malformed_datagrams_do_not_end_the_session() {
 #[tokio::test]
 async fn a_backend_that_is_not_listening_disturbs_no_other_flow() {
     let a = backend().await;
-    let dead: SocketAddr = format!("127.0.0.1:{}", free_udp_port()).parse().unwrap();
+    let dead = SocketAddr::from(([127, 0, 0, 1], unassigned_udp_port()));
     let t = setup(
         &[],
         &[5300, 5301],

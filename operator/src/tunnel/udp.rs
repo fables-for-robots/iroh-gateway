@@ -2,14 +2,14 @@
 //! flow a connected socket towards a target its listener's table picks by weight. Replies go back
 //! under the flow's listener id and flow id.
 //!
-//! A flow lasts while its listener id is in the session's routes, its target is listed for that
-//! listener and packets pass in either direction; whatever ends it closes its socket, so no
+//! A flow lasts while its listener id is in the session's routes, its target is listed with a
+//! weight above 0 for that listener and packets pass in either direction; whatever ends it closes its socket, so no
 //! reply of an old backend reaches a visitor afterwards.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,10 @@ pub struct UdpTarget {
 }
 
 /// Where the packets of each UDP listener go. Keys have `Protocol::Udp`.
+///
+/// A new flow goes to a target picked by weight; a flow ends as soon as its target is no longer
+/// listed with a weight above 0 for its listener (a weight-0 target gets no traffic, and UDP has
+/// nothing to drain).
 pub type UdpTargets = HashMap<ListenerKey, Vec<UdpTarget>>;
 
 /// The target `roll` falls on when the weights are laid end to end; `roll` is taken modulo the
@@ -57,6 +61,31 @@ pub fn pick(targets: &[UdpTarget], roll: u64) -> Option<SocketAddr> {
 /// Listener id → key, as the session's last `Config` sent has them.
 pub(crate) type Routes = HashMap<u32, ListenerKey>;
 
+/// One above the highest listener id the link has issued. A link never reuses an id, so every
+/// id from 1 up to below it was in some `Config` of the link.
+pub(crate) type IssuedIds = Arc<AtomicU32>;
+
+/// Why a datagram's listener id leads to no UDP listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// An id of an earlier config: the edge had not applied the new one yet.
+    Retired,
+    /// An id the link never issued: the edge is broken.
+    NeverIssued,
+    /// A TCP listener's id: the edge is broken.
+    NotUdp,
+}
+
+/// The UDP listener a datagram under `listener_id` is for; `issued` as [`IssuedIds`] holds.
+fn udp_listener(routes: &Routes, issued: u32, listener_id: u32) -> Result<ListenerKey, Refused> {
+    match routes.get(&listener_id) {
+        Some(key) if key.protocol == Protocol::Udp => Ok(*key),
+        Some(_) => Err(Refused::NotUdp),
+        None if (1..issued).contains(&listener_id) => Err(Refused::Retired),
+        None => Err(Refused::NeverIssued),
+    }
+}
+
 /// How often idle flows are looked for.
 const EXPIRE_EVERY: Duration = Duration::from_secs(1);
 
@@ -67,12 +96,14 @@ const EXPIRE_EVERY: Duration = Duration::from_secs(1);
 pub(crate) async fn forward(
     conn: Connection,
     mut routes: watch::Receiver<Routes>,
+    issued: IssuedIds,
     mut targets: watch::Receiver<UdpTargets>,
     max_flows: usize,
     idle: Duration,
 ) {
     let shared = Arc::new(Shared {
         conn,
+        issued,
         flows: Mutex::new(IdleMap::new(max_flows.max(1), idle)),
         buffer: Mutex::new(vec![0; MAX_PACKET].into_boxed_slice()),
         drops: Drops::default(),
@@ -101,7 +132,7 @@ pub(crate) async fn forward(
                 forwarder.close_where(|flow| {
                     !targets
                         .get(&flow.key)
-                        .is_some_and(|ts| ts.iter().any(|t| t.addr == flow.target))
+                        .is_some_and(|ts| ts.iter().any(|t| t.addr == flow.target && t.weight > 0))
                 });
             }
             _ = expiry.tick() => forwarder.expire(),
@@ -123,6 +154,7 @@ pub(crate) async fn forward(
 /// What the forwarder and its flows' tasks share.
 struct Shared {
     conn: Connection,
+    issued: IssuedIds,
     flows: Mutex<IdleMap<u64, Flow>>,
     /// Receives the replies of every flow; held only for one `try_recv` and its split.
     buffer: Mutex<Box<[u8]>>,
@@ -187,16 +219,18 @@ impl Forwarder {
             drops.bad_datagram.hit();
             return;
         };
-        let key = match routes.get(&header.listener_id) {
-            None => {
-                drops.unknown_listener.hit();
+        let issued = self.shared.issued.load(Ordering::Acquire);
+        let key = match udp_listener(routes, issued, header.listener_id) {
+            Ok(key) => key,
+            Err(refused) => {
+                let counter = match refused {
+                    Refused::Retired => &drops.retired_listener,
+                    Refused::NeverIssued => &drops.unknown_listener,
+                    Refused::NotUdp => &drops.not_udp,
+                };
+                counter.hit();
                 return;
             }
-            Some(key) if key.protocol != Protocol::Udp => {
-                drops.not_udp.hit();
-                return;
-            }
-            Some(key) => *key,
         };
         if let Some(packet) = self.reassembler.push(header, payload, now()) {
             self.send(key, packet, targets);
@@ -247,7 +281,9 @@ impl Forwarder {
                     listener_id: packet.listener_id,
                     target,
                     socket: socket.clone(),
-                    next_packet: 0,
+                    // Not 0: a reply of an earlier flow with this id must not share packet
+                    // ids with this flow's, or the edge could join fragments of the two.
+                    next_packet: fastrand::u32(..),
                     seq,
                     task,
                 };
@@ -323,8 +359,12 @@ fn connect(target: SocketAddr) -> io::Result<UdpSocket> {
 /// Dropped packets, per reason.
 struct Drops {
     bad_datagram: Counter,
-    /// A listener id the session's routes do not have: the edge is broken.
+    /// A listener id of an earlier config, during the round trip before the edge applies a new
+    /// one.
+    retired_listener: Counter,
+    /// A listener id the link never issued: the edge is broken.
     unknown_listener: Counter,
+    /// A TCP listener's id: the edge is broken.
     not_udp: Counter,
     /// A known flow id under another listener id.
     wrong_listener: Counter,
@@ -339,8 +379,11 @@ impl Default for Drops {
     fn default() -> Self {
         Self {
             bad_datagram: Counter::new("bad datagram"),
-            unknown_listener: Counter::warning("listener id not in the config; the edge is broken"),
-            not_udp: Counter::new("not a udp listener"),
+            retired_listener: Counter::new("listener id of an earlier config"),
+            unknown_listener: Counter::warning(
+                "listener id the operator never issued; the edge is broken",
+            ),
+            not_udp: Counter::warning("datagram for a tcp listener; the edge is broken"),
             wrong_listener: Counter::new("known flow under another listener id"),
             no_target: Counter::new("no target"),
             socket_error: Counter::new("backend socket error"),
@@ -407,6 +450,30 @@ mod tests {
             addr: addr.parse().unwrap(),
             weight,
         }
+    }
+
+    #[test]
+    fn listener_ids_are_told_apart() {
+        let key = |protocol, port| ListenerKey { protocol, port };
+        let routes: Routes = [(3, key(Protocol::Udp, 53)), (4, key(Protocol::Tcp, 53))]
+            .into_iter()
+            .collect();
+        // Ids 1 to 5 were issued; 1, 2 and 5 are retired.
+        let issued = 6;
+        let got = |id| udp_listener(&routes, issued, id);
+        assert_eq!(got(3), Ok(key(Protocol::Udp, 53)));
+        assert_eq!(got(4), Err(Refused::NotUdp));
+        for id in [1, 2, 5] {
+            assert_eq!(got(id), Err(Refused::Retired), "id {id}");
+        }
+        for id in [0, 6, 7, u32::MAX] {
+            assert_eq!(got(id), Err(Refused::NeverIssued), "id {id}");
+        }
+        // Before any config, no id was issued.
+        assert_eq!(
+            udp_listener(&Routes::new(), 1, 1),
+            Err(Refused::NeverIssued)
+        );
     }
 
     #[test]
