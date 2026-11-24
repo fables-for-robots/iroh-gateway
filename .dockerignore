@@ -1,0 +1,7 @@
+target/
+.git/
+.superpowers/
+.direnv/
+**/*.key
+**/*.pem
+**/.env

@@ -10,11 +10,22 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 fastrand.workspace = true
+futures.workspace = true
+gateway-api.workspace = true
+hex.workspace = true
 iroh.workspace = true
 iroh-gateway-proto = { path = "../proto" }
+k8s-openapi.workspace = true
+kube.workspace = true
+rustls.workspace = true
+schemars.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 toml.workspace = true
-tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 nix = { workspace = true, features = ["resource"] }
@@ -27,8 +38,13 @@ tracing-subscriber.workspace = true
 tempfile.workspace = true
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-gateway-edge = { path = "../edge" }
-tokio = { workspace = true, features = ["io-util", "time"] }
+tokio = { workspace = true, features = ["io-util", "time", "test-util"] }
+rcgen.workspace = true
 
 [[bin]]
 name = "iroh-gateway-operator"
 path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"

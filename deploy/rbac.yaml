@@ -1,0 +1,65 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: iroh-gateway-operator
+rules:
+  # Everything the operator watches. Secrets are deliberately absent here.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "tcproutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.fables-for-robots.ch"]
+    resources: ["edges"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  # Status is written as a JSON merge patch, and only so.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status", "tcproutes/status"]
+    verbs: ["patch"]
+  - apiGroups: ["gateway.fables-for-robots.ch"]
+    resources: ["edges/status"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: iroh-gateway-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: iroh-gateway-operator
+subjects:
+  - kind: ServiceAccount
+    name: iroh-gateway-operator
+    namespace: iroh-gateway
+---
+# The operator's own key lives in a Secret it creates on first start. It may read only that
+# Secret; a create cannot be limited to a name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: iroh-gateway-operator
+  namespace: iroh-gateway
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["iroh-gateway-identity"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: iroh-gateway-operator
+  namespace: iroh-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: iroh-gateway-operator
+subjects:
+  - kind: ServiceAccount
+    name: iroh-gateway-operator
+    namespace: iroh-gateway

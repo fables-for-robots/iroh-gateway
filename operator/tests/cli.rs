@@ -255,3 +255,101 @@ async fn static_forwards_to_target() {
     assert!(status.success(), "{status:?}");
     edge.shutdown().await;
 }
+
+/// `run` with no in-cluster configuration and a kubeconfig path that does not exist.
+fn run_without_cluster(args: &[&str]) -> Output {
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = bin();
+    cmd.env_remove("POD_NAMESPACE")
+        .env_remove("KUBERNETES_SERVICE_HOST")
+        .env_remove("KUBERNETES_SERVICE_PORT")
+        .env("HOME", home.path())
+        .env("KUBECONFIG", home.path().join("missing"))
+        .arg("run")
+        .args(args);
+    cmd.output().unwrap()
+}
+
+#[test]
+fn run_without_a_cluster_configuration_fails() {
+    let out = run_without_cluster(&["--namespace", "iroh-gateway"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no Kubernetes configuration"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn run_refuses_an_empty_gateway_namespace_list() {
+    for list in ["", "a,,b"] {
+        let out = run_without_cluster(&["--namespace", "ns", "--gateway-namespaces", list]);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--gateway-namespaces"), "stderr: {stderr}");
+        assert!(
+            !stderr.contains("Kubernetes configuration"),
+            "stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn run_needs_a_namespace() {
+    let out = run_without_cluster(&[]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--namespace"), "stderr: {stderr}");
+}
+
+#[test]
+fn run_stops_on_sigterm_during_start_up() {
+    // An API server that takes connections and never answers: the identity load hangs.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let kubeconfig = home.path().join("kubeconfig");
+    std::fs::write(
+        &kubeconfig,
+        format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             clusters:\n\
+             - name: silent\n  \
+               cluster:\n    \
+                 server: http://{}\n\
+             users:\n\
+             - name: nobody\n  \
+               user: {{}}\n\
+             contexts:\n\
+             - name: silent\n  \
+               context:\n    \
+                 cluster: silent\n    \
+                 user: nobody\n\
+             current-context: silent\n",
+            silent.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let runtime = common::short_dir();
+    let mut cmd = bin();
+    cmd.env_remove("KUBERNETES_SERVICE_HOST")
+        .env_remove("KUBERNETES_SERVICE_PORT")
+        .env("HOME", home.path())
+        .env("KUBECONFIG", &kubeconfig)
+        .env("RUST_LOG", "info")
+        .args(["run", "--namespace", "ns", "--runtime-dir"])
+        .arg(runtime.path());
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    let (mut child, lines) = spawn_with_nofile(cmd, soft, hard);
+    // Logged just before the client is built.
+    line_with(&lines, "open file limit is");
+    std::thread::sleep(Duration::from_millis(500));
+    let started = Instant::now();
+    let status = child.terminate();
+    assert!(status.success(), "{status:?}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    // Nothing was started: no HAProxy directory.
+    assert!(!runtime.path().join("haproxy").exists());
+    drop(silent);
+}

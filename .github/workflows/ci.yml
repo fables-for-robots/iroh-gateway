@@ -28,8 +28,39 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The operator's HAProxy supervisor tests run the real binary.
+      - name: Install HAProxy 3.2
+        run: |
+          sudo add-apt-repository -y ppa:vbernat/haproxy-3.2
+          sudo apt-get update
+          sudo apt-get install -y haproxy=3.2.\*
+          # The package starts a system service; the tests need only the binary.
+          sudo systemctl disable --now haproxy || true
+          haproxy -v
+
       - name: Tests
         run: cargo test --workspace
+
+      # The operator's cluster tests run a real kube-apiserver and etcd (Kubernetes 1.37.0),
+      # which setup-envtest downloads into target/envtest/, with the Gateway API CRDs.
+      - name: Cluster tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The setup-envtest the flake provides: controller-runtime v0.22.3, which has no
+          # module tag of its own for tools/setup-envtest, hence the pseudo-version of its commit.
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20251010212459-3e8b2594ffc4
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          assets="$(scripts/envtest-assets)"
+          test -n "$assets"
+          KUBEBUILDER_ASSETS="$assets" cargo test -p iroh-gateway-operator --test cluster -- --ignored
+
+      - name: CRD manifest is up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -q -p iroh-gateway-operator --bin crdgen > "$RUNNER_TEMP/crd.yaml"
+          diff "$RUNNER_TEMP/crd.yaml" deploy/crd.yaml
 
       - name: iroh port mapping stays compiled out
         shell: bash
@@ -46,6 +77,30 @@ jobs:
             echo "iroh portmapper must stay disabled"
             exit 1
           fi
+
+  e2e-kind:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the operator image
+        run: docker build --target operator -t iroh-gateway-operator:e2e .
+
+      - name: Build the edge image
+        run: docker build --target edge -t iroh-gateway-edge:e2e .
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: iroh-gateway-e2e
+
+      - name: Load the images into kind
+        run: |
+          kind load docker-image iroh-gateway-operator:e2e --name iroh-gateway-e2e
+          kind load docker-image iroh-gateway-edge:e2e --name iroh-gateway-e2e
+
+      - name: End-to-end test
+        run: scripts/e2e-kind.sh
 
   audit:
     runs-on: ubuntu-latest

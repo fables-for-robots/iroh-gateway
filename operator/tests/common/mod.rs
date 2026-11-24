@@ -1,5 +1,7 @@
 //! Harness for operator link tests: a real edge on loopback, a link to it, and a fake edge.
 
+pub mod envtest;
+
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +27,14 @@ use tokio::time::{sleep, timeout};
 
 /// Upper bound for any single step that should complete promptly on loopback.
 pub const STEP: Duration = Duration::from_secs(10);
+
+/// A runtime directory short enough for Unix socket paths on macOS.
+pub fn short_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("igw")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
 
 pub fn free_tcp_port() -> u16 {
     let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -297,6 +307,16 @@ impl FakeEdge {
         targets: &[(u16, SocketAddr)],
         desired: &[u16],
     ) -> (LinkHandle, watch::Sender<Vec<ListenerKey>>, Endpoint) {
+        self.link_with(targets, desired, |_| {}).await
+    }
+
+    /// [`FakeEdge::link`] with a hook to change the link's options.
+    pub async fn link_with(
+        &self,
+        targets: &[(u16, SocketAddr)],
+        desired: &[u16],
+        customize: impl FnOnce(&mut LinkOptions),
+    ) -> (LinkHandle, watch::Sender<Vec<ListenerKey>>, Endpoint) {
         let endpoint = bind_endpoint(SecretKey::generate(), &Relay::Disabled)
             .await
             .unwrap();
@@ -305,6 +325,7 @@ impl FakeEdge {
             LinkOptions::new(self.endpoint.id(), Some(addr.to_string()), Relay::Disabled).unwrap();
         opts.backoff_min = Duration::from_millis(50);
         opts.backoff_max = Duration::from_millis(200);
+        customize(&mut opts);
         let (desired, link) = spawn_link(endpoint.clone(), opts, targets, desired);
         (link, desired, endpoint)
     }

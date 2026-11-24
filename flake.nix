@@ -22,6 +22,11 @@
         default = pkgs.mkShell {
           packages = [
             (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+            pkgs.haproxy
+            # The operator's cluster tests: scripts/envtest-assets fetches an API server.
+            pkgs.setup-envtest
+            pkgs.kubectl
+            pkgs.shellcheck
           ];
         };
       });

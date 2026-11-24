@@ -247,8 +247,9 @@ One setting, with the same value on the operator and on its edges:
 - Closes all public listeners a few seconds after the tunnel drops, so
   visitors fail fast and a future health check sees the edge as down.
 - Enforces a cap on concurrent connections and UDP flows and refuses new
-  ones beyond it. The default is 2048 connections; the worst case is about
-  400 KiB of memory per connection.
+  ones beyond it. The default is 2048 connections and the most that can be
+  configured is 4096; the worst case is about 400 KiB of memory per
+  connection.
 - Does not let a visitor hold a connection slot indefinitely:
   - a connection that accepts no data for 300 s while data is waiting for
     it is aborted;
@@ -259,6 +260,16 @@ One setting, with the same value on the operator and on its edges:
 - Limits what an unauthenticated host can cost it: source addresses are
   validated before a handshake is processed, at most 64 handshakes are
   pending at once, and each has 10 s to complete.
+- Does not let those hosts lock the operator out. When all 64 slots are
+  taken, a new handshake is still admitted and one pending handshake is
+  dropped: the oldest one of the source that holds the most slots. A source
+  is an IPv4 address or an IPv6 /64 prefix, because one IPv6 host usually
+  controls a whole /64. One host can therefore only push out its own
+  handshakes. What remains: an attacker who controls at least 63 other
+  sources can still push out the operator's handshake, which then retries.
+  Handshakes that arrive through a relay have no source address and share
+  one group, so in relay mode a flood through the relay pushes out relayed
+  handshakes first, the operator's among them.
 - Forwards no visitor until the current operator session has sent its first
   `Config`.
 - Persists only its own key. No certificates, no routes, no hostnames.
@@ -303,6 +314,15 @@ Rules:
   different hostnames may share a port; so may `HTTP` listeners. Any other
   mix on one port is `Conflicted`.
 - A listener may not use the edge's iroh port.
+- A TCP listener carries one `TCPRoute`. If several attach, the oldest
+  wins and the others are not accepted.
+- An edge opens a listener's port only once the listener has a route with at
+  least one usable backend. Until then visitors get a refused connection.
+- A backend that cannot be used is left out and its share of traffic goes
+  to the others. (The Gateway API asks for that share to be refused. This
+  is a known deviation for now.)
+- A backend must be a Service with a cluster IP. Headless and
+  `ExternalName` Services are refused.
 - No matching route answers 404; a rule whose backends are all invalid
   answers 500, as the specification requires.
 
@@ -334,6 +354,16 @@ status:
 - An `Edge` without `address` is `Accepted=False` when relay mode is
   `disabled`, and one without both `address` and `publicAddresses` is
   always `Accepted=False`.
+- If two `Edge` resources carry the same `endpointId`, the older one is
+  accepted and the other is not. Only edges that pass every other check
+  compete, so a mistyped `Edge` cannot block a correct one for the same
+  machine.
+- Published addresses are checked before they reach `Gateway.status`. An
+  entry must be an IP address or a DNS name; names are lower-cased and a
+  trailing dot is dropped. An `Edge` with an entry that is neither (a name
+  with a port, for example) is `Accepted=False`, reason
+  `InvalidPublicAddress`. A Gateway publishes at most 16 addresses, the
+  first 16 in sorted order, which is the Gateway API's limit.
 - An edge serves exactly one Gateway. A Gateway is served by any number of
   edges, and every edge of a Gateway opens all of that Gateway's ports.
   Edges are never shared, so two Gateways can never fight over a port.
@@ -350,8 +380,16 @@ status:
   are all disconnected or unbound is `Programmed=False` with a reason
   saying so, and keeps its addresses.
 - A listener is `Programmed=True` once HAProxy serves it (or the UDP
-  forwarder for UDP) and at least one edge has bound its port. An edge's
-  bind error shows on the `Edge` and in the listener's condition message.
+  forwarder for UDP) and at least one accepted, connected edge has bound its
+  port. This is decided per listener: one port that fails to bind does not
+  change the other listeners. An edge's bind error shows on the `Edge` and
+  in the listener's condition message.
+- An `Edge` that the operator does not accept is never `Connected` or
+  `Programmed`, whatever its link last reported. An `Edge` whose ports have
+  not been reported yet is `Programmed=False`, reason `Pending`; `BindFailed`
+  is used only for a failure the edge reported.
+- Text that comes from an edge (its version, its bind errors) is cut to 256
+  bytes and stripped of control characters before it is written to status.
 
 ### Where Gateways may live
 
@@ -368,6 +406,11 @@ Every resource the operator handles carries standard conditions with
 `Programmed`, per-listener `Accepted`, `Programmed`, `ResolvedRefs`,
 `Conflicted` and `attachedRoutes`; route parent status `Accepted` and
 `ResolvedRefs` under the controller name.
+
+Status writes are not allowed to stall the operator. Each request to the API
+server has 10 s. After a pass in which a write failed, the operator writes
+again after 5 s, doubling up to 60 s, until a pass succeeds. Shutdown
+interrupts a write in progress.
 
 ## Tunnel protocol
 
@@ -400,25 +443,35 @@ operator connects to the HAProxy socket for that port, writes a PROXY v2
 header with the visitor's address, and copies.
 
 The default QUIC limit on concurrent streams is far too low for this and
-must be raised on both sides to the connection cap.
+must be raised on both sides to the connection cap, 4096 streams per edge.
 
 Receive memory is bounded explicitly, because the QUIC defaults are not:
 
 - Each stream has a 256 KiB receive window, on both sides.
-- The operator also caps each edge connection at 256 MiB of unread data, so
+- The operator also caps each edge connection at 64 MiB of unread data, so
   a compromised edge cannot exhaust the operator's memory. If one edge
   fills it, only that edge's own traffic waits.
+- Together with the stream limit this bounds what one edge can make the
+  operator hold: about 4096 × 192 KiB + 64 MiB ≈ 830 MiB in the worst case.
+  The shipped memory limit of 1 GiB fits one edge and must be raised by
+  about that much for each further edge.
 - The edge has no such connection-wide cap on purpose: with one, a few
   hundred visitors that stop reading could stall every other visitor.
 - The stream header is at most 256 bytes and must arrive within 5 s.
+- An edge must answer a `Config` with its first `Status` within 10 s, or the
+  operator drops the connection and dials again.
 
 The operator also refuses a stream whose header names a local port that
 does not match the listener its id belongs to.
 
-**Open question for the HAProxy step.** A Unix socket cannot signal an
-abort: closing it looks like a clean end of data. An aborted visitor
-connection would therefore reach HAProxy as a clean close. Either accept
-that, or connect to HAProxy over loopback TCP instead of Unix sockets.
+**Aborts at the HAProxy hop.** A Unix socket cannot signal an abort:
+closing it looks like a clean end of data, so an aborted visitor connection
+reaches HAProxy as a clean close. This is accepted, and the Unix sockets
+stay. HAProxy itself turns most aborts into ordinary closes towards a TCP
+backend, so loopback TCP would gain little, and for HTTP it notices a
+truncated request from the message framing. In return nothing outside the
+operator's container can reach the sockets, and no ports have to be
+allocated.
 
 **UDP.** Each visitor packet travels as one or more QUIC datagrams:
 
@@ -457,6 +510,12 @@ An edge that sends a stream or datagram for a listener id not in its current
   which carries that rule's filters and its weighted servers.
 - `TCP` ports are TCP-mode frontends with one backend. The visitor address
   is logged but not passed on to the backend.
+- HAProxy runs in `<runtime-dir>/haproxy`, a directory the operator creates
+  for itself with mode 0700. The mount point itself may belong to someone
+  else, as an `emptyDir` does. Unix socket paths are short, so the runtime
+  directory's path may be at most 60 bytes.
+- Global limits: `maxconn 8192`; `timeout client` and `timeout server` of
+  1 h, so a connection that is idle for an hour is closed.
 - `X-Forwarded-For` and `X-Forwarded-Proto` are set. WebSockets work.
 - Access logs go to stdout.
 
@@ -488,9 +547,27 @@ Applying a new render:
    a hard-stop limit passes.
 4. If invalid, the running configuration stays, the affected Gateways go
    `Programmed=False` with the validator's message, and a metric counts it.
+5. If the reload itself fails or its outcome is lost, the operator no longer
+   assumes which configuration is live and tries the same render again
+   every 5 s.
 
 Edge listener lists and the UDP table are applied after HAProxy is ready
-for them, so an edge never opens a port that has nothing behind it.
+for them, so an edge never opens a port that has nothing behind it. Ports
+that the new render removes or re-points stop accepting streams before
+HAProxy is reloaded.
+
+After an apply that failed, an edge keeps a port only if nothing behind it
+changed: the same listener, the same socket and the same frontend and
+backend text as the last configuration HAProxy loaded. Otherwise the port
+closes until an apply succeeds. A port must never keep serving a backend
+the cluster no longer assigns to it.
+
+**Known limit: long-lived connections.** Any change to a serving listener's
+route or backends, in any namespace, reloads HAProxy. A connection that is
+still open 30 minutes after a reload (`hard-stop-after 30m`), or after 50
+further reloads (`mworker-max-reloads 50`), is closed. SSH and database
+sessions notice this. The real fix is to change backends through HAProxy's
+runtime API without reloading; that is later work.
 
 ## Packaging
 
@@ -501,7 +578,13 @@ for them, so an edge never opens a port that has nothing behind it.
   `ghcr.io/fables-for-robots/iroh-gateway-operator`.
 - **Helm chart** under `charts/iroh-gateway`: Deployment, RBAC, the `Edge`
   CRD, a `GatewayClass`, an optional `NetworkPolicy`, metrics Service.
-  Gateway API CRDs are a prerequisite, not bundled.
+  Gateway API CRDs are a prerequisite, not bundled. Until the chart exists
+  (build step 5) the same objects ship as plain manifests in `deploy/`.
+- **Operator permissions.** In its own namespace the operator may `get` only
+  its identity Secret, by name, and `create` Secrets. On status
+  subresources it may only `patch`.
+- **Operator resources.** Memory request 128 Mi, limit 1 Gi, sized for one
+  edge (see the tunnel protocol's memory bound).
 - **Edge.** Static Linux binaries for x86_64 and aarch64, a hardened systemd
   unit (dynamic user, `CAP_NET_BIND_SERVICE` only), and a NixOS module from
   the flake. Subcommands: `run`, and `id` to print the EndpointId.
@@ -532,6 +615,10 @@ HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
   the edge restarts; rejection of an unlisted key; an edge with no direct
   address reached through a relay started inside the test. A real `haproxy` binary
   for HTTP routing, TLS termination and reload-on-change.
+- **Integration, API server only.** The controller against a real
+  `kube-apiserver` and `etcd` (envtest) with the upstream Gateway API CRDs
+  installed, so the API server's own validation rules apply to every status
+  the operator writes. No nodes, no pods.
 - **End to end.** A kind cluster with the chart installed and an edge
   process outside it: HTTP, HTTPS with a test certificate, TCP and UDP
   requests through the edge to in-cluster echo services, and status
