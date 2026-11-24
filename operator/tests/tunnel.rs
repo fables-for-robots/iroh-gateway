@@ -892,6 +892,32 @@ async fn a_single_packet_from_a_new_visitor_is_answered() {
 }
 
 #[tokio::test]
+async fn a_single_fragmented_packet_from_a_new_visitor_is_answered() {
+    let (rig, p) = udp_rig().await;
+    // More than one datagram takes, even on a path known to carry 1,452-byte QUIC packets.
+    let payload = random_bytes(1_400);
+    // Sent exactly once, against the rule to send again: a datagram on an established loopback
+    // QUIC session is not lost, and resending is what hid first packets of new flows being
+    // dropped.
+    let visitor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    visitor.send_to(&payload, public(p)).await.unwrap();
+    let mut buf = [0u8; 2_048];
+    let answer = timeout(STEP, async {
+        loop {
+            match visitor.recv_from(&mut buf).await {
+                Ok((n, from)) if from == public(p) => return buf[..n].to_vec(),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("a single fragmented packet from a new visitor was not answered");
+    assert!(answer == payload, "the answer is not the packet sent");
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
+#[tokio::test]
 async fn large_packets_echo_through_edge_and_operator() {
     let (rig, p) = udp_rig().await;
     for len in [1_400, 9_000] {

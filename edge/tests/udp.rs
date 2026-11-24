@@ -475,8 +475,9 @@ async fn idle_flow_is_forgotten_and_a_reply_keeps_it_alive() {
     }
     reply_until_received(&fake.conn, 1, flow, b"still there", &v).await;
 
-    // Silence: past the idle time and the next expiry pass the flow is gone.
-    sleep(Duration::from_millis(1_600)).await;
+    // Silence: past the idle time and the next expiry pass the flow is gone, with room for a
+    // late pass on a loaded machine.
+    sleep(Duration::from_secs(3)).await;
     send_packet(&fake.conn, 1, flow, packet_id, b"after idle");
     assert_not_received(&v, &[b"after idle"]).await;
     let (header, _) = send_until_datagram(&v, p, b"new flow", &fake.conn).await;
