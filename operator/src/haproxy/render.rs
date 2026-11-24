@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Write as _};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use iroh_gateway_proto::control::{ListenerKey, Protocol};
@@ -23,6 +23,7 @@ use crate::model::{
     Backend, GatewayModel, HeaderMods, HostMatch, HttpAction, HttpPort, HttpRule, Model, ObjRef,
     PathMatch, Redirect,
 };
+use crate::tunnel::UdpTarget;
 
 /// What the model asks of HAProxy and of the edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,8 @@ pub struct EdgePlan {
     /// The Gateway's serving ports and what HAProxy serves behind each: its TCP ports and its
     /// HTTP and HTTPS ports, all under `Protocol::Tcp`, which is what the edge opens.
     pub sockets: HashMap<ListenerKey, PortPlan>,
+    /// The targets of each serving UDP listener of the Gateway, by port.
+    pub udp: BTreeMap<u16, Vec<UdpTarget>>,
 }
 
 /// One port of an [`EdgePlan`]: HAProxy's socket for it, and a fingerprint of what is behind it.
@@ -100,7 +103,18 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
 
     let mut files: BTreeMap<String, String> = BTreeMap::new();
     let mut sockets: HashMap<&ObjRef, HashMap<ListenerKey, PortPlan>> = HashMap::new();
+    let mut udp: HashMap<&ObjRef, BTreeMap<u16, Vec<UdpTarget>>> = HashMap::new();
     for gateway in &gateways {
+        // UDP does not go through HAProxy: a UDP listener writes nothing into `cfg`.
+        udp.insert(
+            &gateway.key,
+            gateway
+                .listeners
+                .iter()
+                .filter(|l| l.serving() && l.transport() == Protocol::Udp)
+                .map(|l| (l.port, udp_targets(&l.backends)))
+                .collect(),
+        );
         let per_gateway = sockets.entry(&gateway.key).or_default();
         // The port's own sections, which its fingerprint covers, after a comment that says
         // whose port it is.
@@ -160,6 +174,7 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
                 address: e.address.clone(),
                 gateway: gateway.clone(),
                 sockets: sockets.get(gateway)?.clone(),
+                udp: udp.get(gateway)?.clone(),
             })
         })
         .collect();
@@ -195,6 +210,17 @@ fn servers(section: &mut String, backends: &[Backend]) {
             ),
         };
     }
+}
+
+/// A UDP listener's backends as its targets, in order.
+fn udp_targets(backends: &[Backend]) -> Vec<UdpTarget> {
+    backends
+        .iter()
+        .map(|b| UdpTarget {
+            addr: SocketAddr::new(b.ip, b.port),
+            weight: b.weight,
+        })
+        .collect()
 }
 
 /// The `frontend` and `backend` sections of an HTTP or HTTPS port; an HTTPS port's certificates
@@ -1516,5 +1542,104 @@ mod tests {
         }
         // Nor does the configuration name anything but the file.
         assert!(!r.haproxy_cfg.contains(KEY_LINE));
+    }
+
+    // ---- UDP listeners ----
+
+    fn udp_listener(port: u16, backends: Vec<Backend>) -> ListenerModel {
+        let mut l = listener(port, backends);
+        l.protocol = "UDP".into();
+        l.supported_kinds = vec!["UDPRoute".into()];
+        l
+    }
+
+    fn target(addr: &str, weight: u32) -> UdpTarget {
+        UdpTarget {
+            addr: addr.parse().unwrap(),
+            weight,
+        }
+    }
+
+    /// The plan of the one edge of gateway `gw/public` with `listeners`.
+    fn plan_of(listeners: Vec<ListenerModel>) -> (Rendered, EdgePlan) {
+        let g = gw("gw", "public");
+        let r = render_in(&model(
+            vec![gateway(g.clone(), listeners)],
+            vec![edge("e1", 1, &g)],
+        ));
+        assert_eq!(r.edges.len(), 1);
+        let plan = r.edges[0].clone();
+        (r, plan)
+    }
+
+    #[test]
+    fn udp_listener_adds_nothing_to_the_configuration() {
+        // The model of `one_gateway_one_port`.
+        let tcp_only = vec![listener(
+            5432,
+            vec![backend("10.0.0.1", 5432, 1), backend("10.0.0.2", 5432, 3)],
+        )];
+        let mut with_udp = tcp_only.clone();
+        let udp = udp_listener(53, vec![backend("10.0.0.2", 53, 1)]);
+        assert!(udp.serving(), "precondition");
+        with_udp.push(udp);
+        let (without, plan_without) = plan_of(tcp_only);
+        let (with, plan_with) = plan_of(with_udp);
+        assert_eq!(with.haproxy_cfg, without.haproxy_cfg);
+        assert_eq!(with.haproxy_cfg, include_str!("testdata/one.cfg"));
+        assert_eq!(with.files, without.files);
+        assert_eq!(plan_with.sockets, plan_without.sockets);
+        assert!(plan_without.udp.is_empty());
+        assert!(!plan_with.udp.is_empty());
+    }
+
+    #[test]
+    fn udp_targets_follow_the_listener_backends() {
+        let (r, plan) = plan_of(vec![udp_listener(
+            53,
+            vec![backend("10.0.0.1", 53, 1), backend("10.0.0.2", 53, 3)],
+        )]);
+        assert_eq!(
+            plan.udp,
+            BTreeMap::from([(53, vec![target("10.0.0.1:53", 1), target("10.0.0.2:53", 3)])])
+        );
+        assert!(plan.sockets.is_empty());
+        assert_eq!(r.haproxy_cfg, include_str!("testdata/empty.cfg"));
+    }
+
+    #[test]
+    fn udp_listener_without_a_route_has_no_targets() {
+        let mut l = udp_listener(53, vec![]);
+        l.attached_routes = 0;
+        assert!(!l.serving(), "precondition");
+        let (r, plan) = plan_of(vec![l]);
+        assert!(!plan.udp.contains_key(&53), "{:?}", plan.udp);
+        assert_eq!(r.haproxy_cfg, include_str!("testdata/empty.cfg"));
+    }
+
+    #[test]
+    fn tcp_and_udp_on_one_port_give_a_socket_and_targets() {
+        let (r, plan) = plan_of(vec![
+            listener(53, vec![backend("10.0.0.1", 53, 1)]),
+            udp_listener(53, vec![backend("10.0.0.2", 53, 1)]),
+        ]);
+        assert_eq!(plan.sockets.keys().copied().collect::<Vec<_>>(), [tcp(53)]);
+        assert_eq!(
+            plan.udp,
+            BTreeMap::from([(53, vec![target("10.0.0.2:53", 1)])])
+        );
+        // Only the TCP listener is in the configuration.
+        assert_eq!(lines_of(&r.haproxy_cfg, "frontend fe_").len(), 1);
+        assert!(r.haproxy_cfg.contains("10.0.0.1:53"));
+        assert!(!r.haproxy_cfg.contains("10.0.0.2"));
+    }
+
+    #[test]
+    fn ipv6_backend_is_a_target() {
+        let (_, plan) = plan_of(vec![udp_listener(53, vec![backend("fd00::53", 5353, 2)])]);
+        assert_eq!(
+            plan.udp,
+            BTreeMap::from([(53, vec![target("[fd00::53]:5353", 2)])])
+        );
     }
 }

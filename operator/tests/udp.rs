@@ -109,17 +109,6 @@ fn target(socket: &UdpSocket, weight: u32) -> UdpTarget {
     }
 }
 
-/// A free UDP port below every ephemeral range (Linux 32768.., macOS 49152..), so no socket bound
-/// to port 0 meanwhile, such as another test's flow socket, can take it before the test binds it.
-fn unassigned_udp_port() -> u16 {
-    loop {
-        let port = fastrand::u16(20_000..30_000);
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
-
 fn next_packet_id() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)

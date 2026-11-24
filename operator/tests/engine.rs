@@ -22,13 +22,14 @@ use iroh_gateway_operator::model::{
 };
 use iroh_gateway_operator::status::Facts;
 use iroh_gateway_operator::tunnel::{ListenerState, bind_endpoint};
+use iroh_gateway_proto::control::{ListenerKey, Protocol};
 use iroh_gateway_proto::transport::Relay;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const NS: &str = "ns";
@@ -242,17 +243,20 @@ fn sockets_in(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether `edge` is connected with exactly `ports` bound. The engine reports ports in
-/// ascending order, whatever order the test's free ports came in.
+/// Whether `edge` is connected with exactly the TCP ports `ports` bound.
 fn serving(f: &Facts, edge: &str, ports: &[u16]) -> bool {
-    let mut ports = ports.to_vec();
-    ports.sort_unstable();
-    let want: Vec<ListenerState> = ports
-        .iter()
-        .map(|&p| ListenerState {
-            key: tcp(p),
-            bound: Ok(()),
-        })
+    let keys: Vec<ListenerKey> = ports.iter().map(|&p| tcp(p)).collect();
+    serving_keys(f, edge, &keys)
+}
+
+/// Whether `edge` is connected with exactly `keys` bound. The engine reports them by port, TCP
+/// before UDP, whatever order the test's free ports came in.
+fn serving_keys(f: &Facts, edge: &str, keys: &[ListenerKey]) -> bool {
+    let mut keys = keys.to_vec();
+    keys.sort_by_key(|k| (k.port, k.protocol == Protocol::Udp));
+    let want: Vec<ListenerState> = keys
+        .into_iter()
+        .map(|key| ListenerState { key, bound: Ok(()) })
         .collect();
     f.edges
         .get(&key(edge))
@@ -1237,6 +1241,349 @@ async fn port_that_changes_kind_is_cut() {
     assert!(engine.facts().haproxy.is_err());
     refused(p).await;
     wait_facts(&mut engine, |f| serving(f, "e", &[])).await;
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+// ---- UDP ports ----
+
+/// How long a test waits to conclude that nothing arrives.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// The edge's public address for UDP port `p`.
+fn public(p: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], p))
+}
+
+fn addr(socket: &UdpSocket) -> SocketAddr {
+    socket.local_addr().unwrap()
+}
+
+/// A UDP socket on loopback that the test reads, standing in for a backend.
+async fn udp_backend() -> UdpSocket {
+    UdpSocket::bind("127.0.0.1:0").await.unwrap()
+}
+
+/// A UDP listener on `port` with `targets` as its backends, weight 1 each.
+fn udp_listener(port: u16, targets: &[SocketAddr]) -> ListenerModel {
+    ListenerModel {
+        name: format!("u{port}"),
+        port,
+        protocol: "UDP".into(),
+        hostname: HostMatch::Any,
+        accepted: Ok(()),
+        conflicted: None,
+        resolved_refs: Ok(()),
+        supported_kinds: vec!["UDPRoute".into()],
+        allowed_namespaces: Default::default(),
+        attached_routes: 1,
+        backends: targets
+            .iter()
+            .map(|t| Backend {
+                service: key("udp"),
+                ip: t.ip(),
+                port: t.port(),
+                weight: 1,
+            })
+            .collect(),
+        certificates: Vec::new(),
+    }
+}
+
+impl World {
+    /// [`World::plan`] of gateway `gw` with TCP ports `tcp` and UDP listeners: each
+    /// `(port, target)` of `udp` adds `target` to the UDP listener on `port`.
+    fn udp_plan(&self, tcp: &[u16], udp: &[(u16, SocketAddr)], edges: &[EdgeSpec<'_>]) -> Rendered {
+        let mut model = self.model(&[("gw", tcp)], edges);
+        let mut ports: Vec<u16> = udp.iter().map(|&(p, _)| p).collect();
+        ports.dedup();
+        for port in ports {
+            let targets: Vec<SocketAddr> = udp
+                .iter()
+                .filter(|&&(p, _)| p == port)
+                .map(|&(_, t)| t)
+                .collect();
+            model.gateways[0]
+                .listeners
+                .push(udp_listener(port, &targets));
+        }
+        render(&model, self.dir.path())
+    }
+}
+
+/// Sends `payload` from `visitor` to UDP port `p` of the edge until `backend` receives it, and
+/// returns where it came from: the socket of the visitor's flow on the operator.
+async fn deliver(visitor: &UdpSocket, p: u16, payload: &[u8], backend: &UdpSocket) -> SocketAddr {
+    let mut buf = vec![0u8; 65_535];
+    timeout(STEP, async {
+        loop {
+            let _ = visitor.send_to(payload, public(p)).await;
+            let arrived = timeout(Duration::from_millis(500), async {
+                loop {
+                    if let Ok((n, from)) = backend.recv_from(&mut buf).await
+                        && &buf[..n] == payload
+                    {
+                        return from;
+                    }
+                }
+            })
+            .await;
+            if let Ok(from) = arrived {
+                return from;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{payload:?} did not reach {}", addr(backend)))
+}
+
+/// Asserts that none of `payloads` reaches `backend` within [`QUIET`].
+async fn nothing_arrives(backend: &UdpSocket, payloads: &[&[u8]]) {
+    let mut buf = vec![0u8; 65_535];
+    let _ = timeout(QUIET, async {
+        loop {
+            if let Ok((n, from)) = backend.recv_from(&mut buf).await {
+                let got = &buf[..n];
+                assert!(
+                    !payloads.contains(&got),
+                    "{:?} from {from} reached {}",
+                    String::from_utf8_lossy(got),
+                    addr(backend)
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// Waits until `at` can be bound: whatever held it has closed it.
+async fn released(at: SocketAddr) {
+    timeout(STEP, async {
+        while std::net::UdpSocket::bind(at).is_err() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{at} stayed bound"));
+}
+
+/// Where a flow's socket on the operator is bound, given the address its backend saw.
+fn flow_socket(seen: SocketAddr) -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], seen.port()))
+}
+
+#[tokio::test]
+async fn udp_port_opens_and_forwards() {
+    let w = World::new().await;
+    let echo = udp_echo_server().await;
+    let edge = w.edge().await;
+    let (t, u) = (free_tcp_port(), free_udp_port());
+    let edges = [at("e", "gw", &edge)];
+    let mut engine = w.start(w.udp_plan(&[t], &[], &edges)).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[t])).await;
+
+    // A UDP listener added to the plan of a running link.
+    engine.apply(w.udp_plan(&[t], &[(u, echo)], &edges)).await;
+    let facts = wait_facts(&mut engine, |f| serving_keys(f, "e", &[tcp(t), udp(u)])).await;
+    assert_eq!(facts.haproxy, Ok(()));
+    assert_eq!(udp_roundtrip(public(u), b"hello").await, b"hello");
+    echoes_on(t, b"t").await;
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn udp_target_change_moves_new_packets_and_ends_old_flows() {
+    let w = World::new().await;
+    let a = udp_backend().await;
+    let b = udp_echo_server().await;
+    let edge = w.edge().await;
+    let u = free_udp_port();
+    let edges = [at("e", "gw", &edge)];
+    let mut engine = w.start(w.udp_plan(&[], &[(u, addr(&a))], &edges)).await;
+    wait_facts(&mut engine, |f| serving_keys(f, "e", &[udp(u)])).await;
+    let visitor = udp_backend().await;
+    let seen = deliver(&visitor, u, b"before", &a).await;
+
+    engine.apply(w.udp_plan(&[], &[(u, b)], &edges)).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    // The same visitor now reaches b, on a new flow, and a gets nothing more.
+    assert_eq!(
+        udp_roundtrip_from(&visitor, public(u), b"after").await,
+        b"after"
+    );
+    nothing_arrives(&a, &[b"after"]).await;
+    // The old flow's socket is closed, so no reply of a reaches the visitor.
+    released(flow_socket(seen)).await;
+    assert_eq!(udp_roundtrip(public(u), b"new").await, b"new");
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn removed_udp_listener_stops_forwarding() {
+    let w = World::new().await;
+    let a = udp_backend().await;
+    let edge = w.edge().await;
+    let (t, u) = (free_tcp_port(), unassigned_udp_port());
+    let edges = [at("e", "gw", &edge)];
+    let mut engine = w.start(w.udp_plan(&[t], &[(u, addr(&a))], &edges)).await;
+    wait_facts(&mut engine, |f| serving_keys(f, "e", &[tcp(t), udp(u)])).await;
+    let visitor = udp_backend().await;
+    let seen = deliver(&visitor, u, b"before", &a).await;
+
+    engine.apply(w.udp_plan(&[t], &[], &edges)).await;
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    // Whatever the edge still does with the port, nothing sent from now on reaches a.
+    for _ in 0..3 {
+        let _ = visitor.send_to(b"after", public(u)).await;
+    }
+    nothing_arrives(&a, &[b"after"]).await;
+    released(flow_socket(seen)).await;
+    // The edge's port closes: the test can bind it.
+    released(public(u)).await;
+    wait_facts(&mut engine, |f| serving(f, "e", &[t])).await;
+    echoes_on(t, b"t").await;
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn udp_changes_apply_although_haproxy_refuses_the_configuration() {
+    let w = World::new().await;
+    let a = udp_backend().await;
+    let b = udp_echo_server().await;
+    let edge = w.edge().await;
+    let (p, q, r) = (free_tcp_port(), free_tcp_port(), free_tcp_port());
+    let (u, v) = (free_udp_port(), free_udp_port());
+    let edges = [at("e", "gw", &edge)];
+    let mut engine = w.start(w.udp_plan(&[p, q], &[(u, addr(&a))], &edges)).await;
+    wait_facts(&mut engine, |f| {
+        serving_keys(f, "e", &[tcp(p), tcp(q), udp(u)])
+    })
+    .await;
+    let visitor = udp_backend().await;
+    deliver(&visitor, u, b"before", &a).await;
+
+    // TCP: q goes and r comes. UDP: u moves to b, and v is new.
+    let mut bad = w.udp_plan(&[p, r], &[(u, b), (v, b)], &edges);
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    let err = engine.facts().haproxy.unwrap_err();
+    assert!(err.contains("haproxy refused the configuration"), "{err}");
+    // TCP ports follow the rule for a refused configuration: q closes, r stays closed.
+    refused(q).await;
+    wait_facts(&mut engine, |f| {
+        serving_keys(f, "e", &[tcp(p), udp(u), udp(v)])
+    })
+    .await;
+    stays_refused(r, Duration::from_millis(500)).await;
+    assert!(!w.socket("gw", r).exists());
+    echoes_on(p, b"p").await;
+    // UDP follows the new plan.
+    assert_eq!(
+        udp_roundtrip_from(&visitor, public(u), b"after").await,
+        b"after"
+    );
+    nothing_arrives(&a, &[b"after"]).await;
+    assert_eq!(udp_roundtrip(public(v), b"v").await, b"v");
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn udp_and_tcp_on_one_port_number_both_forward() {
+    let w = World::new().await;
+    let udp_echo = udp_echo_server().await;
+    let edge = w.edge().await;
+    let p = free_tcp_and_udp_port();
+    let initial = w.udp_plan(&[p], &[(p, udp_echo)], &[at("e", "gw", &edge)]);
+    // One port number, with a socket for HAProxy and targets for the link.
+    assert_eq!(
+        initial.edges[0].sockets.keys().copied().collect::<Vec<_>>(),
+        [tcp(p)]
+    );
+    assert_eq!(
+        initial.edges[0].udp.keys().copied().collect::<Vec<_>>(),
+        [p]
+    );
+    // `start` hands the initial plan's UDP targets to the link.
+    let mut engine = w.start(initial).await;
+    let facts = wait_facts(&mut engine, |f| serving_keys(f, "e", &[tcp(p), udp(p)])).await;
+    assert_eq!(facts.haproxy, Ok(()));
+    echoes_on(p, b"over tcp").await;
+    assert_eq!(udp_roundtrip(public(p), b"over udp").await, b"over udp");
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn edge_that_leaves_the_plan_loses_its_udp_port() {
+    let w = World::new().await;
+    let echo = udp_echo_server().await;
+    let edge = w.edge().await;
+    let u = unassigned_udp_port();
+    let mut engine = w
+        .start(w.udp_plan(&[], &[(u, echo)], &[at("e", "gw", &edge)]))
+        .await;
+    wait_facts(&mut engine, |f| serving_keys(f, "e", &[udp(u)])).await;
+    assert_eq!(udp_roundtrip(public(u), b"u").await, b"u");
+
+    engine.apply(w.udp_plan(&[], &[(u, echo)], &[])).await;
+    let facts = engine.facts();
+    assert!(facts.edges.is_empty(), "{facts:?}");
+    assert_eq!(facts.haproxy, Ok(()));
+    // The edge closes the port once its 300 ms grace after the tunnel has passed.
+    released(public(u)).await;
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn udp_targets_change_before_haproxy_reloads() {
+    let w = World::new().await;
+    let a = udp_backend().await;
+    let b = udp_echo_server().await;
+    let tools = short_dir();
+    let edge = w.edge().await;
+    let (p, q, u) = (free_tcp_port(), free_tcp_port(), free_udp_port());
+    let edges = [at("e", "gw", &edge)];
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let mut opts = w.options();
+    opts.supervisor.haproxy_bin = slow_check_haproxy(tools.path());
+    let mut engine = Engine::start(endpoint, opts, w.udp_plan(&[p], &[(u, addr(&a))], &edges))
+        .await
+        .unwrap();
+    wait_facts(&mut engine, |f| serving_keys(f, "e", &[tcp(p), udp(u)])).await;
+    let visitor = udp_backend().await;
+    deliver(&visitor, u, b"before", &a).await;
+
+    // A TCP port is added, so HAProxy reloads, slowly; u moves to b.
+    std::fs::write(tools.path().join("slow"), "").unwrap();
+    let next = w.udp_plan(&[p, q], &[(u, b)], &edges);
+    let applying = async {
+        engine.apply(next).await;
+        Instant::now()
+    };
+    let during = async {
+        // Well inside the second `haproxy -c` takes: the old configuration still runs.
+        sleep(Duration::from_millis(400)).await;
+        for _ in 0..3 {
+            let _ = visitor.send_to(b"during", public(u)).await;
+        }
+        nothing_arrives(&a, &[b"during"]).await;
+        Instant::now()
+    };
+    let (applied_at, checked_at) = tokio::join!(applying, during);
+    assert!(checked_at < applied_at, "the reload ended before the check");
+    assert_eq!(engine.facts().haproxy, Ok(()));
+    assert_eq!(
+        udp_roundtrip_from(&visitor, public(u), b"after").await,
+        b"after"
+    );
+    echoes_on(q, b"q").await;
     engine.shutdown().await;
     edge.shutdown().await;
 }

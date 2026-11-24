@@ -36,16 +36,6 @@ fn public(p: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], p))
 }
 
-/// A port free for both TCP and UDP on 127.0.0.1.
-fn free_tcp_and_udp_port() -> u16 {
-    loop {
-        let p = free_tcp_port();
-        if std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok() {
-            return p;
-        }
-    }
-}
-
 /// An edge and a link with one UDP port, `p`, forwarding to a UDP echo server, once the edge
 /// has bound it.
 async fn udp_rig() -> (Rig, u16) {

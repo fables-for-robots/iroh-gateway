@@ -63,6 +63,27 @@ pub fn free_udp_port() -> u16 {
     s.local_addr().unwrap().port()
 }
 
+/// A free UDP port below every ephemeral range (Linux 32768.., macOS 49152..), so no socket bound
+/// to port 0 meanwhile, such as another test's flow socket, can take it before the test binds it.
+pub fn unassigned_udp_port() -> u16 {
+    loop {
+        let port = fastrand::u16(20_000..30_000);
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// A port free for both TCP and UDP on 127.0.0.1.
+pub fn free_tcp_and_udp_port() -> u16 {
+    loop {
+        let p = free_tcp_port();
+        if std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
+}
+
 /// Echoes each connection until EOF, then closes it.
 pub async fn echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -121,6 +142,11 @@ pub async fn udp_roundtrip(to: SocketAddr, payload: &[u8]) -> Vec<u8> {
         "[::1]:0".parse().unwrap()
     };
     let socket = UdpSocket::bind(local).await.unwrap();
+    udp_roundtrip_from(&socket, to, payload).await
+}
+
+/// [`udp_roundtrip`] from `socket`, so that every attempt is one flow of the same visitor.
+pub async fn udp_roundtrip_from(socket: &UdpSocket, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; MAX_PACKET];
     timeout(STEP, async {
         loop {
