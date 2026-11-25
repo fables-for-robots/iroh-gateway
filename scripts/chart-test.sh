@@ -233,6 +233,11 @@ step_switches() {
   expect_arg "$f" --relay=n0
   ok "relay=n0 puts --relay=n0 on the container"
 
+  local b="$tmp/bind.yaml"
+  render iroh-gateway "$b" --namespace "$ns" --set 'metrics.bindAddress=[::]'
+  expect_arg "$b" '--metrics-listen=[::]:8080'
+  ok "metrics.bindAddress=[::] puts --metrics-listen=[::]:8080 on the container"
+
   local g="$tmp/noclass.yaml"
   render iroh-gateway "$g" --namespace "$ns" --set gatewayClass.create=false
   expect_count "$g" GatewayClass 0

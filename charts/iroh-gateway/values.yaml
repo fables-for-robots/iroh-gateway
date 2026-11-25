@@ -35,8 +35,11 @@ identity:
   secretName: iroh-gateway-identity
 
 metrics:
-  # --metrics-listen=0.0.0.0:<port>: /metrics, /healthz and /readyz. The probes use it too.
+  # --metrics-listen=<bindAddress>:<port>: /metrics, /healthz and /readyz. The probes use it too.
   port: 8080
+  # The address the port is bound on. "0.0.0.0" listens on IPv4 only; "[::]" is the value for
+  # an IPv6 or dual-stack listener, needed when the pod's IP, which the kubelet probes, is IPv6.
+  bindAddress: "0.0.0.0"
   service:
     # A ClusterIP Service in front of the port, named like the release.
     enabled: true

@@ -1,5 +1,6 @@
 {{- if .Values.metrics.service.enabled }}
-# /metrics for Prometheus; the operator serves nothing else over the network.
+# /metrics for Prometheus. The port also serves /healthz and /readyz, for the kubelet's probes;
+# the operator serves nothing else over the network.
 apiVersion: v1
 kind: Service
 metadata:
