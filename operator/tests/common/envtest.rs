@@ -34,11 +34,12 @@ const START_ATTEMPTS: u32 = 5;
 /// The upstream manifest `scripts/envtest-assets` downloads beside the binaries.
 const GATEWAY_API_MANIFEST: &str = "gateway-api-v1.7.0-standard-install.yaml";
 /// The CRDs of that manifest the operator uses.
-const GATEWAY_API_CRDS: [&str; 4] = [
+const GATEWAY_API_CRDS: [&str; 5] = [
     "gatewayclasses.gateway.networking.k8s.io",
     "gateways.gateway.networking.k8s.io",
     "httproutes.gateway.networking.k8s.io",
     "tcproutes.gateway.networking.k8s.io",
+    "udproutes.gateway.networking.k8s.io",
 ];
 
 /// A process that ended during start, with its log, and whether it found its port taken.

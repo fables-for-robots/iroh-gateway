@@ -7,7 +7,7 @@ pub mod conditions;
 
 use std::collections::BTreeMap;
 
-use iroh_gateway_proto::control::Protocol;
+use iroh_gateway_proto::control::{ListenerKey, Protocol};
 
 use crate::crd::EdgeListenerStatus;
 use crate::model::{
@@ -164,37 +164,54 @@ pub fn compute(model: &Model, facts: &Facts) -> DesiredStatus {
     }
 }
 
-/// The ports of the listeners that get a frontend and an open port on the edges, ascending.
-fn serving_ports(gateway: &GatewayModel) -> Vec<u16> {
-    let mut ports: Vec<u16> = gateway
+/// What the edge binds for a listener: its transport and port.
+fn listener_key(l: &ListenerModel) -> ListenerKey {
+    ListenerKey {
+        protocol: l.transport(),
+        port: l.port,
+    }
+}
+
+/// A port as messages name it: `port 443` over TCP, `UDP port 53`.
+fn port_name(key: ListenerKey) -> String {
+    match key.protocol {
+        Protocol::Tcp => format!("port {}", key.port),
+        Protocol::Udp => format!("UDP port {}", key.port),
+    }
+}
+
+/// What the edges open for the serving listeners, by port, a TCP port before a UDP one of the
+/// same number.
+fn serving_ports(gateway: &GatewayModel) -> Vec<ListenerKey> {
+    let mut ports: Vec<ListenerKey> = gateway
         .listeners
         .iter()
         .filter(|l| l.serving())
-        .map(|l| l.port)
+        .map(listener_key)
         .collect();
-    ports.sort_unstable();
+    ports.sort_unstable_by_key(|k| (k.port, k.protocol == Protocol::Udp));
     ports.dedup();
     ports
 }
 
-fn tcp_port(state: &EdgeState, port: u16) -> Option<&ListenerState> {
-    state
-        .listeners
-        .iter()
-        .find(|l| l.key.protocol == Protocol::Tcp && l.key.port == port)
+fn edge_port(state: &EdgeState, key: ListenerKey) -> Option<&ListenerState> {
+    state.listeners.iter().find(|l| l.key == key)
 }
 
-/// The first of `ports` (given ascending) that the edge does not report as bound, with why.
-fn first_unbound(state: &EdgeState, ports: &[u16]) -> Option<(u16, Option<String>)> {
-    ports.iter().find_map(|&port| match tcp_port(state, port) {
+/// The first of `ports` (given in order) that the edge does not report as bound, with why.
+fn first_unbound(
+    state: &EdgeState,
+    ports: &[ListenerKey],
+) -> Option<(ListenerKey, Option<String>)> {
+    ports.iter().find_map(|&key| match edge_port(state, key) {
         Some(ListenerState { bound: Ok(()), .. }) => None,
-        Some(ListenerState { bound: Err(e), .. }) => Some((port, Some(e.clone()))),
-        None => Some((port, None)),
+        Some(ListenerState { bound: Err(e), .. }) => Some((key, Some(e.clone()))),
+        None => Some((key, None)),
     })
 }
 
 /// None when the edge is ready, otherwise why it is not.
-fn not_ready(state: Option<&EdgeState>, ports: &[u16]) -> Option<String> {
+fn not_ready(state: Option<&EdgeState>, ports: &[ListenerKey]) -> Option<String> {
     let Some(state) = state else {
         return Some(NOT_STARTED.to_owned());
     };
@@ -206,9 +223,9 @@ fn not_ready(state: Option<&EdgeState>, ports: &[u16]) -> Option<String> {
                 .unwrap_or_else(|| NOT_STARTED.to_owned()),
         );
     }
-    first_unbound(state, ports).map(|(port, why)| match why {
-        Some(e) => format!("connected, port {port}: {e}"),
-        None => format!("connected, port {port} not reported yet"),
+    first_unbound(state, ports).map(|(key, why)| match why {
+        Some(e) => format!("connected, {}: {e}", port_name(key)),
+        None => format!("connected, {} not reported yet", port_name(key)),
     })
 }
 
@@ -337,7 +354,8 @@ fn listener_status(
             "Invalid",
             format!("the Gateway is not accepted: {}", rej.message),
         )
-    } else if let Err(e) = &facts.haproxy {
+    } else if let (Err(e), Protocol::Tcp) = (&facts.haproxy, l.transport()) {
+        // A UDP listener does not go through HAProxy: a refused configuration leaves it be.
         cond("Programmed", false, "Invalid", e.clone())
     } else {
         listener_programmed(l, facts, edge_keys)
@@ -355,16 +373,18 @@ fn listener_status(
     }
 }
 
-/// `Programmed` of a listener that is valid, of an accepted Gateway, with HAProxy fine: True once
-/// an accepted, connected edge of the Gateway reports the listener's port bound, or, for a
-/// listener that is not serving, once one is connected.
+/// `Programmed` of a listener that is valid, of an accepted Gateway, with HAProxy fine unless the
+/// listener is UDP: True once an accepted, connected edge of the Gateway reports the listener's
+/// port bound, or, for a listener that is not serving, once one is connected.
 fn listener_programmed(l: &ListenerModel, facts: &Facts, edge_keys: &[ObjRef]) -> Cond {
     let serving = l.serving();
+    let key = listener_key(l);
+    let port = port_name(key);
     let connected = |k: &ObjRef| facts.edges.get(k).filter(|s| s.connected);
     let ready = edge_keys.iter().filter_map(connected).any(|state| {
         !serving
             || matches!(
-                tcp_port(state, l.port),
+                edge_port(state, key),
                 Some(ListenerState { bound: Ok(()), .. })
             )
     });
@@ -383,11 +403,11 @@ fn listener_programmed(l: &ListenerModel, facts: &Facts, edge_keys: &[ObjRef]) -
     let mut others = Vec::new();
     for k in edge_keys {
         match facts.edges.get(k) {
-            Some(state) if state.connected => match tcp_port(state, l.port) {
+            Some(state) if state.connected => match edge_port(state, key) {
                 Some(ListenerState { bound: Err(e), .. }) => {
-                    bind_errors.push(format!("edge {k} cannot bind port {}: {e}", l.port));
+                    bind_errors.push(format!("edge {k} cannot bind {port}: {e}"));
                 }
-                _ => others.push(format!("edge {k} has not reported port {} yet", l.port)),
+                _ => others.push(format!("edge {k} has not reported {port} yet")),
             },
             state => {
                 let why = state
@@ -437,22 +457,22 @@ fn edge_status(model: &Model, e: &EdgeModel, facts: &Facts) -> EdgeStatusOut {
     let programmed = match state {
         Some(s) if connected => {
             // A port the edge reported as failed comes before one it has not reported yet.
-            let failed = ports.iter().find_map(|&port| match tcp_port(s, port) {
-                Some(ListenerState { bound: Err(e), .. }) => Some((port, e)),
+            let failed = ports.iter().find_map(|&key| match edge_port(s, key) {
+                Some(ListenerState { bound: Err(e), .. }) => Some((key, e)),
                 _ => None,
             });
             match (failed, first_unbound(s, &ports)) {
-                (Some((port, why)), _) => cond(
+                (Some((key, why)), _) => cond(
                     "Programmed",
                     false,
                     "BindFailed",
-                    format!("port {port} is not bound: {why}"),
+                    format!("{} is not bound: {why}", port_name(key)),
                 ),
-                (None, Some((port, _))) => cond(
+                (None, Some((key, _))) => cond(
                     "Programmed",
                     false,
                     "Pending",
-                    format!("port {port} not reported yet"),
+                    format!("{} not reported yet", port_name(key)),
                 ),
                 (None, None) => cond("Programmed", true, "Programmed", ""),
             }
@@ -493,7 +513,6 @@ fn edge_status(model: &Model, e: &EdgeModel, facts: &Facts) -> EdgeStatusOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh_gateway_proto::control::ListenerKey;
 
     const NOT_STARTED: &str = "the link has not started yet";
 
@@ -571,6 +590,24 @@ mod tests {
                 port,
             },
             bound: r.map_err(str::to_owned),
+        }
+    }
+
+    fn udp_listener(name: &str, port: u16, serving: bool) -> ListenerModel {
+        ListenerModel {
+            protocol: "UDP".into(),
+            supported_kinds: vec!["UDPRoute".into()],
+            ..listener(name, port, serving)
+        }
+    }
+
+    fn udp_bound(port: u16, r: Result<(), &str>) -> ListenerState {
+        ListenerState {
+            key: ListenerKey {
+                protocol: Protocol::Udp,
+                port,
+            },
+            ..bound(port, r)
         }
     }
 
@@ -1481,6 +1518,209 @@ mod tests {
         assert!(p.message.contains("ns/e") && p.message.contains("ns/e2"));
         assert!(!p.message.contains("ns/x"), "{}", p.message);
         check(gw_cond(&d, "gw2", "Programmed"), true, "Programmed");
+    }
+
+    #[test]
+    fn udp_listener_is_programmed_once_an_edge_binds_its_udp_port() {
+        let m = model(
+            gateway(
+                vec![
+                    listener("dns-tcp", 53, true),
+                    udp_listener("dns-udp", 53, true),
+                ],
+                &["e"],
+            ),
+            vec![edge("e", Ok(()))],
+        );
+        let programmed = |d: &DesiredStatus, name: &str| -> Cond {
+            let l = d.gateways[0].listeners.iter().find(|l| l.name == name);
+            get(&l.unwrap().conditions, "Programmed").clone()
+        };
+        // TCP 53 bound, UDP 53 not.
+        let d = compute(&m, &facts(vec![("e", up(vec![bound(53, Ok(()))]))]));
+        check(&programmed(&d, "dns-tcp"), true, "Programmed");
+        let u = programmed(&d, "dns-udp");
+        check(&u, false, "Pending");
+        assert_eq!(u.message, "edge ns/e has not reported UDP port 53 yet");
+        // And the reverse.
+        let d = compute(&m, &facts(vec![("e", up(vec![udp_bound(53, Ok(()))]))]));
+        check(&programmed(&d, "dns-udp"), true, "Programmed");
+        let t = programmed(&d, "dns-tcp");
+        check(&t, false, "Pending");
+        assert_eq!(t.message, "edge ns/e has not reported port 53 yet");
+    }
+
+    #[test]
+    fn udp_bind_error_names_the_udp_port() {
+        let m = model(
+            gateway(vec![udp_listener("dns", 53, true)], &["e"]),
+            vec![edge("e", Ok(()))],
+        );
+        let st = up(vec![
+            bound(53, Ok(())),
+            udp_bound(53, Err("address in use")),
+        ]);
+        let d = compute(&m, &facts(vec![("e", st)]));
+        let g = &d.gateways[0];
+        let l = get(&g.listeners[0].conditions, "Programmed");
+        check(l, false, "Pending");
+        assert_eq!(
+            l.message,
+            "edge ns/e cannot bind UDP port 53: address in use"
+        );
+        let p = get(&g.conditions, "Programmed");
+        check(p, false, "Pending");
+        assert!(
+            p.message.contains("connected, UDP port 53: address in use"),
+            "{}",
+            p.message
+        );
+        let e = get(&d.edges[0].conditions, "Programmed");
+        check(e, false, "BindFailed");
+        assert_eq!(e.message, "UDP port 53 is not bound: address in use");
+    }
+
+    #[test]
+    fn udp_listener_stays_programmed_when_haproxy_refused_the_configuration() {
+        let m = model(
+            gateway(
+                vec![listener("pg", 5432, true), udp_listener("dns", 53, true)],
+                &["e"],
+            ),
+            vec![edge("e", Ok(()))],
+        );
+        let mut f = facts(vec![(
+            "e",
+            up(vec![bound(5432, Ok(())), udp_bound(53, Ok(()))]),
+        )]);
+        f.haproxy = Err("config says nope".into());
+        let d = compute(&m, &f);
+        let g = &d.gateways[0];
+        let status = |name: &str| {
+            let l = g.listeners.iter().find(|l| l.name == name).unwrap();
+            get(&l.conditions, "Programmed").clone()
+        };
+        check(&status("dns"), true, "Programmed");
+        let pg = status("pg");
+        check(&pg, false, "Invalid");
+        assert!(pg.message.contains("nope"), "{}", pg.message);
+        let p = get(&g.conditions, "Programmed");
+        check(p, false, "Invalid");
+        assert!(p.message.contains("nope"), "{}", p.message);
+        // Without its UDP port bound, the UDP listener waits for the edge, not for HAProxy.
+        let mut f = facts(vec![("e", up(vec![bound(5432, Ok(()))]))]);
+        f.haproxy = Err("config says nope".into());
+        let d = compute(&m, &f);
+        let dns = d.gateways[0].listeners.iter().find(|l| l.name == "dns");
+        let dns = get(&dns.unwrap().conditions, "Programmed");
+        check(dns, false, "Pending");
+        assert_eq!(dns.message, "edge ns/e has not reported UDP port 53 yet");
+    }
+
+    #[test]
+    fn edge_is_not_ready_until_its_udp_ports_are_bound() {
+        let gw = gateway(
+            vec![
+                listener("web", 80, true),
+                udp_listener("dns-udp", 53, true),
+                listener("dns-tcp", 53, true),
+                udp_listener("idle", 54, false),
+            ],
+            &["e"],
+        );
+        // Keyed by transport and port, sorted by port, TCP first; only serving listeners.
+        let key = |protocol, port| ListenerKey { protocol, port };
+        assert_eq!(
+            serving_ports(&gw),
+            [
+                key(Protocol::Tcp, 53),
+                key(Protocol::Udp, 53),
+                key(Protocol::Tcp, 80)
+            ]
+        );
+        let m = model(gw, vec![edge("e", Ok(()))]);
+        let status = |st: EdgeState| -> (Cond, Cond) {
+            let d = compute(&m, &facts(vec![("e", st)]));
+            (
+                get(&d.edges[0].conditions, "Programmed").clone(),
+                get(&d.gateways[0].conditions, "Programmed").clone(),
+            )
+        };
+        let (e, g) = status(up(vec![bound(53, Ok(())), bound(80, Ok(()))]));
+        check(&e, false, "Pending");
+        assert_eq!(e.message, "UDP port 53 not reported yet");
+        check(&g, false, "Pending");
+        assert!(
+            g.message
+                .contains("connected, UDP port 53 not reported yet"),
+            "{}",
+            g.message
+        );
+        // A TCP port of the same number is reported first.
+        let (e, _) = status(up(vec![bound(80, Ok(()))]));
+        assert_eq!(e.message, "port 53 not reported yet");
+        let (e, _) = status(up(vec![
+            bound(53, Ok(())),
+            bound(80, Ok(())),
+            udp_bound(53, Err("in use")),
+        ]));
+        check(&e, false, "BindFailed");
+        assert_eq!(e.message, "UDP port 53 is not bound: in use");
+        let (e, g) = status(up(vec![
+            bound(53, Ok(())),
+            bound(80, Ok(())),
+            udp_bound(53, Ok(())),
+        ]));
+        check(&e, true, "Programmed");
+        check(&g, true, "Programmed");
+    }
+
+    #[test]
+    fn route_status_carries_the_udp_kind() {
+        use crate::model::{RouteKind, RouteModel, RouteParent};
+        let parent = ParentKey {
+            group: "gateway.networking.k8s.io".into(),
+            kind: "Gateway".into(),
+            namespace: "ns".into(),
+            name: "gw".into(),
+            section_name: None,
+            port: None,
+        };
+        let route = |kind, name: &str, generation| RouteModel {
+            kind,
+            key: ObjRef::new("ns", name),
+            generation,
+            parents: vec![RouteParent {
+                parent: parent.clone(),
+                accepted: Ok(()),
+                resolved_refs: Ok(()),
+            }],
+        };
+        let mut m = model(gateway(vec![], &[]), vec![]);
+        m.routes = vec![
+            route(RouteKind::Udp, "web", 4),
+            route(RouteKind::Http, "web", 2),
+            route(RouteKind::Udp, "a", 5),
+            route(RouteKind::Tcp, "web", 1),
+        ];
+        let d = compute(&m, &facts(vec![]));
+        let got: Vec<(RouteKind, &str, i64)> = d
+            .routes
+            .iter()
+            .map(|r| (r.kind, r.key.name.as_str(), r.generation))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (RouteKind::Tcp, "web", 1),
+                (RouteKind::Http, "web", 2),
+                (RouteKind::Udp, "a", 5),
+                (RouteKind::Udp, "web", 4),
+            ]
+        );
+        let udp = &d.routes[2];
+        check(get(&udp.parents[0].1, "Accepted"), true, "Accepted");
+        check(get(&udp.parents[0].1, "ResolvedRefs"), true, "ResolvedRefs");
     }
 
     fn d_names(d: &DesiredStatus) -> Vec<String> {

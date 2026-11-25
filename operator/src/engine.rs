@@ -1,7 +1,10 @@
 //! Applies a [`Rendered`] to the running system: HAProxy first, then one link per edge.
 //!
-//! The rule everything here follows: an edge opens a public port only after HAProxy serves the
-//! socket behind it, and an edge that left the plan loses its link whatever HAProxy does.
+//! The rule everything here follows: an edge opens a public TCP port only after HAProxy serves
+//! the socket behind it, and a UDP port only after its link has the port's targets; an edge that
+//! left the plan loses its link whatever HAProxy does. UDP does not go through HAProxy: the UDP
+//! targets of every link follow each render at once, whether or not HAProxy takes its
+//! configuration.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::poll_fn;
@@ -25,7 +28,8 @@ use crate::haproxy::{ApplyError, Supervisor, SupervisorOptions};
 use crate::model::ObjRef;
 use crate::status::Facts;
 use crate::tunnel::{
-    EdgeLink, EdgeState, HaproxyConnector, LinkHandle, LinkOptions, truncate_status_text,
+    EdgeLink, EdgeState, HaproxyConnector, LinkHandle, LinkOptions, UdpTargets,
+    truncate_status_text,
 };
 
 /// Default for [`EngineOptions::retry`].
@@ -83,6 +87,10 @@ pub struct Engine {
 }
 
 /// One running link and what it was started with.
+///
+/// The link asks its edge for the TCP ports of `sockets` and the UDP ports of `udp`. `udp` holds
+/// the targets of the last plan applied, whatever HAProxy made of it; `sockets` only ports HAProxy
+/// serves.
 struct Running {
     endpoint_id: EndpointId,
     address: Option<String>,
@@ -90,7 +98,10 @@ struct Running {
     state: watch::Receiver<EdgeState>,
     desired: watch::Sender<Vec<ListenerKey>>,
     connector: Arc<HaproxyConnector>,
-    /// The ports in the table `connector` was last given, which are also the ports this link
+    /// The link's UDP targets, whose keys are also the UDP ports this link asks its edge for
+    /// (once published).
+    udp: watch::Sender<UdpTargets>,
+    /// The ports in the table `connector` was last given, which are also the TCP ports this link
     /// asks its edge for (once published).
     sockets: HashMap<ListenerKey, PortPlan>,
     /// The ports of this link in the last plan HAProxy loaded.
@@ -98,9 +109,10 @@ struct Running {
 }
 
 impl Engine {
-    /// Starts HAProxy with `initial.haproxy_cfg`, then applies `initial` as `apply` does.
-    /// The initial configuration must name no file: start fails, before HAProxy is started,
-    /// when `initial.files` is not empty.
+    /// Starts HAProxy with `initial.haproxy_cfg`, then applies `initial` as `apply` does when
+    /// HAProxy took the configuration: each edge's link starts with its plan's UDP targets and
+    /// then asks for its ports. The initial configuration must name no file: start fails, before
+    /// HAProxy is started, when `initial.files` is not empty.
     pub async fn start(
         endpoint: iroh::Endpoint,
         opts: EngineOptions,
@@ -138,10 +150,19 @@ impl Engine {
     /// HAProxy took the configuration are links started and ports added; when it did not, each
     /// link keeps only the ports it may keep.
     ///
+    /// UDP ports do not depend on HAProxy. Before HAProxy is applied, every link that stays gets
+    /// the new plan's UDP targets: a flow whose target left them ends, and a packet for a UDP
+    /// port that left the plan is dropped. Once HAProxy's result is known, each link asks its
+    /// edge for the TCP ports above and for every UDP port of the new plan, whether HAProxy took
+    /// the configuration or not. A link new in the plan is started only when HAProxy took the
+    /// configuration, with its UDP targets set before it starts. So a UDP change takes effect
+    /// whatever HAProxy says, and an edge is asked for a UDP port only after its link has the
+    /// port's targets.
+    ///
     /// Not meant to be cancelled, and the reconcile loop never cancels it. A cancelled call can
     /// leave the links of the edges that left the plan removed and the other links' socket
-    /// tables cut to their unchanged ports, with the old ports still asked of the edges, while
-    /// HAProxy may already run the new configuration.
+    /// tables cut to their unchanged ports and their UDP targets at the new plan's, with the old
+    /// ports still asked of the edges, while HAProxy may already run the new configuration.
     pub async fn apply(&mut self, rendered: Rendered) {
         let gone: Vec<ObjRef> = self
             .links
@@ -164,10 +185,11 @@ impl Engine {
         }
         // Until HAProxy has the new configuration, a visitor on a port that is moving or going
         // away, or on a TCP port whose backend changes, is refused rather than delivered to
-        // what is behind its socket now. The ports asked of the edges stay as they are until the
-        // outcome is known.
+        // what is behind its socket now. UDP targets take the new plan's at once. The ports
+        // asked of the edges stay as they are until the outcome is known.
         for plan in &rendered.edges {
             if let Some(link) = self.links.get_mut(&plan.key) {
+                link.set_udp(plan);
                 link.keep_unchanged(plan);
             }
         }
@@ -300,8 +322,9 @@ impl Engine {
         LinkOptions::new(plan.endpoint_id, plan.address.clone(), self.relay.clone())
     }
 
-    /// After HAProxy took the configuration: socket tables first, then missing links, then the
-    /// listeners each link asks its edge for.
+    /// After HAProxy took the configuration: socket tables first, then missing links, each with
+    /// its UDP targets, then the listeners each link asks its edge for. The UDP targets of a
+    /// running link are set by the caller before HAProxy is applied.
     fn program(&mut self, plans: &[EdgePlan]) {
         let mut new = Vec::new();
         for plan in plans {
@@ -322,8 +345,14 @@ impl Engine {
         for (plan, opts, connector) in new {
             info!(edge = %plan.key, "starting the link");
             let (desired, desired_rx) = watch::channel(Vec::new());
-            let handle =
-                EdgeLink::spawn(self.endpoint.clone(), opts, desired_rx, connector.clone());
+            let (udp, udp_rx) = watch::channel(udp_targets(plan));
+            let handle = EdgeLink::spawn(
+                self.endpoint.clone(),
+                opts,
+                desired_rx,
+                connector.clone(),
+                udp_rx,
+            );
             let link = Running {
                 endpoint_id: plan.endpoint_id,
                 address: plan.address.clone(),
@@ -331,6 +360,7 @@ impl Engine {
                 handle,
                 desired,
                 connector,
+                udp,
                 sockets: plan.sockets.clone(),
                 loaded: plan.sockets.clone(),
             };
@@ -343,8 +373,9 @@ impl Engine {
         }
     }
 
-    /// After HAProxy refused the configuration: each link keeps only the ports it may keep (see
-    /// [`Engine::apply`]); nothing is added.
+    /// After HAProxy refused the configuration: each link keeps only the TCP ports it may keep
+    /// (see [`Engine::apply`]) and asks for the UDP ports of the plan; no TCP port and no link is
+    /// added.
     fn cut_down(&mut self, plans: &[EdgePlan]) {
         for plan in plans {
             if let Some(link) = self.links.get_mut(&plan.key) {
@@ -375,6 +406,20 @@ fn observed(state: &watch::Receiver<EdgeState>) -> EdgeState {
     state.borrow().clone()
 }
 
+/// The UDP targets of `plan`, as the link takes them.
+fn udp_targets(plan: &EdgePlan) -> UdpTargets {
+    plan.udp
+        .iter()
+        .map(|(&port, targets)| {
+            let key = ListenerKey {
+                protocol: Protocol::Udp,
+                port,
+            };
+            (key, targets.clone())
+        })
+        .collect()
+}
+
 /// The socket of each port, as the connector takes them.
 fn paths(sockets: &HashMap<ListenerKey, PortPlan>) -> HashMap<ListenerKey, PathBuf> {
     sockets
@@ -384,6 +429,17 @@ fn paths(sockets: &HashMap<ListenerKey, PortPlan>) -> HashMap<ListenerKey, PathB
 }
 
 impl Running {
+    /// Gives the link the UDP targets of `plan`; the ports asked of the edge stay as they are
+    /// until [`Running::publish`].
+    fn set_udp(&self, plan: &EdgePlan) {
+        let targets = udp_targets(plan);
+        self.udp.send_if_modified(|current| {
+            let changed = *current != targets;
+            *current = targets;
+            changed
+        });
+    }
+
     fn set_sockets(&mut self, sockets: HashMap<ListenerKey, PortPlan>) {
         self.connector.set(paths(&sockets));
         self.sockets = sockets;
@@ -410,9 +466,15 @@ impl Running {
         self.set_sockets(kept);
     }
 
-    /// Asks the edge for the ports in the socket table, sorted by port.
+    /// Asks the edge for the ports in the socket table and the UDP ports in the UDP table, sorted
+    /// by port, TCP before UDP.
     fn publish(&self) {
-        let mut keys: Vec<ListenerKey> = self.sockets.keys().copied().collect();
+        let mut keys: Vec<ListenerKey> = self
+            .sockets
+            .keys()
+            .chain(self.udp.borrow().keys())
+            .copied()
+            .collect();
         keys.sort_by_key(|k| (k.port, k.protocol == Protocol::Udp));
         self.desired.send_if_modified(|desired| {
             let changed = *desired != keys;

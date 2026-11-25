@@ -24,6 +24,10 @@ use gateway_api::httproutes::v1::{
 use gateway_api::tcproutes::v1::{
     TcpRoute, TcpRouteParentRefs, TcpRouteStatusParents, TcpRouteStatusParentsParentRef,
 };
+use gateway_api::udproutes::v1::{
+    UdpRoute, UdpRouteParentRefs, UdpRouteStatusParents, UdpRouteStatusParentsParentRef,
+};
+use iroh_gateway_proto::control::Protocol;
 use iroh_gateway_proto::transport::Relay;
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
@@ -84,6 +88,7 @@ pub struct Snapshot {
     pub gateways: Vec<Gateway>,
     pub tcp_routes: Vec<TcpRoute>,
     pub http_routes: Vec<HttpRoute>,
+    pub udp_routes: Vec<UdpRoute>,
     pub edges: Vec<Edge>,
     pub services: Vec<Service>,
     pub namespaces: Vec<Namespace>,
@@ -95,6 +100,7 @@ pub struct Snapshot {
 pub enum RouteKind {
     Tcp,
     Http,
+    Udp,
 }
 
 impl RouteKind {
@@ -103,6 +109,7 @@ impl RouteKind {
         match self {
             RouteKind::Tcp => "TCPRoute",
             RouteKind::Http => "HTTPRoute",
+            RouteKind::Udp => "UDPRoute",
         }
     }
 }
@@ -166,7 +173,9 @@ parent_ref_from!(
     TcpRouteParentRefs,
     TcpRouteStatusParentsParentRef,
     HttpRouteParentRefs,
-    HttpRouteStatusParentsParentRef
+    HttpRouteStatusParentsParentRef,
+    UdpRouteParentRefs,
+    UdpRouteStatusParentsParentRef
 );
 
 /// `From<&$t> for ParentStatus` for the generated status entry types.
@@ -184,7 +193,11 @@ macro_rules! parent_status_from {
     )*};
 }
 
-parent_status_from!(TcpRouteStatusParents, HttpRouteStatusParents);
+parent_status_from!(
+    TcpRouteStatusParents,
+    HttpRouteStatusParents,
+    UdpRouteStatusParents
+);
 
 impl RouteResource for TcpRoute {
     const KIND: RouteKind = RouteKind::Tcp;
@@ -228,6 +241,27 @@ impl RouteResource for HttpRoute {
     }
 }
 
+impl RouteResource for UdpRoute {
+    const KIND: RouteKind = RouteKind::Udp;
+
+    fn parent_refs(&self) -> Vec<ParentRef> {
+        self.spec
+            .parent_refs
+            .iter()
+            .flatten()
+            .map(ParentRef::from)
+            .collect()
+    }
+
+    fn status_parents(&self) -> Vec<ParentStatus> {
+        self.status
+            .iter()
+            .flat_map(|s| &s.parents)
+            .map(ParentStatus::from)
+            .collect()
+    }
+}
+
 /// Why something was refused: a Gateway API reason and a human readable message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reject {
@@ -252,8 +286,8 @@ pub struct Model {
     pub gateways: Vec<GatewayModel>,
     /// Every `Edge`, by key.
     pub edges: Vec<EdgeModel>,
-    /// Every `TCPRoute` and `HTTPRoute` with a `parentRef` naming one of our gateways, by kind,
-    /// then key.
+    /// Every `TCPRoute`, `HTTPRoute` and `UDPRoute` with a `parentRef` naming one of our
+    /// gateways, by kind, then key.
     pub routes: Vec<RouteModel>,
 }
 
@@ -327,7 +361,7 @@ pub struct ListenerModel {
     pub name: String,
     pub port: u16,
     pub protocol: String,
-    /// The hosts the listener answers for; always `Any` for TCP.
+    /// The hosts the listener answers for; always `Any` for TCP and UDP.
     pub hostname: HostMatch,
     pub accepted: Result<(), Reject>,
     pub conflicted: Option<Reject>,
@@ -370,10 +404,10 @@ pub struct LabelRequirement {
 }
 
 impl ListenerModel {
-    /// Accepted, not conflicted, and ready for traffic: a TCP listener needs a backend, an HTTP
-    /// one a route (which can answer without a backend, like a redirect), an HTTPS one a route
-    /// and its certificates. Only serving listeners get an HAProxy frontend and an open port on
-    /// the edges.
+    /// Accepted, not conflicted, and ready for traffic: a TCP or UDP listener needs a backend,
+    /// an HTTP one a route (which can answer without a backend, like a redirect), an HTTPS one
+    /// a route and its certificates. Only serving listeners get an open port on the edges and,
+    /// unless they are UDP, an HAProxy frontend.
     pub fn serving(&self) -> bool {
         if self.accepted.is_err() || self.conflicted.is_some() {
             return false;
@@ -382,6 +416,15 @@ impl ListenerModel {
             "HTTP" => self.attached_routes > 0,
             "HTTPS" => self.attached_routes > 0 && !self.certificates.is_empty(),
             _ => !self.backends.is_empty(),
+        }
+    }
+
+    /// What the edge binds for this listener: `Udp` for protocol "UDP", `Tcp` for every other.
+    pub fn transport(&self) -> Protocol {
+        if self.protocol == "UDP" {
+            Protocol::Udp
+        } else {
+            Protocol::Tcp
         }
     }
 }
@@ -452,9 +495,14 @@ pub fn build(snapshot: &Snapshot, settings: &Settings) -> Model {
     let edges = edges::edges(snapshot, settings, &gateways);
     edges::bind(&mut gateways, &edges);
 
-    // Routes pass: attach TCPRoutes and HTTPRoutes to listeners, fill `attached_routes`, and
-    // `backends` for TCP.
-    let mut routes = routes::routes(snapshot, &mut gateways);
+    // Routes pass: attach TCPRoutes, UDPRoutes and HTTPRoutes to listeners, fill
+    // `attached_routes`, and `backends` for TCP and UDP.
+    let mut routes = routes::routes(&snapshot.tcp_routes, snapshot, &mut gateways);
+    routes.extend(routes::routes(
+        &snapshot.udp_routes,
+        snapshot,
+        &mut gateways,
+    ));
     let (http_routes, attached) = http_routes::routes(snapshot, &mut gateways);
     routes.extend(http_routes);
     routes.sort_by(|a, b| (a.kind, &a.key).cmp(&(b.kind, &b.key)));
@@ -479,9 +527,12 @@ mod tests {
     use gateway_api::tcproutes::v1::{
         TcpRouteParentRefs, TcpRouteStatus, TcpRouteStatusParents, TcpRouteStatusParentsParentRef,
     };
+    use gateway_api::udproutes::v1::{
+        UdpRouteParentRefs, UdpRouteStatus, UdpRouteStatusParents, UdpRouteStatusParentsParentRef,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
-    use super::fixtures::{http_route, tcp_route};
+    use super::fixtures::{http_route, tcp_route, udp_route};
     use super::{ParentRef, ParentStatus, RouteKind, RouteResource};
 
     fn full() -> ParentRef {
@@ -521,7 +572,9 @@ mod tests {
     fn route_kinds_name_their_resources() {
         assert_eq!(RouteKind::Tcp.as_str(), "TCPRoute");
         assert_eq!(RouteKind::Http.as_str(), "HTTPRoute");
+        assert_eq!(RouteKind::Udp.as_str(), "UDPRoute");
         assert!(RouteKind::Tcp < RouteKind::Http);
+        assert!(RouteKind::Http < RouteKind::Udp);
         assert_eq!(
             <gateway_api::tcproutes::v1::TcpRoute as RouteResource>::KIND,
             RouteKind::Tcp
@@ -529,6 +582,10 @@ mod tests {
         assert_eq!(
             <gateway_api::httproutes::v1::HttpRoute as RouteResource>::KIND,
             RouteKind::Http
+        );
+        assert_eq!(
+            <gateway_api::udproutes::v1::UdpRoute as RouteResource>::KIND,
+            RouteKind::Udp
         );
     }
 
@@ -553,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_and_http_routes_expose_their_parent_refs() {
+    fn tcp_http_and_udp_routes_expose_their_parent_refs() {
         let want = vec![full(), name_only("other")];
 
         let mut tcp = tcp_route("apps", "r");
@@ -591,6 +648,24 @@ mod tests {
             },
         ]);
         assert_eq!(http.parent_refs(), want);
+
+        let mut udp = udp_route("apps", "r");
+        assert_eq!(udp.parent_refs(), []);
+        udp.spec.parent_refs = Some(vec![
+            UdpRouteParentRefs {
+                group: Some("gateway.networking.k8s.io".into()),
+                kind: Some("Gateway".into()),
+                namespace: Some("gw".into()),
+                name: "public".into(),
+                section_name: Some("web".into()),
+                port: Some(443),
+            },
+            UdpRouteParentRefs {
+                name: "other".into(),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(udp.parent_refs(), want);
     }
 
     #[test]
@@ -671,6 +746,38 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&want).unwrap(),
             serde_json::to_value(&http.status.as_ref().unwrap().parents).unwrap()
+        );
+
+        let mut udp = udp_route("apps", "r");
+        assert_eq!(udp.status_parents(), []);
+        udp.status = Some(UdpRouteStatus {
+            parents: vec![
+                UdpRouteStatusParents {
+                    conditions: vec![condition("One")],
+                    controller_name: "example.com/a".into(),
+                    parent_ref: UdpRouteStatusParentsParentRef {
+                        group: Some("gateway.networking.k8s.io".into()),
+                        kind: Some("Gateway".into()),
+                        namespace: Some("gw".into()),
+                        name: "public".into(),
+                        section_name: Some("web".into()),
+                        port: Some(443),
+                    },
+                },
+                UdpRouteStatusParents {
+                    conditions: vec![condition("Two"), condition("Three")],
+                    controller_name: "example.com/b".into(),
+                    parent_ref: UdpRouteStatusParentsParentRef {
+                        name: "other".into(),
+                        ..Default::default()
+                    },
+                },
+            ],
+        });
+        assert_eq!(udp.status_parents(), want);
+        assert_eq!(
+            serde_json::to_value(&want).unwrap(),
+            serde_json::to_value(&udp.status.as_ref().unwrap().parents).unwrap()
         );
     }
 }

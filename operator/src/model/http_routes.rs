@@ -9,6 +9,7 @@ use gateway_api::httproutes::v1::{
     HttpRouteRulesFiltersRequestRedirectScheme, HttpRouteRulesFiltersType, HttpRouteRulesMatches,
     HttpRouteRulesMatchesHeadersType, HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesPathType,
 };
+use iroh_gateway_proto::control::Protocol;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::ResourceExt;
@@ -202,7 +203,7 @@ pub(super) fn translate(
                 port: b.port,
                 weight: b.weight,
             };
-            match backend(&b, &route_ns, services) {
+            match backend(&b, Protocol::Tcp, &route_ns, services) {
                 Ok(Some(backend)) => usable.push(backend),
                 Ok(None) => {}
                 Err(reject) => {
@@ -1800,8 +1801,10 @@ mod tests {
     }
 
     #[test]
-    fn tcp_and_http_routes_are_sorted_by_kind_then_key() {
-        let gw = public().listener("pg", 5432, "TCP");
+    fn routes_are_sorted_by_kind_then_key() {
+        let gw = public()
+            .listener("pg", 5432, "TCP")
+            .listener("dns", 53, "UDP");
         let mut s = snap(
             vec![gw],
             vec![
@@ -1812,8 +1815,16 @@ mod tests {
                 tcp_route("gw", "z").parent("public").backend("db", 5432),
                 tcp_route("gw", "c").parent("public").backend("db", 5432),
             ],
-            vec![web(), service("gw", "db", "10.43.0.12", &[5432])],
+            vec![
+                web(),
+                service("gw", "db", "10.43.0.12", &[5432]),
+                service("gw", "dns", "10.43.0.53", &[]).udp_port(53),
+            ],
         );
+        s.udp_routes = vec![
+            udp_route("gw", "y").parent("public").backend("dns", 53),
+            udp_route("gw", "b").parent("public").backend("dns", 53),
+        ];
         let (m, _) = run(&s);
         let got: Vec<(RouteKind, String)> = m
             .routes
@@ -1825,11 +1836,14 @@ mod tests {
             (RouteKind::Tcp, "gw/z".to_owned()),
             (RouteKind::Http, "gw/a".to_owned()),
             (RouteKind::Http, "gw/b".to_owned()),
+            (RouteKind::Udp, "gw/b".to_owned()),
+            (RouteKind::Udp, "gw/y".to_owned()),
         ];
         assert_eq!(got, want);
         // Whatever the snapshot's order.
         s.http_routes.reverse();
         s.tcp_routes.reverse();
+        s.udp_routes.reverse();
         let (again, _) = run(&s);
         assert_eq!(again, m);
     }

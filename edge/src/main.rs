@@ -8,6 +8,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use iroh::EndpointId;
 use iroh_gateway_edge::{Edge, EdgeOptions};
+use iroh_gateway_proto::datagram::UDP_FLOW_IDLE;
 use iroh_gateway_proto::key::load_or_generate;
 use iroh_gateway_proto::transport::Relay;
 use tracing::{error, info, warn};
@@ -60,6 +61,24 @@ enum Command {
             value_parser = clap::value_parser!(u32).range(1..=4096)
         )]
         max_connections: u32,
+        /// Maximum number of UDP flows (one per visitor address and port); at the cap a new
+        /// flow replaces the least recently used one.
+        #[arg(
+            long,
+            env = "IROH_GATEWAY_EDGE_MAX_UDP_FLOWS",
+            default_value_t = 4096,
+            value_parser = clap::value_parser!(u32).range(1..=4096)
+        )]
+        max_udp_flows: u32,
+        /// Most UDP bytes per second sent from visitors into the tunnel, counted as each
+        /// packet's payload plus an 18-byte header per fragment; no limit when unset.
+        #[arg(
+            long,
+            env = "IROH_GATEWAY_EDGE_UDP_RATE_LIMIT",
+            value_name = "BYTES_PER_SECOND",
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        udp_rate_limit: Option<u64>,
         /// How long listeners stay open without a tunnel, e.g. "5s".
         #[arg(
             long,
@@ -95,6 +114,8 @@ async fn main() -> anyhow::Result<()> {
             iroh_listen,
             public_bind,
             max_connections,
+            max_udp_flows,
+            udp_rate_limit,
             tunnel_grace,
             relay,
         } => {
@@ -118,6 +139,9 @@ async fn main() -> anyhow::Result<()> {
                 max_connections: max_connections as usize,
                 tunnel_grace,
                 relay,
+                max_udp_flows: max_udp_flows as usize,
+                udp_flow_idle: UDP_FLOW_IDLE,
+                udp_rate_limit,
             })
             .await?;
             info!(id = %edge.endpoint_id(), "serving; waiting for SIGINT or SIGTERM");

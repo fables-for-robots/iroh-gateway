@@ -14,8 +14,10 @@ use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::render;
 use iroh_gateway_operator::model::{self, Settings, Snapshot};
 use iroh_gateway_operator::staticcfg;
-use iroh_gateway_operator::tunnel::{EdgeLink, LinkOptions, StaticConnector, bind_endpoint};
-use iroh_gateway_proto::control::ListenerKey;
+use iroh_gateway_operator::tunnel::{
+    EdgeLink, LinkOptions, StaticConnector, UdpTarget, UdpTargets, bind_endpoint,
+};
+use iroh_gateway_proto::control::{ListenerKey, Protocol};
 use iroh_gateway_proto::key::load_or_generate;
 use iroh_gateway_proto::transport::Relay;
 use tokio::sync::watch;
@@ -128,37 +130,40 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
     let mut links = Vec::new();
     // Each ends when its link's task ends, which before shutdown it never does on its own.
     let mut watchers = JoinSet::new();
-    // The senders live until shutdown; the links keep the last desired set anyway.
-    let mut desired_senders = Vec::new();
+    // The senders live until shutdown; the links keep the last values anyway.
+    let mut senders = Vec::new();
     for edge in cfg.edges {
-        let keys: Vec<ListenerKey> = edge
-            .listeners
-            .iter()
-            .map(|l| ListenerKey {
+        let mut keys = Vec::new();
+        let mut tcp_targets = HashMap::new();
+        let mut udp_targets = UdpTargets::new();
+        for l in &edge.listeners {
+            let key = ListenerKey {
                 protocol: l.protocol,
                 port: l.port,
-            })
-            .collect();
-        let targets: HashMap<_, _> = edge
-            .listeners
-            .iter()
-            .map(|l| {
-                (
-                    ListenerKey {
-                        protocol: l.protocol,
-                        port: l.port,
-                    },
-                    l.target,
-                )
-            })
-            .collect();
+            };
+            keys.push(key);
+            match l.protocol {
+                Protocol::Tcp => {
+                    tcp_targets.insert(key, l.target);
+                }
+                Protocol::Udp => {
+                    let target = UdpTarget {
+                        addr: l.target,
+                        weight: 1,
+                    };
+                    udp_targets.insert(key, vec![target]);
+                }
+            }
+        }
         let opts = LinkOptions::new(edge.endpoint_id, edge.address, cfg.relay.clone())?;
         let (tx, rx) = watch::channel(keys);
+        let (udp_tx, udp_rx) = watch::channel(udp_targets);
         let link = EdgeLink::spawn(
             endpoint.clone(),
             opts,
             rx,
-            Arc::new(StaticConnector::new(targets)),
+            Arc::new(StaticConnector::new(tcp_targets)),
+            udp_rx,
         );
         let mut state = link.state();
         let id = edge.endpoint_id;
@@ -184,7 +189,7 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
             }
             id
         });
-        desired_senders.push(tx);
+        senders.push((tx, udp_tx));
         links.push(link);
     }
 
@@ -201,7 +206,7 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
         link.shutdown().await;
     }
     watchers.abort_all();
-    drop(desired_senders);
+    drop(senders);
     endpoint.close().await;
     Ok(())
 }

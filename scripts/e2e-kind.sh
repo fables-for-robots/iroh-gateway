@@ -25,7 +25,8 @@ diagnostics() {
   echo "=== e2e failed; cluster state follows ===" >&2
   kubectl get pods -A -o wide >&2 || true
   for resource in gateways.gateway.networking.k8s.io tcproutes.gateway.networking.k8s.io \
-    httproutes.gateway.networking.k8s.io edges.gateway.fables-for-robots.ch; do
+    udproutes.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io \
+    edges.gateway.fables-for-robots.ch; do
     k get "$resource" -o wide >&2 || true
     k describe "$resource" >&2 || true
   done
@@ -100,6 +101,51 @@ route_accepted() {
     [ "$got" = "$2" ]
 }
 
+# True when the Programmed condition of the listener named udp of Gateway public reads True.
+udp_listener_programmed() {
+  got="$(k get gateways.gateway.networking.k8s.io public \
+    -o jsonpath='{.status.listeners[?(@.name=="udp")].conditions[?(@.type=="Programmed")].status}' 2>&1)" &&
+    [ "$got" = True ]
+}
+
+# True when the Accepted condition of the only parent entry of UDPRoute udp-echo reads True.
+udproute_accepted() {
+  got="$(k get udproutes.gateway.networking.k8s.io udp-echo \
+    -o jsonpath='{.status.parents[*].conditions[?(@.type=="Accepted")].status}' 2>&1)" &&
+    [ "$got" = True ]
+}
+
+# The cluster IP of the edge's Service, where the UDP probes send to; set by the UDP steps.
+udp_edge_ip=
+# The last token sent by udp_dial.
+token=
+
+# Makes the udp-echo pod send "echo <token>" over UDP to the edge's Service on port 9001
+# (agnhost's /dial, asked through its HTTP port from the probe pod; it waits up to 5 s for an
+# answer). A fresh lowercase token each time, so an old answer cannot pass for a new one. What
+# it printed goes to $got: {"responses":["<token>"]} when the packet was answered by the
+# backend, {"errors":[...]} when nothing came back. The status is wget's.
+udp_dial() {
+  token="t$RANDOM$RANDOM"
+  got="$(k exec probe -- wget -qO- -T 15 \
+    "http://udp-echo.$ns.svc:8081/dial?request=echo%20$token&protocol=udp&host=$udp_edge_ip&port=9001&tries=1" 2>&1)"
+}
+
+# True when the packet of a udp_dial was answered with its token.
+udp_answered() {
+  udp_dial && [[ "$got" == *"\"responses\":[\"$token\"]"* ]]
+}
+
+# True when a udp_dial ran and brought no answer.
+udp_silent() {
+  udp_dial && [[ "$got" != *'"responses"'* ]]
+}
+
+# True when three packets in a row get no answer.
+udp_stopped() {
+  udp_silent && udp_silent && udp_silent
+}
+
 # Writes the Secret app-tls of type kubernetes.io/tls from certificate $1 and key $2, creating
 # or replacing it.
 app_tls_secret() {
@@ -131,7 +177,7 @@ kubectl apply --server-side -f "$gateway_api_crds"
 # deploy/ creates a GatewayClass, so its CRD must be served before that is applied.
 kubectl wait --for=condition=Established --timeout=60s \
   crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
-  crd/tcproutes.gateway.networking.k8s.io
+  crd/tcproutes.gateway.networking.k8s.io crd/udproutes.gateway.networking.k8s.io
 
 step "deploy/ and the operator"
 kubectl apply -f "$root/deploy/"
@@ -246,6 +292,9 @@ spec:
     - name: https
       protocol: TCP
       port: 8443
+    - name: udp
+      protocol: UDP
+      port: 9001
 YAML
 k rollout status deployment/edge --timeout=120s
 
@@ -538,6 +587,122 @@ if ! retry 20 certificate_files_private; then
   exit 1
 fi
 echo "$got"
+
+step "UDP: backend, UDP listener and UDPRoute"
+kubectl apply -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-echo
+  namespace: $ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-echo
+  template:
+    metadata:
+      labels:
+        app: udp-echo
+    spec:
+      containers:
+        - name: udp-echo
+          image: registry.k8s.io/e2e-test-images/agnhost:2.47
+          imagePullPolicy: IfNotPresent
+          args:
+            - netexec
+            - --http-port=8081
+            - --udp-port=9001
+          ports:
+            - containerPort: 8081
+              protocol: TCP
+            - containerPort: 9001
+              protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-echo
+  namespace: $ns
+spec:
+  selector:
+    app: udp-echo
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8081
+    - name: udp
+      protocol: UDP
+      port: 9001
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: $ns
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: tcp-8080
+      protocol: TCP
+      port: 8080
+    - name: http
+      protocol: HTTP
+      port: 8081
+    - name: https
+      protocol: HTTPS
+      port: 8443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-tls
+    - name: udp
+      protocol: UDP
+      port: 9001
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata:
+  name: udp-echo
+  namespace: $ns
+spec:
+  parentRefs:
+    - name: public
+      sectionName: udp
+  rules:
+    - backendRefs:
+        - name: udp-echo
+          port: 9001
+YAML
+k rollout status deployment/udp-echo --timeout=120s
+udp_edge_ip="$(k get service edge -o jsonpath='{.spec.clusterIP}')"
+echo "edge service address: $udp_edge_ip"
+[[ "$udp_edge_ip" =~ ^[0-9.]+$ ]]
+
+step "UDP: a packet through the edge is answered by the backend"
+# The first attempts may fail while the edge opens the port.
+if ! retry 60 udp_answered; then
+  echo "expected the answer '$token' from the backend through the edge's UDP port 9001, got '$got'" >&2
+  exit 1
+fi
+echo "answered: $got"
+
+step "UDP: conditions"
+if ! retry 30 udp_listener_programmed; then
+  echo "expected the listener udp of Gateway public Programmed 'True', got '$got'" >&2
+  exit 1
+fi
+if ! retry 30 udproute_accepted; then
+  echo "expected UDPRoute udp-echo Accepted 'True', got '$got'" >&2
+  exit 1
+fi
+
+step "UDP: deleting the UDPRoute stops the answers"
+k delete udproutes.gateway.networking.k8s.io udp-echo
+if ! retry 60 udp_stopped; then
+  echo "the edge still answers UDP port 9001 60 s after the UDPRoute was deleted, last got '$got'" >&2
+  exit 1
+fi
 
 step "deleting the operator pod is prompt (the image's stop signal reaches the operator)"
 # Well under the 60 s grace period: a pod that is only killed after the grace period fails here.

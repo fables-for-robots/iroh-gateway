@@ -1,9 +1,14 @@
 //! Harness for edge tests: an edge on loopback and a small fake operator that dials it.
+// Each test binary uses its own share of the helpers.
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::Bytes;
 use iroh::endpoint::{
     ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream,
 };
@@ -12,20 +17,58 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions};
 use iroh_gateway_proto::ALPN;
 use iroh_gateway_proto::control::{Config, Listener, Protocol, Status, StreamHeader};
+use iroh_gateway_proto::datagram::{
+    Header, MAX_UDP_FLOWS, Packet, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler, UDP_FLOW_IDLE,
+    split,
+};
 use iroh_gateway_proto::frame::{read_frame, write_frame};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
+use tokio::net::UdpSocket;
 
 /// Upper bound for any single step that should complete promptly on loopback.
 pub const STEP: Duration = Duration::from_secs(10);
 
-pub fn free_tcp_port() -> u16 {
-    let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    s.local_addr().unwrap().port()
+/// The next port of this process's walk through 20000..30000. That range lies below every
+/// ephemeral range (Linux 32768.., macOS 49152..), so neither a socket bound to port 0 nor the
+/// source port of an outgoing connection, such as another test's, can take a port between the
+/// moment a test picks it and the moment the test binds it. The walk starts at a random port and
+/// hands out each port once, so two tests of one process never get the same one.
+fn next_port() -> u16 {
+    static NEXT: LazyLock<AtomicU16> = LazyLock::new(|| AtomicU16::new(fastrand::u16(0..10_000)));
+    20_000 + NEXT.fetch_add(1, Ordering::Relaxed) % 10_000
 }
 
+/// A TCP port on loopback that nothing listens on and nothing takes by chance; see [`next_port`].
+pub fn free_tcp_port() -> u16 {
+    loop {
+        let port = next_port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// A UDP port on loopback that nothing is bound to and nothing takes by chance; see
+/// [`next_port`].
 pub fn free_udp_port() -> u16 {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    s.local_addr().unwrap().port()
+    loop {
+        let port = next_port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// A port free for both TCP and UDP on 127.0.0.1.
+pub fn free_tcp_and_udp_port() -> u16 {
+    loop {
+        let port = next_port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        {
+            return port;
+        }
+    }
 }
 
 pub fn edge_options(operator: EndpointId, grace: Duration, max_connections: usize) -> EdgeOptions {
@@ -37,6 +80,9 @@ pub fn edge_options(operator: EndpointId, grace: Duration, max_connections: usiz
         max_connections,
         tunnel_grace: grace,
         relay: Relay::Disabled,
+        max_udp_flows: MAX_UDP_FLOWS,
+        udp_flow_idle: UDP_FLOW_IDLE,
+        udp_rate_limit: None,
     }
 }
 
@@ -76,6 +122,60 @@ pub fn tcp_cfg(generation: u64, ports: &[u16]) -> Config {
                 port,
             })
             .collect(),
+    }
+}
+
+pub fn cfg(generation: u64, listeners: &[(u32, Protocol, u16)]) -> Config {
+    Config {
+        generation,
+        listeners: listeners
+            .iter()
+            .map(|&(id, protocol, port)| Listener { id, protocol, port })
+            .collect(),
+    }
+}
+
+/// A UDP visitor on loopback.
+pub async fn udp_visitor() -> UdpSocket {
+    UdpSocket::bind("127.0.0.1:0").await.unwrap()
+}
+
+/// The next datagram on `conn`, decoded; panics after `STEP`.
+pub async fn recv_datagram(conn: &Connection) -> (Header, Bytes) {
+    let datagram = tokio::time::timeout(STEP, conn.read_datagram())
+        .await
+        .expect("no datagram")
+        .unwrap();
+    Header::decode(datagram).unwrap()
+}
+
+/// The next whole packet on `conn`; panics after `STEP`.
+pub async fn recv_packet(conn: &Connection) -> Packet {
+    let mut reassembler = Reassembler::new(REASSEMBLY_BYTES, REASSEMBLY_WINDOW);
+    tokio::time::timeout(STEP, async {
+        loop {
+            let (header, payload) = recv_datagram(conn).await;
+            let now = tokio::time::Instant::now().into_std();
+            if let Some(packet) = reassembler.push(header, payload, now) {
+                return packet;
+            }
+        }
+    })
+    .await
+    .expect("no packet")
+}
+
+/// Sends `payload` as one packet, split by the connection's current datagram size.
+pub fn send_packet(
+    conn: &Connection,
+    listener_id: u32,
+    flow_id: u64,
+    packet_id: u32,
+    payload: &[u8],
+) {
+    let max = conn.max_datagram_size().expect("datagrams unsupported");
+    for datagram in split(listener_id, flow_id, packet_id, payload, max).unwrap() {
+        conn.send_datagram(datagram).unwrap();
     }
 }
 

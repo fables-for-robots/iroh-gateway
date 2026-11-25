@@ -5,7 +5,7 @@ metadata:
 rules:
   # Everything the operator watches cluster-wide. Secrets are deliberately absent here.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses", "gateways", "tcproutes", "httproutes"]
+    resources: ["gatewayclasses", "gateways", "tcproutes", "udproutes", "httproutes"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.fables-for-robots.ch"]
     resources: ["edges"]
@@ -15,7 +15,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # Status is written as a JSON merge patch, and only so.
   - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["gatewayclasses/status", "gateways/status", "tcproutes/status", "httproutes/status"]
+    resources: ["gatewayclasses/status", "gateways/status", "tcproutes/status", "udproutes/status", "httproutes/status"]
     verbs: ["patch"]
   - apiGroups: ["gateway.fables-for-robots.ch"]
     resources: ["edges/status"]

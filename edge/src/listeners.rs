@@ -9,13 +9,17 @@ use std::time::Duration;
 use iroh_gateway_proto::control::{
     BindState, Config, ListenerKey, ListenerStatus, Protocol, Status,
 };
+use iroh_gateway_proto::datagram::MAX_PACKET;
 use iroh_gateway_proto::tcp::set_keepalive_and_nodelay;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
-use tokio::net::{TcpListener, TcpStream};
+use socket2::SockRef;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
+
+use crate::udp::{REPLY_QUEUE, Reply, UdpHub};
 
 const ACCEPTED_QUEUE: usize = 1024;
 
@@ -45,20 +49,20 @@ struct Bound {
 }
 
 impl Bound {
-    /// Aborts the accept task and returns once it is gone, and with it the port.
+    /// Aborts the port's task and returns once it is gone, and with it the port.
     async fn close(mut self) {
         self.task.abort();
         if let Err(e) = (&mut self.task).await
             && e.is_panic()
         {
-            error!("accept task panicked: {e}");
+            error!("listener task panicked: {e}");
         }
     }
 }
 
 impl Drop for Bound {
     fn drop(&mut self) {
-        // Aborting drops the TcpListener, which closes the port, once the runtime gets to it.
+        // Aborting drops the socket, which closes the port, once the runtime gets to it.
         self.task.abort();
     }
 }
@@ -67,16 +71,22 @@ pub struct ListenerSet {
     bind_ip: IpAddr,
     permits: Arc<Semaphore>,
     tx: mpsc::Sender<Accepted>,
+    udp: Arc<UdpHub>,
     bound: HashMap<ListenerKey, Bound>,
 }
 
 impl ListenerSet {
-    pub fn new(bind_ip: IpAddr, max_connections: usize) -> (Self, mpsc::Receiver<Accepted>) {
+    pub fn new(
+        bind_ip: IpAddr,
+        max_connections: usize,
+        udp: Arc<UdpHub>,
+    ) -> (Self, mpsc::Receiver<Accepted>) {
         let (tx, rx) = mpsc::channel(ACCEPTED_QUEUE);
         let set = Self {
             bind_ip,
             permits: Arc::new(Semaphore::new(max_connections)),
             tx,
+            udp,
             bound: HashMap::new(),
         };
         (set, rx)
@@ -86,13 +96,12 @@ impl ListenerSet {
     /// closed before any new one is bound and before this returns.
     pub async fn apply(&mut self, cfg: &Config) -> Status {
         // Close ports that are no longer wanted. Established connections are untouched.
-        let removed: Vec<Bound> = self
+        let removed: Vec<(ListenerKey, Bound)> = self
             .bound
             .extract_if(|key, _| !cfg.listeners.iter().any(|l| l.key() == *key))
-            .map(|(_, b)| b)
             .collect();
-        for b in removed {
-            b.close().await;
+        for (key, b) in removed {
+            self.close(key, b).await;
         }
 
         let mut listeners = Vec::with_capacity(cfg.listeners.len());
@@ -101,19 +110,26 @@ impl ListenerSet {
             let state = if let Some(b) = self.bound.get(&key) {
                 b.id.store(l.id, Ordering::Relaxed);
                 BindState::Bound
-            } else if l.protocol == Protocol::Udp {
-                BindState::Error("udp is not supported by this edge version".to_string())
             } else {
-                match TcpListener::bind(SocketAddr::new(self.bind_ip, l.port)).await {
-                    Ok(listener) => {
-                        let id = Arc::new(AtomicU32::new(l.id));
-                        let task = tokio::spawn(accept_loop(
+                let id = Arc::new(AtomicU32::new(l.id));
+                let addr = SocketAddr::new(self.bind_ip, l.port);
+                let task = match l.protocol {
+                    Protocol::Tcp => TcpListener::bind(addr).await.map(|listener| {
+                        tokio::spawn(accept_loop(
                             listener,
                             key,
                             id.clone(),
                             self.permits.clone(),
                             self.tx.clone(),
-                        ));
+                        ))
+                    }),
+                    Protocol::Udp => UdpSocket::bind(addr).await.map(|socket| {
+                        self.udp.port_opened();
+                        tokio::spawn(udp_loop(socket, l.port, id.clone(), self.udp.clone()))
+                    }),
+                };
+                match task {
+                    Ok(task) => {
                         self.bound.insert(key, Bound { id, task });
                         BindState::Bound
                     }
@@ -132,9 +148,17 @@ impl ListenerSet {
 
     /// Closes every port; they are closed when this returns.
     pub async fn close_all(&mut self) {
-        let all: Vec<Bound> = self.bound.drain().map(|(_, b)| b).collect();
-        for b in all {
-            b.close().await;
+        let all: Vec<(ListenerKey, Bound)> = self.bound.drain().collect();
+        for (key, b) in all {
+            self.close(key, b).await;
+        }
+    }
+
+    /// Closes one port; a UDP port's flows go with it, once its task can make no new one.
+    async fn close(&self, key: ListenerKey, b: Bound) {
+        b.close().await;
+        if key.protocol == Protocol::Udp {
+            self.udp.forget_port(key.port);
         }
     }
 
@@ -145,7 +169,7 @@ impl ListenerSet {
 
     pub fn bound(&self) -> Vec<ListenerKey> {
         let mut keys: Vec<_> = self.bound.keys().copied().collect();
-        keys.sort_by_key(|k| k.port);
+        keys.sort_by_key(|k| (k.port, k.protocol == Protocol::Udp));
         keys
     }
 }
@@ -196,10 +220,53 @@ async fn accept_loop(
     }
 }
 
+/// Owns one UDP port's socket: hands each visitor packet to the hub under the listener's
+/// current id, and sends the replies the hub queues for the port. A reply the kernel does not
+/// take at once is dropped and counted.
+async fn udp_loop(socket: UdpSocket, port: u16, id: Arc<AtomicU32>, hub: Arc<UdpHub>) {
+    let (replies_tx, mut replies) = mpsc::channel::<Reply>(REPLY_QUEUE);
+    let mut buf = vec![0u8; MAX_PACKET];
+    let mut recv_errors = LogThrottle::new(LOG_EVERY);
+    let mut send_errors = LogThrottle::new(LOG_EVERY);
+    let mut send_failures: u64 = 0;
+    loop {
+        tokio::select! {
+            received = socket.recv_from(&mut buf) => match received {
+                Ok((n, visitor)) => hub.forward(port, &id, visitor, &buf[..n], &replies_tx),
+                Err(e) => {
+                    if let Some(suppressed) = recv_errors.hit() {
+                        debug!(port, suppressed, "receiving a udp packet failed: {e}");
+                    }
+                }
+            },
+            // Never None: this task holds a sender.
+            Some((visitor, payload)) = replies.recv() => {
+                // Straight to the kernel, as a non-blocking send: awaiting `send_to` would stop
+                // the port receiving while a send waits, and tokio's `try_send_to` refuses until
+                // the reactor has reported the socket writable, which would drop its first
+                // replies.
+                if let Err(e) = SockRef::from(&socket).send_to(&payload, &visitor.into()) {
+                    send_failures += 1;
+                    if let Some(suppressed) = send_errors.hit() {
+                        debug!(
+                            port,
+                            %visitor,
+                            total = send_failures,
+                            suppressed,
+                            "sending a udp reply failed: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use iroh_gateway_proto::control::Listener;
+    use iroh_gateway_proto::datagram::{MAX_UDP_FLOWS, UDP_FLOW_IDLE};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn free_port() -> u16 {
@@ -217,8 +284,23 @@ mod tests {
         }
     }
 
+    fn hub() -> Arc<UdpHub> {
+        UdpHub::new(MAX_UDP_FLOWS, UDP_FLOW_IDLE, None)
+    }
+
     fn new_set(max: usize) -> (ListenerSet, mpsc::Receiver<Accepted>) {
-        ListenerSet::new("127.0.0.1".parse().unwrap(), max)
+        ListenerSet::new("127.0.0.1".parse().unwrap(), max, hub())
+    }
+
+    /// A port free for both TCP and UDP on loopback, other than `not`.
+    fn free_tcp_and_udp_port(not: u16) -> u16 {
+        loop {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = tcp.local_addr().unwrap().port();
+            if port != not && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
     }
 
     /// What one connection attempt to `p` fails with; panics if it succeeds.
@@ -367,14 +449,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_listener_reports_unsupported() {
+    async fn udp_and_tcp_ports_are_listed_in_port_then_protocol_order() {
+        let p = free_tcp_and_udp_port(0);
+        let q = free_tcp_and_udp_port(p);
         let (mut set, _rx) = new_set(10);
-        let st = set.apply(&cfg(1, &[(1, Protocol::Udp, 5353)])).await;
+        let st = set
+            .apply(&cfg(
+                1,
+                &[
+                    (1, Protocol::Udp, q),
+                    (2, Protocol::Tcp, p),
+                    (3, Protocol::Udp, p),
+                    (4, Protocol::Tcp, q),
+                ],
+            ))
+            .await;
+        assert!(st.listeners.iter().all(|l| l.state == BindState::Bound));
+        let key = |protocol, port| ListenerKey { protocol, port };
+        let (lo, hi) = (p.min(q), p.max(q));
         assert_eq!(
-            st.listeners[0].state,
-            BindState::Error("udp is not supported by this edge version".to_string())
+            set.bound(),
+            vec![
+                key(Protocol::Tcp, lo),
+                key(Protocol::Udp, lo),
+                key(Protocol::Tcp, hi),
+                key(Protocol::Udp, hi),
+            ]
         );
-        assert!(set.bound().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_first_udp_port_without_a_rate_limit_warns_once() {
+        let p = free_tcp_and_udp_port(0);
+        let q = free_tcp_and_udp_port(p);
+        let udp = hub();
+        let (mut set, _rx) = ListenerSet::new("127.0.0.1".parse().unwrap(), 10, udp.clone());
+        set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await;
+        assert!(udp.unlimited_warning_due());
+        let st = set
+            .apply(&cfg(2, &[(1, Protocol::Tcp, p), (2, Protocol::Udp, p)]))
+            .await;
+        assert!(st.listeners.iter().all(|l| l.state == BindState::Bound));
+        assert!(!udp.unlimited_warning_due());
+        // With a rate limit, there is nothing to warn about.
+        let limited = UdpHub::new(MAX_UDP_FLOWS, UDP_FLOW_IDLE, Some(1_000));
+        assert!(!limited.unlimited_warning_due());
+        let (mut set, _rx) = ListenerSet::new("127.0.0.1".parse().unwrap(), 10, limited.clone());
+        set.apply(&cfg(1, &[(1, Protocol::Udp, q)])).await;
+        assert!(!limited.unlimited_warning_due());
     }
 
     #[tokio::test]
@@ -463,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn ipv4_visitor_on_dual_stack_listener_is_ipv4() {
         let p = free_port();
-        let (mut set, mut rx) = ListenerSet::new("::".parse().unwrap(), 10);
+        let (mut set, mut rx) = ListenerSet::new("::".parse().unwrap(), 10, hub());
         let st = set.apply(&cfg(1, &[(1, Protocol::Tcp, p)])).await;
         assert_eq!(st.listeners[0].state, BindState::Bound);
         let c = TcpStream::connect(("127.0.0.1", p)).await.unwrap();

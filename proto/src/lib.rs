@@ -1,7 +1,9 @@
 //! Wire protocol shared by the iroh-gateway edge and operator.
 
 pub mod control;
+pub mod datagram;
 pub mod frame;
+pub mod idle;
 pub mod key;
 pub mod splice;
 pub mod tcp;
