@@ -280,7 +280,8 @@ Operator (`iroh_gateway_operator_` + name); every `tunnel_*` metric also has the
   frontend metrics
       mode http
       bind unix@{dir}/metrics.sock mode 600
-      http-request use-service prometheus-exporter if { path /metrics }
+      acl metrics_path path /metrics
+      http-request use-service prometheus-exporter if metrics_path
       no log
   ```
 
@@ -296,7 +297,7 @@ Operator (`iroh_gateway_operator_` + name); every `tunnel_*` metric also has the
 
 - [ ] **Step 3: Render and supervisor.** Emit the frontend; `remove_sockets` also removes `metrics.sock`.
 
-- [ ] **Step 4: The handler.** With `haproxy_exporter: Some(path)`: connect a `UnixStream`, send `GET /metrics HTTP/1.0\r\n\r\n`, read to EOF, all within 2 s and at most 16 MiB; accept only a `200` status line and a body that is not chunked; the answer is the operator's own text, then `# HELP`/`# TYPE` and the line `iroh_gateway_operator_haproxy_exporter_up <0|1>`, then HAProxy's body when it was accepted. `main.rs` sets `haproxy_exporter: Some(haproxy_dir.join(METRICS_SOCKET))` in `run` and `None` in `static`.
+- [ ] **Step 4: The handler.** With `haproxy_exporter: Some(path)`: connect a `UnixStream`, send `GET /metrics HTTP/1.0\r\n\r\n`, read to EOF, all within 2 s and at most 16 MiB; accept only a `200` status line; HAProxy answers with `Transfer-Encoding: chunked` even to an HTTP/1.0 request (seen with 3.3.17), so the body is decoded when that header is present and taken as it is otherwise, and a chunked body that is cut short or malformed is not accepted; the answer is the operator's own text, then `# HELP`/`# TYPE` and the line `iroh_gateway_operator_haproxy_exporter_up <0|1>`, then HAProxy's body when it was accepted. `main.rs` sets `haproxy_exporter: Some(haproxy_dir.join(METRICS_SOCKET))` in `run` and `None` in `static`.
 
 - [ ] **Step 5: Run everything** (Global Constraints).
 
