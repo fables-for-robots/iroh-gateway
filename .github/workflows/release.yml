@@ -13,7 +13,16 @@ on:
       - dist/**
       - scripts/check-release-version.sh
       - charts/**
+      # What breaks a musl build of the edge without touching the files above.
+      - Cargo.lock
+      - rust-toolchain.toml
   workflow_dispatch:
+
+# One run per ref at a time, in order: an older run on main cannot finish last and move the
+# `edge` tag back. A pull request's newer run cancels its older one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   OPERATOR_IMAGE: ghcr.io/fables-for-robots/iroh-gateway-operator
@@ -114,9 +123,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Needs the edge binaries too, so a failed musl build or unit check publishes no image, and
+  # with that no chart, on a tag whose GitHub release would then be skipped.
   manifests:
-    needs: [version, images]
-    if: ${{ !cancelled() && (needs.version.result == 'success' || needs.version.result == 'skipped') && needs.images.result == 'success' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    needs: [version, images, edge-binaries]
+    if: ${{ !cancelled() && (needs.version.result == 'success' || needs.version.result == 'skipped') && needs.images.result == 'success' && needs.edge-binaries.result == 'success' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     strategy:
       matrix:
         image: [operator, edge]
@@ -293,8 +304,8 @@ jobs:
 
           sudo systemctl start iroh-gateway-edge
 
-          # tracing colours its fields, so journald keeps the line as binary: -a prints it and
-          # sed strips the escape sequences before the match.
+          # The edge colours its log only on a terminal. Should a line carry escape codes anyway,
+          # journald keeps it as binary: -a prints it and sed strips them before the match.
           started() {
             local log
             log="$(sudo journalctl -a -o cat -u iroh-gateway-edge --no-pager | sed 's/\x1b\[[0-9;]*m//g')"
@@ -303,17 +314,32 @@ jobs:
           bound() {
             [ -n "$(ss -Hlun 'sport = :7842')" ]
           }
+          up=false
           for _ in $(seq 30); do
             if systemctl is-active --quiet iroh-gateway-edge && started && bound; then
-              echo "iroh-gateway-edge is active, logged id=$id and binds UDP 7842"
-              exit 0
+              up=true
+              break
             fi
             sleep 1
           done
-          echo "::error::within 30 s iroh-gateway-edge was not active with id=$id and UDP 7842 bound"
-          systemctl status iroh-gateway-edge --no-pager || true
-          ss -Hlun
-          exit 1
+          if [ "$up" != true ]; then
+            echo "::error::within 30 s iroh-gateway-edge was not active with id=$id and UDP 7842 bound"
+            systemctl status iroh-gateway-edge --no-pager || true
+            ss -Hlun
+            exit 1
+          fi
+          echo "iroh-gateway-edge is active, logged id=$id and binds UDP 7842"
+
+          # With Restart=always an edge killed a moment after it came up (by the seccomp filter,
+          # say) would have passed the loop: 5 s later it must still be active and never restarted.
+          sleep 5
+          restarts="$(systemctl show -p NRestarts --value iroh-gateway-edge)"
+          if ! systemctl is-active --quiet iroh-gateway-edge || [ "$restarts" != 0 ]; then
+            echo "::error::5 s later iroh-gateway-edge is $(systemctl is-active iroh-gateway-edge) after $restarts restarts"
+            systemctl status iroh-gateway-edge --no-pager || true
+            exit 1
+          fi
+          echo "5 s later iroh-gateway-edge is still active and has not restarted"
 
       - name: The edge's journal
         if: failure() && matrix.check-unit
@@ -339,7 +365,9 @@ jobs:
           helm package charts/iroh-gateway --version "$ver" --app-version "$ver"
           helm push "iroh-gateway-${ver}.tgz" oci://ghcr.io/fables-for-robots/charts
 
-  # Last, so a GitHub release exists only once its images and chart are published.
+  # Last, so a GitHub release exists only once its images and chart are published. A re-run
+  # after a release completed fails at `gh release create`, because the release exists; that is
+  # intended, as a re-run must not replace a published release's files.
   release:
     needs: [version, edge-binaries, manifests, chart]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

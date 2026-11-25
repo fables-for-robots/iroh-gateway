@@ -39,9 +39,12 @@ diagnostics() {
     echo "=== logs of $pod ===" >&2
     k logs "$pod" --all-containers --tail=200 >&2 || true
   done
+  kubectl get networkpolicies -A >&2 || true
   # Only once the cert-manager steps have started does the cluster have these resources.
   kubectl get certificates,certificaterequests -A >&2 || true
+  kubectl describe certificates,certificaterequests -A >&2 || true
   kubectl -n cert-manager logs deployment/cert-manager --tail=100 >&2 || true
+  kubectl -n cert-manager logs deployment/cert-manager-webhook --tail=100 >&2 || true
 }
 
 finish() {
@@ -903,8 +906,9 @@ fi
 step "cert-manager: app-tls is untouched"
 # The https listener has a hostname, so only the annotation keeps cert-manager off app-tls. It has
 # processed the Gateway by now: cm-tls is Ready.
-if ! got="$(k get certificates.cert-manager.io -o name 2>&1)"; then
-  echo "listing the Certificates failed: $got" >&2
+# Stdout only: a warning kubectl prints on stderr goes to the script's stderr, not into $got.
+if ! got="$(k get certificates.cert-manager.io -o name)"; then
+  echo "listing the Certificates failed (kubectl's error is above): $got" >&2
   exit 1
 fi
 if [ "$got" != "certificate.cert-manager.io/cm-tls" ]; then

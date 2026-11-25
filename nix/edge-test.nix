@@ -22,9 +22,21 @@ pkgs.testers.runNixOSTest {
     def started_ids() -> list[str]:
         """The id of every "edge started" line in the unit's journal, oldest first."""
         log = machine.succeed("journalctl --no-pager -o cat -u iroh-gateway-edge.service")
-        # tracing colours its output even when it goes to the journal.
+        # The edge colours its log only on a terminal; should a line carry escape codes anyway,
+        # they are stripped before the match.
         log = re.sub(r"\x1b\[[0-9;]*m", "", log)
         return re.findall(r"edge started.*\bid=([0-9a-f]{64})", log)
+
+
+    def stays_up() -> None:
+        """Active 5 s on and never restarted: Restart=always would hide an edge that crashes
+        a moment after it starts. A manual restart does not count in NRestarts."""
+        machine.sleep(5)
+        machine.succeed("systemctl is-active iroh-gateway-edge.service")
+        restarts = machine.succeed(
+            "systemctl show -p NRestarts --value iroh-gateway-edge.service"
+        ).strip()
+        assert restarts == "0", f"NRestarts={restarts}"
 
 
     machine.wait_for_unit("iroh-gateway-edge.service")
@@ -54,6 +66,7 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds("journalctl -o cat -u iroh-gateway-edge.service | grep -q 'edge started'")
         first = started_ids()
         assert len(first) == 1, first
+        stays_up()
         machine.succeed("systemctl restart iroh-gateway-edge.service")
         machine.wait_for_unit("iroh-gateway-edge.service")
         machine.wait_until_succeeds(
@@ -61,6 +74,6 @@ pkgs.testers.runNixOSTest {
         )
         ids = started_ids()
         assert len(ids) == 2 and ids[0] == ids[1], ids
-        machine.succeed("systemctl is-active iroh-gateway-edge.service")
+        stays_up()
   '';
 }
