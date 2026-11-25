@@ -4,7 +4,7 @@ iroh-gateway is a TCP and UDP tunnel between a small public machine (the edge) a
 
 ## Status
 
-The edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, UDP, HTTP and HTTPS (see [Kubernetes](#kubernetes); the images are not published yet).
+The edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, UDP, HTTP and HTTPS (see [Kubernetes](#kubernetes); it installs from the Helm chart in `charts/iroh-gateway`, and the images are not published yet).
 
 ## Build
 
@@ -139,12 +139,12 @@ A UDP listener forwards each visitor's packets to its `target` as described unde
 What this step does and does not do:
 
 - `TCP`, `UDP`, `HTTP` and `HTTPS` listeners, `TCPRoute`, `UDPRoute` and `HTTPRoute` (see [UDP](#udp) and [HTTP and HTTPS](#http-and-https) for what a `UDPRoute` and an `HTTPRoute` may use). There is no TLS passthrough and no `TLSRoute` or `GRPCRoute` yet; a listener with any other protocol is not accepted.
-- One operator replica. The manifests use one replica with the `Recreate` strategy; running two would make both dial the edges and write the same status.
-- The images are not published yet. `deploy/operator.yaml` names `ghcr.io/fables-for-robots/iroh-gateway-operator:0.1.0`, which does not exist until the packaging step is done. Build the images yourself and load them into your cluster (see below).
-- No health endpoint, no metrics, no NetworkPolicy. The operator pod must be able to send UDP to the edges, and TCP and UDP to the backend Services.
-- Everything the manifests create lives in the namespace `iroh-gateway`.
+- One operator replica. The chart runs one replica with the `Recreate` strategy; running two would make both dial the edges and write the same status.
+- The images are not published yet. The chart names `ghcr.io/fables-for-robots/iroh-gateway-operator` with its `appVersion` as the tag, which no release has published. Build the images yourself and load them into your cluster (see below).
+- The operator serves `/metrics`, `/healthz` and `/readyz` on `--metrics-listen` (the chart sets port 8080 and points its liveness and readiness probes there, and puts a Service in front of it). The chart's optional NetworkPolicy (`networkPolicy.enabled`) admits ingress only to that port and leaves egress open: the operator pod must be able to send UDP to the edges, and TCP and UDP to the backend Services.
+- The chart puts the operator, its ServiceAccount, its Service and its Roles in the release namespace (`iroh-gateway` below), and a Role and RoleBinding in each further namespace of `gatewayNamespaces`. The chart creates no namespace; `helm install --create-namespace` creates the release namespace.
 - Long-lived connections. A configuration change anywhere (any serving listener's routes, backends or certificates, in any namespace) reloads HAProxy. Connections that are still open 30 minutes after a reload, or after 50 further reloads, are closed, and a connection idle for an hour is closed. This is a known limit of this step for long-lived TCP such as SSH or database sessions.
-- Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The manifest's limit of 1 GiB fits one edge; raise it by about that much for each further edge. UDP adds about 5.3 MiB per edge to the worst case (a 4 MiB budget for reassembling large packets, 1 MiB of received datagrams and 256 KiB queued to send), which the 1 GiB limit still covers; the kernel's buffers for the flow sockets (one per UDP flow, up to 4096 per edge) are not counted.
+- Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The chart's default limit of 1 GiB (`resources`) fits one edge; raise it by about that much for each further edge. UDP adds about 5.3 MiB per edge to the worst case (a 4 MiB budget for reassembling large packets, 1 MiB of received datagrams and 256 KiB queued to send), which the 1 GiB limit still covers; the kernel's buffers for the flow sockets (one per UDP flow, up to 4096 per edge) are not counted.
 
 ### Prerequisites
 
@@ -166,17 +166,17 @@ docker build --target edge -t iroh-gateway-edge:dev .
 kind load docker-image iroh-gateway-operator:dev iroh-gateway-edge:dev
 ```
 
-Install the CRD, the namespace, the RBAC rules, the `GatewayClass` named `iroh-gateway` and the operator, then point the operator at the image you built:
+Install the chart with the image you built. It installs the `Edge` CRD, the RBAC rules, the `GatewayClass` named `iroh-gateway` and the operator, and waits until the operator is ready:
 
 ```sh
-kubectl apply -f deploy/
-kubectl -n iroh-gateway patch deployment iroh-gateway-operator --type strategic -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"operator","imagePullPolicy":"IfNotPresent"}]}}}}'
-kubectl -n iroh-gateway set image deployment/iroh-gateway-operator operator=iroh-gateway-operator:dev
-kubectl -n iroh-gateway rollout status deployment/iroh-gateway-operator
+helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway --create-namespace \
+  --set image.repository=iroh-gateway-operator --set image.tag=dev \
+  --set image.pullPolicy=IfNotPresent --wait --timeout 180s
 ```
 
-The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start (it may `get` that Secret by name and `create` Secrets there; with another `--identity-secret`, change the Role's `resourceNames` to match). For HTTPS it also lists and watches the Secrets of every namespace it serves Gateways in, which means it can read every Secret there; see [Secrets](#secrets). It writes status only with `patch`. The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to a private directory `haproxy` that the operator creates in the in-memory volume at `/run/iroh-gateway`.
+`scripts/e2e-kind.sh` installs it the same way (with its own tag and `networkPolicy.enabled=true`). The chart's values are listed in [its README](charts/iroh-gateway/README.md). Helm installs the CRD only on the first install and never upgrades it; apply `charts/iroh-gateway/crds/edges.yaml` yourself when it changes.
+
+The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start (it may `get` that Secret by name and `create` Secrets there; the chart's `identity.secretName` sets both the flag and the Role's `resourceNames`). For HTTPS it also lists and watches the Secrets of every namespace it serves Gateways in, which means it can read every Secret there; see [Secrets](#secrets). It writes status only with `patch`. The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to a private directory `haproxy` that the operator creates in the in-memory volume at `/run/iroh-gateway`.
 
 ### Enrolling an edge
 
@@ -433,34 +433,13 @@ Certificates:
 The operator reads two kinds of Secret:
 
 - Its identity, `iroh-gateway-identity` in its own namespace, which it may `get` by name and creates on first start.
-- The certificates of HTTPS listeners. It watches the Secrets of type `kubernetes.io/tls` in each namespace of `--gateway-namespaces`, and requests and holds no other Secret. Kubernetes cannot limit `list` and `watch` to a type, though, so the Role in `deploy/rbac.yaml` lets the operator list and watch every Secret of `iroh-gateway`, and so read every Secret there.
+- The certificates of HTTPS listeners. It watches the Secrets of type `kubernetes.io/tls` in each namespace of `--gateway-namespaces`, and requests and holds no other Secret. Kubernetes cannot limit `list` and `watch` to a type, though, so the chart's Role lets the operator list and watch every Secret of `iroh-gateway`, and so read every Secret there.
 
-For each further namespace in `--gateway-namespaces` (here `apps`, which must exist), give the operator the same in a Role and RoleBinding of that namespace, and know that it can then read every Secret there:
+The chart's `gatewayNamespaces` sets `--gateway-namespaces` and gives the operator the same rule in a Role and RoleBinding of each namespace listed, which must exist before the install; the operator can then read every Secret there. For example, to serve `iroh-gateway` and `apps`:
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: iroh-gateway-operator
-  namespace: apps
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: iroh-gateway-operator
-  namespace: apps
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: iroh-gateway-operator
-subjects:
-  - kind: ServiceAccount
-    name: iroh-gateway-operator
-    namespace: iroh-gateway
+```sh
+helm upgrade iroh-gateway charts/iroh-gateway --namespace iroh-gateway --reuse-values \
+  --set 'gatewayNamespaces={iroh-gateway,apps}'
 ```
 
 Until the operator has listed every resource it watches once, it applies nothing: no edge is dialed, no port opens and no status is written. While it waits (for a missing CRD, or a namespace where it may not list Secrets) it logs every 30 s which lists are missing, for example `still waiting for the first list of: Secret in apps`. One namespace without the Role therefore holds up every Gateway.
@@ -527,7 +506,7 @@ What to know:
 
 ### Upgrading from the TCP-only version
 
-The new version watches `HTTPRoute`s, `UDPRoute`s and TLS Secrets, which the old RBAC rules do not allow. Apply `deploy/rbac.yaml` before switching to the new image; otherwise the operator waits for its permissions, logging which lists it cannot get, and applies nothing, so no edge serves any port until the rules are in place. The `UDPRoute` CRD must also be installed, as it is with the standard channel of Gateway API v1.7.0; without it the operator applies nothing either.
+The new version watches `HTTPRoute`s, `UDPRoute`s and TLS Secrets, which the old RBAC rules do not allow; the chart's rules do. An installation made from the plain manifests of earlier versions (objects named `iroh-gateway-operator` in the namespace `iroh-gateway`, and the `GatewayClass` `iroh-gateway`) must be removed before `helm install`, all but the namespace, the `Edge` CRD and the identity Secret: Helm does not take over objects it did not create, and two operators would fight over the edges. Without the new rules the operator waits for its permissions, logging which lists it cannot get, and applies nothing, so no edge serves any port until the rules are in place. The `UDPRoute` CRD must also be installed, as it is with the standard channel of Gateway API v1.7.0; without it the operator applies nothing either.
 
 Old and new binaries work together: an edge of the previous version answers a `UDP` listener with a bind error, and a previous operator never asks for one. Update the edges to serve UDP.
 
@@ -602,7 +581,7 @@ A relay learns the home IP, the edge's IP, and the size and timing of the relaye
 - **Stalled visitors are cut after 5 minutes.** If a visitor accepts no data for 300 seconds while data is waiting for it, the connection is aborted. Idle connections with nothing pending are not affected.
 - **Half-closed connections are cut after 5 minutes of silence.** Once one side has finished sending, the connection is aborted if the other side sends nothing for 300 seconds.
 - **UDP is best effort.** A packet that does not fit the tunnel, or loses a piece, is lost, and a UDP flood can slow TCP and HTTP through the same edge unless `--udp-rate-limit` is set; see [UDP](#udp).
-- **No metrics yet.** Both binaries log to stderr only.
+- **Metrics only when asked for.** Both binaries log to stderr; they serve Prometheus metrics only with `--metrics-listen` (the chart sets it for the operator).
 
 ## License
 

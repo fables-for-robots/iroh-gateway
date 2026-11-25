@@ -1,0 +1,84 @@
+image:
+  repository: ghcr.io/fables-for-robots/iroh-gateway-operator
+  # "" → the chart's appVersion (the image released with this chart).
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# --controller-name: the GatewayClass controllerName this operator serves. Gateways of any
+# other class are ignored.
+controllerName: gateway.fables-for-robots.ch/iroh-gateway
+
+gatewayClass:
+  # Render a GatewayClass with controllerName above. Off when the class is managed elsewhere.
+  create: true
+  name: iroh-gateway
+
+# --gateway-namespaces: the namespaces whose Gateway and Edge objects the operator serves.
+# [] → the release namespace only. Each listed namespace gets a Role and RoleBinding that let
+# the operator list and watch its Secrets (for HTTPS certificates; Kubernetes cannot limit
+# that to the TLS type, so the operator can read every Secret there). The chart does not create
+# namespaces: every namespace listed here other than the release namespace must exist before
+# the install.
+gatewayNamespaces: []
+
+# --relay: disabled | n0 | https://… (a relay URL). Must match the edges' --relay.
+relay: disabled
+
+identity:
+  # --identity-secret: the Secret in the release namespace that holds the operator's key. The
+  # operator creates it on first start and reuses it afterwards; the Role may get only this
+  # Secret by name. Back it up: the key is the operator's identity, which every edge pins.
+  secretName: iroh-gateway-identity
+
+metrics:
+  # --metrics-listen=0.0.0.0:<port>: /metrics, /healthz and /readyz. The probes use it too.
+  port: 8080
+  service:
+    # A ClusterIP Service in front of the port, named like the release.
+    enabled: true
+  serviceMonitor:
+    # Requires metrics.service.enabled and the Prometheus Operator CRDs.
+    enabled: false
+
+networkPolicy:
+  # A NetworkPolicy for the operator pod that admits ingress only to the metrics port. The
+  # operator needs no other ingress: it dials the edges, and its traffic to the backends is
+  # outgoing. Egress is not restricted.
+  enabled: false
+  # NetworkPolicyPeers allowed to reach the metrics port (the rule's `from`).
+  # [] → any source, the kubelet's probes included. With peers listed, the probes still need
+  # to reach the port: most network plugins admit traffic from the pod's own node regardless,
+  # but check yours.
+  metricsFrom: []
+
+# Sizing: in the worst case one edge can make the operator hold about
+# 4096 streams x 192 KiB + 64 MiB = 830 MiB. One edge fits this limit; raise it by
+# about that much for each further edge.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 1Gi
+
+serviceAccount:
+  create: true
+  # "" → the release's full name when create is true, "default" otherwise.
+  name: ""
+  annotations: {}
+
+# The ClusterRole, the Roles and their bindings. With false, grant the same rules yourself
+# (see templates/rbac.yaml).
+rbac:
+  create: true
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""

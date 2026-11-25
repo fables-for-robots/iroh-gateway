@@ -1,0 +1,98 @@
+{{- if .Values.rbac.create }}
+{{- $fullname := include "iroh-gateway.fullname" . }}
+{{- $serviceAccount := include "iroh-gateway.serviceAccountName" . }}
+{{- $gatewayNamespaces := splitList "," (include "iroh-gateway.gatewayNamespaces" .) }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "iroh-gateway.labels" . | nindent 4 }}
+rules:
+  # Everything the operator watches cluster-wide. Secrets are deliberately absent here.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses", "gateways", "tcproutes", "udproutes", "httproutes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.fables-for-robots.ch"]
+    resources: ["edges"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  # Status is written as a JSON merge patch, and only so.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status", "gateways/status", "tcproutes/status", "udproutes/status", "httproutes/status"]
+    verbs: ["patch"]
+  - apiGroups: ["gateway.fables-for-robots.ch"]
+    resources: ["edges/status"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "iroh-gateway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $serviceAccount }}
+    namespace: {{ .Release.Namespace }}
+{{- /*
+The operator's own key lives in a Secret it creates on first start. It may get only that
+Secret by name; a create cannot be limited to a name.
+
+HTTPS listeners take their certificates from Secrets of type kubernetes.io/tls in the
+Gateway's own namespace, which the operator watches in every namespace it serves Gateways in.
+It asks only for that type, but `list` and `watch` cannot be limited to a type: with them the
+operator can read every Secret of each such namespace. Without that rule in one of them the
+operator waits, warning every 30 s, and applies nothing.
+
+One Role per namespace, all named like the release: the release namespace's Role holds the
+identity rules, and the Secret reads too when it is a gateway namespace.
+*/}}
+{{- range $namespace := prepend (without $gatewayNamespaces $.Release.Namespace) $.Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "iroh-gateway.labels" $ | nindent 4 }}
+rules:
+  {{- if eq $namespace $.Release.Namespace }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $.Values.identity.secretName | quote }}]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  {{- end }}
+  {{- if has $namespace $gatewayNamespaces }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["list", "watch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "iroh-gateway.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $serviceAccount }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}

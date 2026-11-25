@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "iroh-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "iroh-gateway.labels" . | nindent 4 }}
+spec:
+  # Exactly one operator: two would both dial the edges and fight over status. Deliberately
+  # not a value, and Recreate so that an upgrade never runs two at once either.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "iroh-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "iroh-gateway.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "iroh-gateway.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The image's entrypoint is `iroh-gateway-operator run`; these are its flags.
+          args:
+            {{- if .Values.gatewayNamespaces }}
+            - {{ printf "--gateway-namespaces=%s" (include "iroh-gateway.gatewayNamespaces" .) | quote }}
+            {{- end }}
+            - {{ printf "--controller-name=%s" .Values.controllerName | quote }}
+            - {{ printf "--identity-secret=%s" .Values.identity.secretName | quote }}
+            - {{ printf "--relay=%s" .Values.relay | quote }}
+            - {{ printf "--metrics-listen=0.0.0.0:%v" .Values.metrics.port | quote }}
+          env:
+            # --namespace: where the identity Secret lives, and the Gateways when
+            # gatewayNamespaces is empty.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            # /metrics, /healthz and /readyz.
+            - name: http
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          # /healthz answers as soon as the listener is up. /readyz turns ready once the
+          # operator has applied its first pass over the cluster's objects, and stays ready.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # See values.yaml for the sizing of the memory limit.
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # The default --runtime-dir. The volume's root belongs to root; the operator keeps
+            # HAProxy's configuration and sockets in a private directory it creates inside it.
+            - name: runtime
+              mountPath: /run/iroh-gateway
+            - name: tmp
+              mountPath: /tmp
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: runtime
+          emptyDir:
+            medium: Memory
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

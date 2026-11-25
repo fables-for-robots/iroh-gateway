@@ -26,6 +26,10 @@
             # The operator's cluster tests: scripts/envtest-assets fetches an API server.
             pkgs.setup-envtest
             pkgs.kubectl
+            # The chart, its test (scripts/chart-test.sh) and the kind cluster CI runs it in.
+            pkgs.kubernetes-helm
+            pkgs.kind
+            pkgs.yq-go
             pkgs.shellcheck
             # The operator's HTTPS tests make RSA and SEC1 keys with it.
             pkgs.openssl

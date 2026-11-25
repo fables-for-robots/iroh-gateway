@@ -134,7 +134,10 @@ spec:
 
     #[test]
     fn checked_in_crd_matches_generated() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/crd.yaml");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../charts/iroh-gateway/crds/edges.yaml"
+        );
         let checked_in = std::fs::read_to_string(path).unwrap();
         assert_eq!(serde_yaml::to_string(&Edge::crd()).unwrap(), checked_in);
     }

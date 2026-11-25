@@ -1,0 +1,19 @@
+{{- if .Values.metrics.service.enabled }}
+# /metrics for Prometheus; the operator serves nothing else over the network.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "iroh-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "iroh-gateway.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "iroh-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.metrics.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

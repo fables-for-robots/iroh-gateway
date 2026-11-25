@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end test in a kind cluster: operator, edge, Gateway API objects, real traffic.
+# End-to-end test in a kind cluster: the operator installed from the Helm chart, an edge,
+# Gateway API objects, real traffic, and both binaries' metrics.
 #
-# Expects kubectl pointed at a running kind cluster and the images iroh-gateway-operator:e2e
-# and iroh-gateway-edge:e2e both built locally (docker build --target operator|edge) and
-# loaded into the cluster (kind load docker-image). Takes no arguments. On any failure it
+# Expects kubectl and helm pointed at a running kind cluster and the images
+# iroh-gateway-operator:e2e and iroh-gateway-edge:e2e both built locally (docker build
+# --target operator|edge) and loaded into the cluster (kind load docker-image). Takes no arguments. On any failure it
 # prints the state and logs of what it created and exits non-zero.
 set -euo pipefail
 
@@ -14,7 +15,9 @@ fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ns=iroh-gateway
-operator_image=iroh-gateway-operator:e2e
+# The chart's release; its Deployment and Service are named like it, and its pod has these labels.
+release=iroh-gateway
+operator_labels="app.kubernetes.io/name=iroh-gateway,app.kubernetes.io/instance=$release"
 edge_image=iroh-gateway-edge:e2e
 gateway_api_crds=https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 tmp="$(mktemp -d)"
@@ -30,6 +33,8 @@ diagnostics() {
     k get "$resource" -o wide >&2 || true
     k describe "$resource" >&2 || true
   done
+  # A pod that is not Ready says why only in its events.
+  k describe pods -l "$operator_labels" >&2 || true
   for pod in $(k get pods -o name 2>/dev/null || true); do
     echo "=== logs of $pod ===" >&2
     k logs "$pod" --all-containers --tail=200 >&2 || true
@@ -162,7 +167,7 @@ self_signed() {
 # True when the operator's certificate directory holds exactly one certificate file of app-tls
 # and every entry in it has mode 0600 (-rw-------).
 certificate_files_private() {
-  got="$(k exec deploy/iroh-gateway-operator -c operator -- \
+  got="$(k exec "deploy/$release" -c operator -- \
     ls -l /run/iroh-gateway/haproxy/certs 2>&1)" || return 1
   local certificates others
   # grep -c prints 0 when nothing matches, and then fails.
@@ -172,22 +177,66 @@ certificate_files_private() {
   [ "$certificates" = 1 ] && [ "$others" = 0 ]
 }
 
+# Fetches http://$1/metrics from the probe pod; what it printed, its errors included, goes to
+# $got. The status is wget's.
+metrics_of() {
+  got="$(k exec probe -- wget -qO- -T 5 "http://$1/metrics" 2>&1)"
+}
+
+# The lines of $got that match the extended regular expression $1, or, when none does, the
+# first 20 lines of $got: what a metrics check saw, for its failure message.
+seen() {
+  grep -E "$1" <<<"$got" || head -n 20 <<<"$got"
+}
+
+# True when the operator's /metrics, through its Service, has the tunnel to the edge up, the
+# HAProxy exporter answering, and HAProxy's own metrics.
+operator_metrics_complete() {
+  metrics_of "$release.$ns.svc:8080" &&
+    grep -qxF "iroh_gateway_operator_tunnel_up{edge=\"$edge_id\"} 1" <<<"$got" &&
+    grep -qxF 'iroh_gateway_operator_haproxy_exporter_up 1' <<<"$got" &&
+    grep -q '^haproxy_process_' <<<"$got"
+}
+
+# True when the edge's /metrics has a session with a configuration.
+edge_metrics_complete() {
+  metrics_of "edge.$ns.svc:9090" &&
+    grep -qxF 'iroh_gateway_edge_session_up 1' <<<"$got"
+}
+
+# True when the operator's one pod is Ready and its container has the liveness probe on
+# /healthz and the readiness probe on /readyz.
+operator_pod_probed() {
+  got="$(k get pod -l "$operator_labels" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status} {.spec.containers[?(@.name=="operator")].livenessProbe.httpGet.path} {.spec.containers[?(@.name=="operator")].readinessProbe.httpGet.path}{"\n"}{end}' 2>&1)" &&
+    [ "$got" = "True /healthz /readyz" ]
+}
+
+# True when the operator's /metrics counts at least one visitor stream from the edge.
+operator_streams_counted() {
+  metrics_of "$release.$ns.svc:8080" || return 1
+  local streams
+  streams="$(sed -n "s/^iroh_gateway_operator_tunnel_streams_total{edge=\"$edge_id\"} //p" <<<"$got")"
+  [[ "$streams" =~ ^[0-9]+$ ]] && [ "$streams" -ge 1 ]
+}
+
 step "Gateway API CRDs"
 kubectl apply --server-side -f "$gateway_api_crds"
-# deploy/ creates a GatewayClass, so its CRD must be served before that is applied.
+# The chart creates a GatewayClass, so its CRD must be served before the install.
 kubectl wait --for=condition=Established --timeout=60s \
   crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
   crd/tcproutes.gateway.networking.k8s.io crd/udproutes.gateway.networking.k8s.io
 
-step "deploy/ and the operator"
-kubectl apply -f "$root/deploy/"
+step "the chart and the operator"
+# The locally built image instead of the unpublished one. --wait returns once the operator's
+# pod is Ready, which its readiness probe (/readyz) reports after the first pass over the
+# cluster's objects.
+helm install "$release" "$root/charts/iroh-gateway" --namespace "$ns" --create-namespace \
+  --set image.repository=iroh-gateway-operator --set image.tag=e2e \
+  --set image.pullPolicy=IfNotPresent --set networkPolicy.enabled=true \
+  --wait --timeout 180s
+# Helm installs crds/ before the templates.
 kubectl wait --for=condition=Established --timeout=60s \
   crd/edges.gateway.fables-for-robots.ch
-# Use the locally built image instead of the unpublished one in the manifest.
-k patch deployment iroh-gateway-operator --type strategic -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"operator","imagePullPolicy":"IfNotPresent"}]}}}}'
-k set image deployment/iroh-gateway-operator "operator=$operator_image"
-k rollout status deployment/iroh-gateway-operator --timeout=180s
 
 step "edge key"
 docker run --rm -v "$tmp:/keys" --user "$(id -u)" "$edge_image" id --key-file /keys/edge.key \
@@ -262,6 +311,7 @@ spec:
             - --operator=$operator_id
             - --iroh-listen=0.0.0.0:7842
             - --public-bind=0.0.0.0
+            - --metrics-listen=0.0.0.0:9090
           volumeMounts:
             - name: key
               mountPath: /keys
@@ -295,6 +345,9 @@ spec:
     - name: udp
       protocol: UDP
       port: 9001
+    - name: metrics
+      protocol: TCP
+      port: 9090
 YAML
 k rollout status deployment/edge --timeout=120s
 
@@ -355,6 +408,30 @@ step "conditions"
 k wait --for=condition=Programmed gateways.gateway.networking.k8s.io/public --timeout=120s
 k wait --for=condition=Connected edges.gateway.fables-for-robots.ch/e2e --timeout=120s
 
+step "metrics: the operator's"
+if ! retry 60 operator_metrics_complete; then
+  echo "expected iroh_gateway_operator_tunnel_up{edge=\"$edge_id\"} 1, iroh_gateway_operator_haproxy_exporter_up 1 and haproxy_process_ lines at http://$release.$ns.svc:8080/metrics, got:" >&2
+  seen '^(iroh_gateway_operator_(tunnel_up|haproxy_exporter_up)|haproxy_process_)' >&2
+  exit 1
+fi
+seen '^iroh_gateway_operator_(tunnel_up|haproxy_exporter_up)'
+echo "and $(grep -c '^haproxy_process_' <<<"$got") haproxy_process_ lines"
+
+step "metrics: the edge's"
+if ! retry 30 edge_metrics_complete; then
+  echo "expected iroh_gateway_edge_session_up 1 at http://edge.$ns.svc:9090/metrics, got:" >&2
+  seen '^iroh_gateway_edge_session_up' >&2
+  exit 1
+fi
+seen '^iroh_gateway_edge_session_up'
+
+step "probes"
+if ! retry 30 operator_pod_probed; then
+  echo "expected the operator pod Ready 'True' with probes on /healthz and /readyz, got '$got'" >&2
+  exit 1
+fi
+echo "ready, liveness and readiness paths: $got"
+
 step "traffic reaches the backend"
 line="hello-$RANDOM-$RANDOM"
 echoed=
@@ -368,6 +445,14 @@ if [ "$echoed" != "$line" ]; then
   exit 1
 fi
 echo "echoed: $echoed"
+
+step "metrics: the operator counted the stream"
+if ! retry 30 operator_streams_counted; then
+  echo "expected iroh_gateway_operator_tunnel_streams_total{edge=\"$edge_id\"} of at least 1, got:" >&2
+  seen '^iroh_gateway_operator_tunnel_streams_total' >&2
+  exit 1
+fi
+seen '^iroh_gateway_operator_tunnel_streams_total'
 
 step "deleting the TCPRoute closes the port"
 k delete tcproutes.gateway.networking.k8s.io echo
@@ -706,7 +791,7 @@ fi
 
 step "deleting the operator pod is prompt (the image's stop signal reaches the operator)"
 # Well under the 60 s grace period: a pod that is only killed after the grace period fails here.
-k delete pod -l app.kubernetes.io/name=iroh-gateway-operator --wait=true --timeout=30s
-k wait --for=condition=Available deployment/iroh-gateway-operator --timeout=120s
+k delete pod -l "$operator_labels" --wait=true --timeout=30s
+k wait --for=condition=Available "deployment/$release" --timeout=120s
 
 echo "e2e passed"
