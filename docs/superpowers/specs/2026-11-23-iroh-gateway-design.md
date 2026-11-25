@@ -847,11 +847,16 @@ HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
   towards backends and `out` for the way back. No label carries a visitor
   address, a port, a hostname or a route name.
 - **Full tunnel.** A UDP packet is handed to the tunnel only when the
-  connection's datagram send buffer has room for all of its pieces;
-  otherwise the whole packet is dropped and counted with the reason
+  connection's datagram send buffer reports room for all of its pieces, and
+  its pieces are queued in the way that never displaces one already queued;
+  otherwise the packet is dropped and counted with the reason
   `tunnel_full`. The QUIC layer would otherwise discard the oldest queued
   piece without a trace. Under overload the newest packet is lost, not the
-  oldest, and no packet loses only some of its pieces to the buffer.
+  oldest. The reported room is slightly generous (the QUIC library counts
+  its per-datagram overhead once, not per queued datagram), so on a nearly
+  full buffer a packet of several pieces can still have a later piece
+  refused after earlier ones were queued; it is then counted once and its
+  remaining pieces are not sent.
 
 ## Testing
 
