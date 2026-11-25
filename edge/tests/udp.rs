@@ -38,17 +38,6 @@ fn bound(st: &Status) -> bool {
     !st.listeners.is_empty() && st.listeners.iter().all(|l| l.state == BindState::Bound)
 }
 
-/// A port free for both TCP and UDP on loopback.
-fn free_tcp_and_udp_port() -> u16 {
-    loop {
-        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
-
 /// Sends `payload` from `v` to port `p` until a datagram carrying it arrives on `conn`;
 /// datagrams carrying anything else are skipped.
 async fn send_until_datagram(

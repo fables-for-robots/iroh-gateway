@@ -5,7 +5,8 @@ pub mod envtest;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream};
@@ -53,33 +54,51 @@ pub fn certificate_with_key() -> String {
     format!("{}{}", cert.pem(), key.serialize_pem())
 }
 
+/// The next port of this process's walk through 20000..30000. That range lies below every
+/// ephemeral range (Linux 32768.., macOS 49152..), so neither a socket bound to port 0 nor the
+/// source port of an outgoing connection, such as another test's, can take a port between the
+/// moment a test picks it and the moment the test binds it. The walk starts at a random port and
+/// hands out each port once, so two tests of one process never get the same one.
+fn next_port() -> u16 {
+    static NEXT: LazyLock<AtomicU16> = LazyLock::new(|| AtomicU16::new(fastrand::u16(0..10_000)));
+    20_000 + NEXT.fetch_add(1, Ordering::Relaxed) % 10_000
+}
+
+/// A TCP port on loopback that nothing listens on and nothing takes by chance; see [`next_port`].
 pub fn free_tcp_port() -> u16 {
-    let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    s.local_addr().unwrap().port()
-}
-
-pub fn free_udp_port() -> u16 {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    s.local_addr().unwrap().port()
-}
-
-/// A free UDP port below every ephemeral range (Linux 32768.., macOS 49152..), so no socket bound
-/// to port 0 meanwhile, such as another test's flow socket, can take it before the test binds it.
-pub fn unassigned_udp_port() -> u16 {
     loop {
-        let port = fastrand::u16(20_000..30_000);
+        let port = next_port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// A UDP port on loopback that nothing is bound to and nothing takes by chance; see
+/// [`next_port`].
+pub fn free_udp_port() -> u16 {
+    loop {
+        let port = next_port();
         if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
 }
 
+/// A UDP port for a test that leaves it unbound for a while: no socket bound to port 0 meanwhile,
+/// such as another test's flow socket, can take it. Every port of [`free_udp_port`] is one.
+pub fn unassigned_udp_port() -> u16 {
+    free_udp_port()
+}
+
 /// A port free for both TCP and UDP on 127.0.0.1.
 pub fn free_tcp_and_udp_port() -> u16 {
     loop {
-        let p = free_tcp_port();
-        if std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok() {
-            return p;
+        let port = next_port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        {
+            return port;
         }
     }
 }
