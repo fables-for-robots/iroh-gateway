@@ -11,9 +11,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::{certificate_with_key, short_dir};
+use iroh_gateway_operator::haproxy::METRICS_SOCKET;
+use iroh_gateway_operator::haproxy::render::render;
 use iroh_gateway_operator::haproxy::{
     Applied, ApplyError, CERT_DIR, MAX_RUNTIME_DIR_LEN, SecretFile, Supervisor, SupervisorOptions,
 };
+use iroh_gateway_operator::model::Model;
 use iroh_gateway_operator::tunnel::proxyv2;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
@@ -1298,4 +1301,79 @@ async fn dropping_the_supervisor_removes_certificate_files() {
     drop(sup);
     assert!(cert_files(&dir).is_empty(), "{:?}", cert_files(&dir));
     gone(&pids).await;
+}
+
+/// The rendered configuration of an empty model: no listener, only the frontends every
+/// configuration has.
+fn rendered_empty(dir: &TempDir) -> String {
+    let model = Model {
+        classes: Vec::new(),
+        gateways: Vec::new(),
+        edges: Vec::new(),
+        routes: Vec::new(),
+    };
+    render(&model, dir.path()).haproxy_cfg
+}
+
+/// `GET /metrics HTTP/1.0` on the exporter socket: the whole answer as text.
+async fn scrape(dir: &TempDir) -> String {
+    let mut s = timeout(STEP, UnixStream::connect(dir.path().join(METRICS_SOCKET)))
+        .await
+        .unwrap()
+        .unwrap();
+    s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").await.unwrap();
+    let mut out = Vec::new();
+    timeout(STEP, s.read_to_end(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+#[tokio::test]
+async fn the_exporter_answers_on_its_socket() {
+    let dir = short_dir();
+    let sup = Supervisor::start(opts(&dir), &rendered_empty(&dir))
+        .await
+        .unwrap();
+    let answer = scrape(&dir).await;
+    assert!(
+        answer.starts_with("HTTP/1.0 200") || answer.starts_with("HTTP/1.1 200"),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("haproxy_process_start_time_seconds"),
+        "{answer}"
+    );
+    sup.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_exporter_socket_survives_a_reload_and_goes_at_shutdown() {
+    let dir = short_dir();
+    let first = rendered_empty(&dir);
+    let mut sup = Supervisor::start(opts(&dir), &first).await.unwrap();
+    assert!(exists(&dir.path().join(METRICS_SOCKET)));
+    let applied = sup
+        .apply(&format!("{first}\n# changed\n"), &[])
+        .await
+        .unwrap();
+    assert_eq!(applied, Applied::Reloaded);
+    let deadline = Instant::now() + STEP;
+    let answer = loop {
+        match timeout(STEP, UnixStream::connect(dir.path().join(METRICS_SOCKET)))
+            .await
+            .unwrap()
+        {
+            Ok(_) => break scrape(&dir).await,
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(20)).await,
+            Err(e) => panic!("exporter socket refuses after reload: {e}"),
+        }
+    };
+    assert!(
+        answer.contains("haproxy_process_start_time_seconds"),
+        "{answer}"
+    );
+    sup.shutdown().await;
+    assert!(!exists(&dir.path().join(METRICS_SOCKET)), "left behind");
 }

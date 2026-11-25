@@ -12,8 +12,8 @@ use clap::{Parser, Subcommand};
 use iroh_gateway_operator::cluster::{StatusWriter, Stores, identity};
 use iroh_gateway_operator::controller::{ControllerOptions, run_loop};
 use iroh_gateway_operator::engine::{Engine, EngineOptions};
-use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::render;
+use iroh_gateway_operator::haproxy::{METRICS_SOCKET, SupervisorOptions};
 use iroh_gateway_operator::http::{self, HttpState};
 use iroh_gateway_operator::metrics::Metrics;
 use iroh_gateway_operator::model::{self, Settings, Snapshot};
@@ -140,7 +140,7 @@ async fn run_static(path: PathBuf, metrics_listen: Option<SocketAddr>) -> anyhow
     info!("open file limit is {limit}");
     let metrics = Metrics::new();
     let ready = Arc::new(AtomicBool::new(false));
-    let _server = Server::start(metrics_listen, metrics.clone(), ready.clone()).await?;
+    let _server = Server::start(metrics_listen, metrics.clone(), ready.clone(), None).await?;
     let endpoint = bind_endpoint(key.clone(), &cfg.relay).await?;
     info!(id = %key.public(), "operator started");
 
@@ -259,7 +259,13 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     // Before the cluster is reached: /healthz answers while start-up waits for it.
     let metrics = Metrics::new();
     let ready = Arc::new(AtomicBool::new(false));
-    let _server = Server::start(args.metrics_listen, metrics.clone(), ready.clone()).await?;
+    let _server = Server::start(
+        args.metrics_listen,
+        metrics.clone(),
+        ready.clone(),
+        Some(args.runtime_dir.join(HAPROXY_DIR).join(METRICS_SOCKET)),
+    )
+    .await?;
     let limit = raise_open_file_limit()?;
     info!("open file limit is {limit}");
 
@@ -321,6 +327,7 @@ impl Server {
         addr: Option<SocketAddr>,
         metrics: Metrics,
         ready: Arc<AtomicBool>,
+        haproxy_exporter: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let Some(addr) = addr else {
             return Ok(Self(None));
@@ -330,7 +337,16 @@ impl Server {
             .with_context(|| format!("binding the metrics listener on {addr}"))?;
         info!("serving /healthz, /readyz and /metrics on http://{addr}");
         let task = tokio::spawn(async move {
-            if let Err(e) = http::serve(listener, HttpState { metrics, ready }).await {
+            if let Err(e) = http::serve(
+                listener,
+                HttpState {
+                    metrics,
+                    ready,
+                    haproxy_exporter,
+                },
+            )
+            .await
+            {
                 error!("serving metrics failed: {e}");
             }
         });
