@@ -1517,6 +1517,81 @@ mod tests {
         assert_eq!(a.rules[0].action, HttpAction::Forward(vec![web_backend()]));
     }
 
+    /// The route cert-manager creates for an ACME HTTP-01 challenge, as cert-manager 1.21 writes
+    /// it: no `sectionName`, no `port`, the backend's namespace given, a `NodePort` Service.
+    #[test]
+    fn the_acme_http01_solver_route_is_served() {
+        use gateway_api::gateways::v1::{GatewayListenersTls, GatewayListenersTlsMode};
+        use gateway_api::httproutes::v1::HttpRouteRulesBackendRefs;
+        use k8s_openapi::api::core::v1::ServiceSpec;
+
+        let token = "/.well-known/acme-challenge/YadC4gaAzqEPU1Yea0D2MrzvNRWiBCtUizCtpiRQZqI";
+        let gw = gateway("gw", "public")
+            .listener("http", 80, "HTTP")
+            .listener("https", 443, "HTTPS")
+            .hostname("example.net")
+            .tls(GatewayListenersTls {
+                mode: Some(GatewayListenersTlsMode::Terminate),
+                ..Default::default()
+            })
+            .certificate("example-net-tls");
+        let mut r = http_route("gw", "cm-acme-http-solver-x7k2p")
+            .parent_in("gw", "public")
+            .hostname("example.net")
+            .matching(exact_path(token));
+        r.spec.parent_refs.as_mut().unwrap()[0].kind = Some("Gateway".into());
+        r.spec.rules.as_mut().unwrap()[0].backend_refs = Some(vec![HttpRouteRulesBackendRefs {
+            group: Some(String::new()),
+            kind: Some("Service".into()),
+            name: "cm-acme-http-solver-4tq9z".into(),
+            namespace: Some("gw".into()),
+            port: Some(8089),
+            weight: Some(1),
+            ..Default::default()
+        }]);
+        let mut solver = service("gw", "cm-acme-http-solver-4tq9z", "10.43.0.30", &[8089]);
+        solver.spec.get_or_insert_with(ServiceSpec::default).type_ = Some("NodePort".into());
+
+        let (m, attached) = run(&snap(
+            vec![gw],
+            vec![r.clone()],
+            vec![],
+            vec![solver.clone()],
+        ));
+        let name = "cm-acme-http-solver-x7k2p";
+        assert_eq!(accepted(&m, "gw", name), "Ok");
+        assert_eq!(route(&m, "gw", name).parents[0].resolved_refs, Ok(()));
+        // Without a sectionName the route attaches to both listeners; only port 80 is served.
+        let slots: Vec<_> = attached.iter().map(|a| a.slot).collect();
+        assert_eq!(slots, [(0, 0), (0, 1)]);
+        assert_eq!(attached[0].hosts, [HostMatch::Exact("example.net".into())]);
+        assert_eq!(
+            rules_of(&r, &[solver]).0[0].action,
+            HttpAction::Forward(vec![Backend {
+                service: ObjRef::new("gw", "cm-acme-http-solver-4tq9z"),
+                ip: "10.43.0.30".parse().unwrap(),
+                port: 8089,
+                weight: 1,
+            }])
+        );
+        assert!(listener(&m, "http").serving());
+        assert_eq!(listener(&m, "http").attached_routes, 1);
+        assert!(
+            !listener(&m, "https").serving(),
+            "its Secret does not exist"
+        );
+        let ports = &m.gateways[0].http_ports;
+        assert_eq!(ports.len(), 1, "{ports:?}");
+        assert_eq!(ports[0].port, 80);
+        assert_eq!(ports[0].tls, None);
+        assert_eq!(ports[0].rules.len(), 1);
+        assert_eq!(
+            ports[0].rules[0].host,
+            HostMatch::Exact("example.net".into())
+        );
+        assert_eq!(ports[0].rules[0].path, PathMatch::Exact(token.into()));
+    }
+
     #[test]
     fn two_routes_attach_to_one_listener() {
         let (m, attached) = run_http(

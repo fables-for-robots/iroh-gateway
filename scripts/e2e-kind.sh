@@ -39,6 +39,9 @@ diagnostics() {
     echo "=== logs of $pod ===" >&2
     k logs "$pod" --all-containers --tail=200 >&2 || true
   done
+  # Only once the cert-manager steps have started does the cluster have these resources.
+  kubectl get certificates,certificaterequests -A >&2 || true
+  kubectl -n cert-manager logs deployment/cert-manager --tail=100 >&2 || true
 }
 
 finish() {
@@ -110,6 +113,13 @@ route_accepted() {
 udp_listener_programmed() {
   got="$(k get gateways.gateway.networking.k8s.io public \
     -o jsonpath='{.status.listeners[?(@.name=="udp")].conditions[?(@.type=="Programmed")].status}' 2>&1)" &&
+    [ "$got" = True ]
+}
+
+# True when the Programmed condition of the listener named $1 of Gateway public reads True.
+listener_programmed() {
+  got="$(k get gateways.gateway.networking.k8s.io public \
+    -o jsonpath="{.status.listeners[?(@.name==\"$1\")].conditions[?(@.type==\"Programmed\")].status}" 2>&1)" &&
     [ "$got" = True ]
 }
 
@@ -786,6 +796,112 @@ step "UDP: deleting the UDPRoute stops the answers"
 k delete udproutes.gateway.networking.k8s.io udp-echo
 if ! retry 60 udp_stopped; then
   echo "the edge still answers UDP port 9001 60 s after the UDPRoute was deleted, last got '$got'" >&2
+  exit 1
+fi
+
+step "cert-manager"
+# The Gateway API CRDs are installed already; without them cert-manager would need a restart.
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager --version v1.21.3 \
+  --namespace cert-manager --create-namespace --set crds.enabled=true \
+  --set config.gatewayAPI.enabled=true --wait --timeout 300s
+
+step "cert-manager: an issuer and an annotated Gateway"
+# The webhook may need a moment after the install before it accepts an issuer.
+apply_issuer() {
+  got="$(kubectl apply -f - 2>&1 <<'YAML'
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-cluster-issuer
+spec:
+  selfSigned: {}
+YAML
+  )"
+}
+if ! retry 60 apply_issuer; then
+  echo "expected the ClusterIssuer to be applied, got '$got'" >&2
+  exit 1
+fi
+# Every listener Gateway public has by now, plus cm. The annotation names the script's own HTTPS
+# listener so that cert-manager leaves app-tls alone.
+kubectl apply -f - <<YAML
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: $ns
+  annotations:
+    cert-manager.io/cluster-issuer: selfsigned-cluster-issuer
+    cert-manager.io/ignore-tls-listeners: https
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: tcp-8080
+      protocol: TCP
+      port: 8080
+    - name: http
+      protocol: HTTP
+      port: 8081
+    - name: https
+      protocol: HTTPS
+      port: 8443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-tls
+    - name: cm
+      protocol: HTTPS
+      port: 8443
+      hostname: cm.example.test
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: cm-tls
+    - name: udp
+      protocol: UDP
+      port: 9001
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cm
+  namespace: $ns
+spec:
+  parentRefs:
+    - name: public
+      sectionName: cm
+  hostnames:
+    - cm.example.test
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080
+YAML
+
+step "cert-manager: the Secret appears and is served"
+# gateway-shim creates the Certificate some time after the Gateway is applied.
+if ! retry 60 k get certificates.cert-manager.io cm-tls; then
+  echo "cert-manager did not create the Certificate cm-tls for the annotated Gateway" >&2
+  exit 1
+fi
+k wait --for=condition=Ready certificates.cert-manager.io/cm-tls --timeout=120s
+k get secret cm-tls -o jsonpath='{.data.tls\.crt}' | base64 -d >"$tmp/cm.crt"
+k exec -i curl -- sh -c 'cat >/tmp/cm.crt' <"$tmp/cm.crt"
+cm=(--connect-to "cm.example.test:8443:edge.$ns.svc:8443" "https://cm.example.test:8443/")
+if ! retry 60 curl_prints "hello from web" --cacert /tmp/cm.crt "${cm[@]}"; then
+  echo "expected 'hello from web' for https://cm.example.test:8443/ with the issued certificate, got '$got'" >&2
+  exit 1
+fi
+echo "got: $got"
+if ! retry 30 listener_programmed cm; then
+  echo "expected the listener cm of Gateway public Programmed 'True', got '$got'" >&2
+  exit 1
+fi
+
+step "cert-manager: app-tls is untouched"
+if k get certificates.cert-manager.io app-tls >/dev/null 2>&1; then
+  echo "cert-manager created a Certificate app-tls for the script's own HTTPS listener:" >&2
+  k get certificates.cert-manager.io app-tls -o yaml >&2 || true
   exit 1
 fi
 
