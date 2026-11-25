@@ -1,0 +1,41 @@
+name: Nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - nix/**
+      - rust-toolchain.toml
+      - Cargo.lock
+      - .github/workflows/nix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The VM test runs QEMU as a Nix build user, which needs /dev/kvm.
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Installs Nix with flakes enabled; KVM is set up by the step above.
+      - uses: cachix/install-nix-action@v32
+        with:
+          enable_kvm: false
+
+      - name: Build the packages
+        run: nix build .#edge .#operator -L
+
+      - name: NixOS VM test of the edge module
+        run: nix build .#checks.x86_64-linux.edge-module -L
