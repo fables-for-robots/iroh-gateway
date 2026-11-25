@@ -63,7 +63,7 @@ The chart's README lists [every value](charts/iroh-gateway/README.md#values). Th
 
 - `gatewayNamespaces`: the namespaces whose `Gateway` and `Edge` objects the operator serves; by default only the release namespace. Each listed namespace must exist before the install and gets a Role that lets the operator read its Secrets (see [Secrets](#secrets)). For example `--set 'gatewayNamespaces={iroh-gateway,apps}'`.
 - `relay`: `disabled` (the default), `n0` or a relay URL; it must match the edges' `--relay` (see [Relay mode](#relay-mode)).
-- `metrics.port` (default 8080), where the operator serves `/metrics`, `/healthz` and `/readyz`; `metrics.service.enabled` (default `true`) puts a ClusterIP Service in front of it, and `metrics.serviceMonitor.enabled=true` adds a ServiceMonitor for the Prometheus Operator (see [Metrics and health](#metrics-and-health)).
+- `metrics.port` (default 8080), where the operator serves `/metrics`, `/healthz` and `/readyz`; `metrics.service.enabled` (default `true`) puts a ClusterIP Service in front of it, and `metrics.serviceMonitor.enabled=true` adds a ServiceMonitor for the Prometheus Operator (see [Metrics and health](#metrics-and-health)). The port is bound on `metrics.bindAddress`, by default `0.0.0.0`, which is IPv4 only: on a cluster whose pod IPs are IPv6, pass `--set 'metrics.bindAddress=[::]'`, or the kubelet's probes cannot reach the operator and `helm install --wait` times out.
 - `networkPolicy.enabled=true` adds a NetworkPolicy that admits ingress to the operator pod only on the metrics port, from the peers in `networkPolicy.metricsFrom` (any source when empty), and leaves egress open: the operator must be able to send UDP to the edges, and TCP and UDP to the backend Services.
 
 ### What the chart grants
@@ -221,7 +221,7 @@ spec:
       port: 9090
 ```
 
-Its `Edge` then has `address: edge.iroh-gateway.svc:7842`. Visitors inside the cluster reach the Gateway's ports at the Service; nothing reaches it from outside. Running the image on a VPS instead needs the iroh port and every port of the Gateway published (or host networking), a writable volume for the key, and, for ports below 1024, a way to bind them as a non-root user; none of that is tested.
+The Service lists the public port 8080, which fits the Gateway of the [raw TCP example](#raw-tcp); for another Gateway, list that Gateway's ports instead. Its `Edge` then has `address: edge.iroh-gateway.svc:7842`. Visitors inside the cluster reach the Gateway's ports at the Service; nothing reaches it from outside. Running the image on a VPS instead needs the iroh port and every port of the Gateway published (or host networking), a writable volume for the key, and, for ports below 1024, a way to bind them as a non-root user; none of that is tested.
 
 ## Walkthrough: from an empty VPS to an HTTPS site
 
@@ -623,7 +623,7 @@ spec:
 
 ### Endpoints
 
-Both binaries serve Prometheus metrics only when `--metrics-listen <addr>` is given (`IROH_GATEWAY_EDGE_METRICS_LISTEN` on the edge, `IROH_GATEWAY_METRICS_LISTEN` on the operator); without it nothing listens. An address that cannot be bound ends the process at start with an error that names it. The flag exists on `iroh-gateway-edge run` and on `iroh-gateway-operator run` and `static`. The chart always sets it, to `0.0.0.0:<metrics.port>`.
+Both binaries serve Prometheus metrics only when `--metrics-listen <addr>` is given (`IROH_GATEWAY_EDGE_METRICS_LISTEN` on the edge, `IROH_GATEWAY_METRICS_LISTEN` on the operator); without it nothing listens. An address that cannot be bound ends the process at start with an error that names it. The flag exists on `iroh-gateway-edge run` and on `iroh-gateway-operator run` and `static`. The chart always sets it, to `<metrics.bindAddress>:<metrics.port>` (`0.0.0.0:8080` by default). The operator's endpoint has no authentication, and as the chart installs it any pod in the cluster can reach it, unless `networkPolicy.enabled=true` with `networkPolicy.metricsFrom` set.
 
 Three paths:
 
@@ -697,6 +697,8 @@ An edge that is down, as the operator sees it (on the edge itself, `iroh_gateway
 iroh_gateway_operator_tunnel_up == 0
 ```
 
+An edge without a link has no series at all, so this query does not see it: one added while HAProxy refuses the configuration, one with no address while the relay is disabled, one just removed. Alert on `iroh_gateway_operator_haproxy_config_ok == 0` (below) alongside.
+
 A configuration HAProxy refused, or a reload that failed; the Gateways are then `Programmed` `False` with HAProxy's message:
 
 ```promql
@@ -737,6 +739,8 @@ The two sides pin each other's key, so enrolling an edge is an exchange of two i
 4. Start the edge with `--operator <that id>` (`IROH_GATEWAY_EDGE_OPERATOR`). It then serves only that operator, and the `Edge` turns `Connected`.
 
 ### Raw TCP
+
+The examples of this section and of [HTTP and HTTPS](#http-and-https) and [UDP](#udp) each define a `Gateway` named `public` in `iroh-gateway`, as the walkthrough does, so applying one replaces the walkthrough's Gateway and its listeners. If you followed the walkthrough, add the example's listener to your Gateway instead.
 
 A `TCP` listener and a `TCPRoute` forward a port to one Service, through HAProxy in TCP mode. `scripts/e2e-kind.sh` runs this one, with an echo server as the backend:
 
@@ -984,7 +988,7 @@ What to know:
 | `--haproxy-bin <path>` | `IROH_GATEWAY_HAPROXY_BIN` | `haproxy` (from `PATH`; the nix package puts its own first on `PATH`) |
 | `--metrics-listen <addr>` | `IROH_GATEWAY_METRICS_LISTEN` | not served; `/metrics`, `/healthz` and `/readyz` (see [Metrics and health](#metrics-and-health)) |
 
-`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit. The chart sets `--gateway-namespaces` (when `gatewayNamespaces` is not empty), `--controller-name`, `--identity-secret`, `--relay` and `--metrics-listen`, and `POD_NAMESPACE` from the pod's namespace.
+`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. The HAProxy that `--haproxy-bin` names must be built with its Prometheus exporter, as the official image's and nixpkgs' are, because every configuration the operator renders uses it. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit. The chart sets `--gateway-namespaces` (when `gatewayNamespaces` is not empty), `--controller-name`, `--identity-secret`, `--relay` and `--metrics-listen`, and `POD_NAMESPACE` from the pod's namespace.
 
 ### Status conditions
 
@@ -1051,6 +1055,8 @@ The namespace, the CRD with every `Edge`, the `GatewayClass` and the identity Se
    helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway \
      --set image.tag=edge --set image.pullPolicy=Always --wait --timeout 180s
    ```
+
+   If the old Deployment was edited to set `--gateway-namespaces` or `--relay`, pass the same as `gatewayNamespaces` and `relay` to `helm install`, or the operator stops serving the Gateways in the other namespaces, or stops matching the edges' relay mode.
 
 The RBAC rules the new version needs (for `HTTPRoute`s, `UDPRoute`s, TLS Secrets and status) are the chart's; with `rbac.create=false` they are yours to grant. `kubectl -n iroh-gateway get edge` then shows the edges `Connected` again. These commands were checked against the old manifests and the chart's rendered objects, not run against a cluster that had the old manifests installed.
 
