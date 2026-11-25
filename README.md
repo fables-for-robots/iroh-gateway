@@ -150,7 +150,7 @@ sudo systemd-run --wait --pipe --collect -p DynamicUser=yes -p StateDirectory=ir
   "$(nix build --no-link --print-out-paths github:fables-for-robots/iroh-gateway#edge)/bin/iroh-gateway-edge" id
 ```
 
-A NixOS VM test (`nix build .#checks.x86_64-linux.edge-module`, on x86_64 Linux with KVM) checks that the module starts the edge as a dynamic user with its key in the state directory, that it binds UDP 7842 and the firewall lets it in, that metrics are served, and that a restart keeps the id. The `systemd-run` command above is not part of it, and nothing tests the module with an operator connected. `aarch64-linux` is evaluated but not built by CI.
+A NixOS VM test (`nix build .#checks.x86_64-linux.edge-module`, on x86_64 Linux with KVM) checks that the module starts the edge as a dynamic user with its key in the state directory, that it binds UDP 7842 and the firewall lets it in, that metrics are served, and that a restart keeps the id. The `systemd-run` command above is not part of it, and nothing tests the module with an operator connected. `aarch64-linux` is neither built nor evaluated by CI.
 
 The operator package runs HAProxy as a child process; its wrapper puts nixpkgs' `haproxy` first on `PATH`, so only `--haproxy-bin` or `IROH_GATEWAY_HAPROXY_BIN` choose another one.
 
@@ -557,12 +557,12 @@ kubectl -n iroh-gateway annotate gateway public cert-manager.io/cluster-issuer=l
 
 To rehearse without Let's Encrypt's production rate limits, make a second `ClusterIssuer` with the staging server `https://acme-staging-v02.api.letsencrypt.org/directory` and its own `privateKeySecretRef`, and annotate the Gateway with that one first; its certificates are not trusted by browsers.
 
-What cert-manager then does (this is cert-manager's documented behaviour; the parts this repository tests are named at the head of the walkthrough):
+What cert-manager then does, from its documentation unless a point says otherwise (the parts this repository tests are named at the head of the walkthrough):
 
 - For each listener of the annotated Gateway with protocol `HTTPS` or `TLS`, a `hostname`, `tls.mode: Terminate` and a Secret in `tls.certificateRefs`, it creates a `Certificate` named after the Secret, in the Gateway's namespace, for the listener's `hostname`: here the `Certificate` `app-tls` for `app.example.com`. It does not edit the Gateway.
-- For the challenge it creates a temporary `HTTPRoute` named `cm-acme-http-solver-…` in the `Certificate`'s namespace, attached to the Gateway without a `sectionName` (so to both listeners), for the hostname `app.example.com`, with one rule for the `Exact` path `/.well-known/acme-challenge/<token>` and a solver Service on port 8089 as its backend. On port 80 the operator tries an `Exact` path before the route `app`'s rule for every path, so the challenge reaches the solver.
+- For the challenge it creates a temporary `HTTPRoute` named `cm-acme-http-solver-…` in the `Certificate`'s namespace, attached to the Gateway (according to cert-manager's source, without a `sectionName` or `port`, so to both listeners), for the hostname `app.example.com`, with one rule for the `Exact` path `/.well-known/acme-challenge/<token>` and a solver Service on port 8089 as its backend. On port 80 the operator tries an `Exact` path before the route `app`'s rule for every path, so the challenge reaches the solver.
 - Before it asks Let's Encrypt, cert-manager fetches the challenge URL itself from inside the cluster, through DNS and the edge. Then Let's Encrypt fetches it, through the edge.
-- Once the certificate is issued, cert-manager deletes the temporary route and writes the Secret `app-tls` of type `kubernetes.io/tls`. The operator checks the certificate, the `https` listener becomes usable, and the edge opens port 443. cert-manager renews the certificate before it expires the same way, and the operator loads the renewed one.
+- Once the certificate is issued, cert-manager deletes the temporary route and writes the Secret `app-tls` of type `kubernetes.io/tls`. The operator checks the certificate, the `https` listener becomes usable, and the edge opens port 443. cert-manager renews the certificate before it expires (its general behaviour, not part of what was checked for this text), and the operator loads a renewed Secret as it loads any changed one (the kind test checks that with a Secret it replaces itself).
 
 Watch it with `kubectl -n iroh-gateway get certificates.cert-manager.io,challenges.acme.cert-manager.io,httproutes`, and wait for it:
 
