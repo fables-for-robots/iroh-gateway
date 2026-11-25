@@ -31,6 +31,10 @@
             pkgs.kind
             pkgs.yq-go
             pkgs.shellcheck
+            # The release workflow's checks: actionlint lints it, scripts/check-release-version.sh
+            # reads cargo metadata with jq.
+            pkgs.actionlint
+            pkgs.jq
             # The operator's HTTPS tests make RSA and SEC1 keys with it.
             pkgs.openssl
           ];

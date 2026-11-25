@@ -15,6 +15,8 @@ RUN cargo build --release --locked -p iroh-gateway-operator -p iroh-gateway-edge
 # The operator runs HAProxy as a child process, so it ships on HAProxy's image.
 # The official image puts the binary at /usr/local/sbin/haproxy, which is on PATH.
 FROM haproxy:3.2 AS operator
+LABEL org.opencontainers.image.source=https://github.com/fables-for-robots/iroh-gateway \
+      org.opencontainers.image.licenses=AGPL-3.0-or-later
 COPY --from=build /src/target/release/iroh-gateway-operator /usr/local/bin/iroh-gateway-operator
 USER 65532:65532
 WORKDIR /
@@ -23,5 +25,7 @@ STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/iroh-gateway-operator", "run"]
 
 FROM gcr.io/distroless/cc-debian12:nonroot AS edge
+LABEL org.opencontainers.image.source=https://github.com/fables-for-robots/iroh-gateway \
+      org.opencontainers.image.licenses=AGPL-3.0-or-later
 COPY --from=build /src/target/release/iroh-gateway-edge /iroh-gateway-edge
 ENTRYPOINT ["/iroh-gateway-edge"]
