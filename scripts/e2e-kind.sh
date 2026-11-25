@@ -822,8 +822,9 @@ if ! retry 60 apply_issuer; then
   echo "expected the ClusterIssuer to be applied, got '$got'" >&2
   exit 1
 fi
-# Every listener Gateway public has by now, plus cm. The annotation names the script's own HTTPS
-# listener so that cert-manager leaves app-tls alone.
+# Every listener Gateway public has by now, plus cm. The https listener gets a hostname here, so
+# cert-manager would pick it up; the ignore-tls-listeners annotation is what keeps cert-manager
+# off app-tls.
 kubectl apply -f - <<YAML
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -845,6 +846,7 @@ spec:
     - name: https
       protocol: HTTPS
       port: 8443
+      hostname: app.example.test
       tls:
         mode: Terminate
         certificateRefs:
@@ -899,9 +901,20 @@ if ! retry 30 listener_programmed cm; then
 fi
 
 step "cert-manager: app-tls is untouched"
-if k get certificates.cert-manager.io app-tls >/dev/null 2>&1; then
-  echo "cert-manager created a Certificate app-tls for the script's own HTTPS listener:" >&2
-  k get certificates.cert-manager.io app-tls -o yaml >&2 || true
+# The https listener has a hostname, so only the annotation keeps cert-manager off app-tls. It has
+# processed the Gateway by now: cm-tls is Ready.
+if ! got="$(k get certificates.cert-manager.io -o name 2>&1)"; then
+  echo "listing the Certificates failed: $got" >&2
+  exit 1
+fi
+if [ "$got" != "certificate.cert-manager.io/cm-tls" ]; then
+  echo "expected exactly certificate.cert-manager.io/cm-tls, got:" >&2
+  echo "$got" >&2
+  exit 1
+fi
+# The script's own certificate, the one of the rotation above, is still the one served.
+if ! retry 30 curl_prints "hello from web" --cacert /tmp/second.crt "${https[@]}"; then
+  echo "expected 'hello from web' for https://app.example.test:8443/ with the certificate of app-tls, got '$got'" >&2
   exit 1
 fi
 
