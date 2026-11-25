@@ -81,7 +81,7 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
 }
 
 /// The body of HAProxy's `GET /metrics` on `socket`, or `None` when it did not answer a `200`
-/// with a complete, non-chunked body within [`EXPORTER_TIMEOUT`] and [`EXPORTER_MAX_BYTES`].
+/// with a complete body (a chunked one decoded) within [`EXPORTER_TIMEOUT`] and [`EXPORTER_MAX_BYTES`].
 async fn fetch_exporter(socket: &Path) -> Option<String> {
     let exchange = async {
         let mut stream = UnixStream::connect(socket).await.ok()?;
@@ -145,7 +145,7 @@ fn decode_chunked(mut rest: &[u8]) -> Option<Vec<u8>> {
         if size == 0 {
             return Some(out);
         }
-        if rest.len() < size + 2 || &rest[size..size + 2] != b"\r\n" {
+        if rest.len() < 2 || rest.len() - 2 < size || &rest[size..size + 2] != b"\r\n" {
             return None;
         }
         out.extend_from_slice(&rest[..size]);
@@ -164,6 +164,14 @@ mod tests {
     fn two_chunks_with_an_extension_decode_to_their_concatenation() {
         let body = b"5;name=value\r\nhello\r\n7\r\n, world\r\n0\r\nTrailer: x\r\n\r\n";
         assert_eq!(decode_chunked(body).unwrap(), b"hello, world");
+    }
+
+    #[test]
+    fn a_size_that_overflows_is_refused_without_a_panic() {
+        for size in ["ffffffffffffffff", "fffffffffffffffe", "7ffffffffffffffe"] {
+            let body = format!("{size}\r\nhello\r\n0\r\n\r\n");
+            assert!(decode_chunked(body.as_bytes()).is_none(), "{size}");
+        }
     }
 
     #[test]
