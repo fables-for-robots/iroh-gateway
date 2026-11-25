@@ -9,6 +9,8 @@
 mod common;
 
 use std::fmt::Debug;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use common::envtest::Envtest;
@@ -60,6 +62,8 @@ const CONVERGE: Duration = Duration::from_secs(20);
 /// The operator as `run` wires it: identity, engine started with an empty render, stores, loop.
 struct Operator {
     key: SecretKey,
+    /// The loop's readiness, as `/readyz` serves it.
+    ready: Arc<AtomicBool>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
     _dir: TempDir,
@@ -90,6 +94,7 @@ impl Operator {
         let stores = Stores::start(client.clone(), &settings.gateway_namespaces);
         let writer = StatusWriter::new(client.clone(), CONTROLLER.into());
         let opts = ControllerOptions::new(settings, dir.path());
+        let ready = opts.ready.clone();
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let ended = run_loop(stores, &mut engine, writer, opts, async {
@@ -102,6 +107,7 @@ impl Operator {
         });
         Self {
             key,
+            ready,
             shutdown: Some(shutdown),
             task: Some(task),
             _dir: dir,
@@ -358,6 +364,31 @@ async fn programmed(client: &Client, operator: &Operator, port: u16) {
     })
     .await;
     eventually("the public port accepts", || connects(port)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn the_operator_becomes_ready_after_its_first_pass() {
+    let env = Envtest::start().await;
+    class(&env.client).await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    eventually("ready", || async {
+        if operator.ready.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("not ready".to_owned())
+        }
+    })
+    .await;
+    // The pass that made it ready goes on to write the class's status.
+    eventually("GatewayClass Accepted", || async {
+        let class: GatewayClass = Api::all(env.client.clone()).get("iroh").await.unwrap();
+        let conditions = class.status.and_then(|s| s.conditions).unwrap_or_default();
+        has(&conditions, &[("Accepted", "True")])
+    })
+    .await;
+    assert!(operator.ready.load(Ordering::SeqCst));
+    operator.stop().await;
 }
 
 #[tokio::test]

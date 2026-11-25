@@ -47,8 +47,6 @@ pub struct Metrics {
     tunnel: Tunnel,
     /// How many running links report on each edge; its series go when the last one ends.
     links: Arc<Mutex<HashMap<String, usize>>>,
-    #[allow(dead_code)]
-    // Registered now; the engine and the controller update them from Task 3 on.
     control: Control,
 }
 
@@ -78,18 +76,22 @@ struct Tunnel {
     udp_dropped: IntCounterVec,
 }
 
-/// HAProxy and the controller loop.
+/// The series of HAProxy, which the engine updates, and of the controller loop.
 #[derive(Clone)]
-#[allow(dead_code)] // Registered now; the engine and the controller update them from Task 3 on.
-struct Control {
-    /// `haproxy_reloads_total` per `result`: `ok`, `refused`, `failed`.
-    haproxy_reloads_ok: IntCounter,
-    haproxy_reloads_refused: IntCounter,
-    haproxy_reloads_failed: IntCounter,
-    haproxy_config_ok: IntGauge,
-    reconciles: IntCounter,
-    reconcile_duration: Histogram,
-    status_write_failures: IntCounter,
+pub(crate) struct Control {
+    /// `haproxy_reloads_total` per `result`: `ok` for a reload HAProxy took, `refused` for a
+    /// configuration it refused as invalid, `failed` for a reload that failed.
+    pub haproxy_reloads_ok: IntCounter,
+    pub haproxy_reloads_refused: IntCounter,
+    pub haproxy_reloads_failed: IntCounter,
+    /// 1 when HAProxy took the last configuration applied, else 0.
+    pub haproxy_config_ok: IntGauge,
+    /// Passes of the controller loop.
+    pub reconciles: IntCounter,
+    /// A pass, from taking the snapshot to the end of its status write.
+    pub reconcile_duration: Histogram,
+    /// Status writes that failed.
+    pub status_write_failures: IntCounter,
 }
 
 /// The series of one edge, for its link.
@@ -352,6 +354,11 @@ impl Metrics {
                 error!("encoding the metrics failed: {e}");
                 String::new()
             })
+    }
+
+    /// The series of HAProxy and of the controller loop.
+    pub(crate) fn control(&self) -> &Control {
+        &self.control
     }
 
     /// Sets up every series of `edge`, for a link that starts; they go when it drops the hold.

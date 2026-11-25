@@ -1,9 +1,11 @@
 //! `iroh-gateway-operator`: the private side of the tunnel.
 
 use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -12,6 +14,8 @@ use iroh_gateway_operator::controller::{ControllerOptions, run_loop};
 use iroh_gateway_operator::engine::{Engine, EngineOptions};
 use iroh_gateway_operator::haproxy::SupervisorOptions;
 use iroh_gateway_operator::haproxy::render::render;
+use iroh_gateway_operator::http::{self, HttpState};
+use iroh_gateway_operator::metrics::Metrics;
 use iroh_gateway_operator::model::{self, Settings, Snapshot};
 use iroh_gateway_operator::staticcfg;
 use iroh_gateway_operator::tunnel::{
@@ -20,8 +24,9 @@ use iroh_gateway_operator::tunnel::{
 use iroh_gateway_proto::control::{ListenerKey, Protocol};
 use iroh_gateway_proto::key::load_or_generate;
 use iroh_gateway_proto::transport::Relay;
+use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -46,6 +51,9 @@ enum Command {
     Static {
         #[arg(long)]
         config: PathBuf,
+        /// Address to serve /healthz, /readyz and /metrics on; not served when unset.
+        #[arg(long, env = "IROH_GATEWAY_METRICS_LISTEN", value_name = "ADDR")]
+        metrics_listen: Option<SocketAddr>,
     },
     /// Run as the Gateway API controller of the cluster this runs in.
     Run(RunArgs),
@@ -86,6 +94,9 @@ struct RunArgs {
     runtime_dir: PathBuf,
     #[arg(long, env = "IROH_GATEWAY_HAPROXY_BIN", default_value = "haproxy")]
     haproxy_bin: PathBuf,
+    /// Address to serve /healthz, /readyz and /metrics on; not served when unset.
+    #[arg(long, env = "IROH_GATEWAY_METRICS_LISTEN", value_name = "ADDR")]
+    metrics_listen: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -107,13 +118,16 @@ async fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("key file {}", key_file.display()))?;
             println!("{}", key.public());
         }
-        Command::Static { config } => run_static(config).await?,
+        Command::Static {
+            config,
+            metrics_listen,
+        } => run_static(config, metrics_listen).await?,
         Command::Run(args) => run_controller(args).await?,
     }
     Ok(())
 }
 
-async fn run_static(path: PathBuf) -> anyhow::Result<()> {
+async fn run_static(path: PathBuf, metrics_listen: Option<SocketAddr>) -> anyhow::Result<()> {
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let base_dir = path.parent().unwrap_or(Path::new(""));
@@ -124,6 +138,9 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
     // One descriptor per backend connection, plus the endpoint and the rest.
     let limit = raise_open_file_limit()?;
     info!("open file limit is {limit}");
+    let metrics = Metrics::new();
+    let ready = Arc::new(AtomicBool::new(false));
+    let _server = Server::start(metrics_listen, metrics.clone(), ready.clone()).await?;
     let endpoint = bind_endpoint(key.clone(), &cfg.relay).await?;
     info!(id = %key.public(), "operator started");
 
@@ -155,7 +172,8 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
                 }
             }
         }
-        let opts = LinkOptions::new(edge.endpoint_id, edge.address, cfg.relay.clone())?;
+        let mut opts = LinkOptions::new(edge.endpoint_id, edge.address, cfg.relay.clone())?;
+        opts.metrics = metrics.clone();
         let (tx, rx) = watch::channel(keys);
         let (udp_tx, udp_rx) = watch::channel(udp_targets);
         let link = EdgeLink::spawn(
@@ -192,6 +210,7 @@ async fn run_static(path: PathBuf) -> anyhow::Result<()> {
         senders.push((tx, udp_tx));
         links.push(link);
     }
+    ready.store(true, Ordering::Release);
 
     tokio::select! {
         r = shutdown_signal() => r?,
@@ -237,6 +256,10 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     // First, so that a signal at any point from here on stops the operator cleanly.
     let shutdown = shutdown_signals()?;
     let mut shutdown = pin!(shutdown);
+    // Before the cluster is reached: /healthz answers while start-up waits for it.
+    let metrics = Metrics::new();
+    let ready = Arc::new(AtomicBool::new(false));
+    let _server = Server::start(args.metrics_listen, metrics.clone(), ready.clone()).await?;
     let limit = raise_open_file_limit()?;
     info!("open file limit is {limit}");
 
@@ -260,12 +283,10 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     supervisor.haproxy_bin = args.haproxy_bin;
     // Nothing is served until the stores have synced and the first pass has run.
     let initial = render(&model::build(&Snapshot::default(), &settings), &haproxy_dir);
+    let mut engine_opts = EngineOptions::new(supervisor, args.relay);
+    engine_opts.metrics = metrics.clone();
     let started = tokio::select! {
-        engine = Engine::start(
-            endpoint.clone(),
-            EngineOptions::new(supervisor, args.relay),
-            initial,
-        ) => engine,
+        engine = Engine::start(endpoint.clone(), engine_opts, initial) => engine,
         () = &mut shutdown => {
             // Dropping the unfinished start kills the HAProxy it may have started.
             info!("stopped during start-up");
@@ -276,7 +297,9 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     let mut engine = started?;
     let stores = Stores::start(client.clone(), &settings.gateway_namespaces);
     let writer = StatusWriter::new(client, args.controller_name);
-    let opts = ControllerOptions::new(settings, &haproxy_dir);
+    let mut opts = ControllerOptions::new(settings, &haproxy_dir);
+    opts.metrics = metrics;
+    opts.ready = ready;
     // A signal that came since the engine started ends the loop at once.
     let ended = run_loop(stores, &mut engine, writer, opts, shutdown).await;
     info!("shutting down");
@@ -286,6 +309,41 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
         error!("{e:#}");
     }
     ended
+}
+
+/// The task serving `/healthz`, `/readyz` and `/metrics`, if `--metrics-listen` was given.
+/// Dropping it, on whichever way the subcommand ends, aborts the task.
+struct Server(Option<JoinHandle<()>>);
+
+impl Server {
+    /// Binds `addr` and serves on it; an address that cannot be bound is an error naming it.
+    async fn start(
+        addr: Option<SocketAddr>,
+        metrics: Metrics,
+        ready: Arc<AtomicBool>,
+    ) -> anyhow::Result<Self> {
+        let Some(addr) = addr else {
+            return Ok(Self(None));
+        };
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding the metrics listener on {addr}"))?;
+        info!("serving /healthz, /readyz and /metrics on http://{addr}");
+        let task = tokio::spawn(async move {
+            if let Err(e) = http::serve(listener, HttpState { metrics, ready }).await {
+                error!("serving metrics failed: {e}");
+            }
+        });
+        Ok(Self(Some(task)))
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Raises the soft open-file limit as far as the hard limit allows and returns the soft limit

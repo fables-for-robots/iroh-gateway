@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::bail;
@@ -10,6 +12,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::cluster::{SnapshotSource, StatusSink};
 use crate::engine::{Engine, EngineEvent};
 use crate::haproxy::render::{Rendered, render};
+use crate::metrics::Metrics;
 use crate::model::{self, Settings};
 use crate::status::{self, Facts};
 
@@ -30,11 +33,15 @@ pub struct ControllerOptions {
     /// changed. Doubles after each consecutive failing pass, up to `status_retry_max`.
     pub status_retry_min: Duration,
     pub status_retry_max: Duration,
+    /// Where the loop counts and times its passes and counts failed status writes.
+    pub metrics: Metrics,
+    /// Set once the first pass's apply has returned, whatever HAProxy made of it; never unset.
+    pub ready: Arc<AtomicBool>,
 }
 
 impl ControllerOptions {
-    /// Options with [`DEFAULT_DEBOUNCE`], [`DEFAULT_STATUS_RETRY_MIN`] and
-    /// [`DEFAULT_STATUS_RETRY_MAX`].
+    /// Options with [`DEFAULT_DEBOUNCE`], [`DEFAULT_STATUS_RETRY_MIN`],
+    /// [`DEFAULT_STATUS_RETRY_MAX`], metrics of their own, and not ready.
     pub fn new(settings: Settings, runtime_dir: impl Into<PathBuf>) -> Self {
         Self {
             settings,
@@ -42,6 +49,8 @@ impl ControllerOptions {
             debounce: DEFAULT_DEBOUNCE,
             status_retry_min: DEFAULT_STATUS_RETRY_MIN,
             status_retry_max: DEFAULT_STATUS_RETRY_MAX,
+            metrics: Metrics::new(),
+            ready: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -90,6 +99,10 @@ impl<A: Applier> Applier for &mut A {
 /// has passed after a pass whose status write failed; changes that arrive within `debounce` of
 /// the first trigger are taken in the same pass. A pass's apply is never interrupted; its
 /// status write is cut short by `shutdown`, which is otherwise noticed between passes.
+///
+/// Each pass that completes is counted and timed, from taking the snapshot to the end of its
+/// status write, in [`ControllerOptions::metrics`]. [`ControllerOptions::ready`] is set once the
+/// first pass's apply has returned.
 pub async fn run_loop(
     mut source: impl SnapshotSource,
     mut applier: impl Applier,
@@ -110,10 +123,13 @@ pub async fn run_loop(
 
     // The delay before the next pass while status writes keep failing.
     let mut status_retry: Option<Duration> = None;
+    let control = opts.metrics.control();
     loop {
+        let started = Instant::now();
         let snapshot = source.snapshot();
         let model = model::build(&snapshot, &opts.settings);
         applier.apply(render(&model, &opts.runtime_dir)).await;
+        opts.ready.store(true, Ordering::Release);
         let desired = status::compute(&model, &applier.facts());
         // Each status request has a timeout, but the write is still raced against shutdown: a
         // pass with many slow writes would otherwise hold up SIGTERM.
@@ -121,6 +137,13 @@ pub async fn run_loop(
             written = sink.write(&desired, &snapshot) => written,
             () = &mut shutdown => return Ok(()),
         };
+        control.reconciles.inc();
+        control
+            .reconcile_duration
+            .observe(started.elapsed().as_secs_f64());
+        if !written {
+            control.status_write_failures.inc();
+        }
         status_retry = (!written).then(|| match status_retry {
             None => opts.status_retry_min,
             Some(delay) => (delay * 2).min(opts.status_retry_max),
@@ -272,6 +295,9 @@ mod tests {
         times: Arc<Mutex<Vec<Instant>>>,
         results: Arc<Mutex<VecDeque<bool>>>,
         hang: Arc<AtomicBool>,
+        /// The loop's [`ControllerOptions::metrics`] and [`ControllerOptions::ready`].
+        metrics: Metrics,
+        ready: Arc<AtomicBool>,
         shutdown: Option<oneshot::Sender<()>>,
         task: JoinHandle<anyhow::Result<()>>,
     }
@@ -315,6 +341,7 @@ mod tests {
             };
             let mut opts = ControllerOptions::new(settings(&["gw"]), "/run/igw");
             customize(&mut opts);
+            let (metrics, ready) = (opts.metrics.clone(), opts.ready.clone());
             let task = tokio::spawn(run_loop(source, applier, sink, opts, async {
                 let _ = shutdown_rx.await;
             }));
@@ -328,9 +355,21 @@ mod tests {
                 times,
                 results,
                 hang,
+                metrics,
+                ready,
                 shutdown: Some(shutdown),
                 task,
             }
+        }
+
+        /// Whether the loop's metrics have the line `iroh_gateway_operator_<series> <value>`.
+        fn shows(&self, series: &str, value: u64) -> bool {
+            let line = format!("iroh_gateway_operator_{series} {value}");
+            self.metrics.render().lines().any(|l| l == line)
+        }
+
+        fn ready(&self) -> bool {
+            self.ready.load(Ordering::SeqCst)
         }
 
         fn applies(&self) -> usize {
@@ -477,6 +516,45 @@ mod tests {
         // That write succeeded: no more passes.
         sleep(DEFAULT_STATUS_RETRY_MAX * 3).await;
         assert_eq!((rig.applies(), rig.writes()), (2, 2));
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_is_counted_and_timed() {
+        let rig = Rig::start();
+        assert!(rig.shows("reconciles_total", 0), "{}", rig.metrics.render());
+        rig.synced().await;
+        assert!(rig.shows("reconciles_total", 1), "{}", rig.metrics.render());
+        assert!(
+            rig.shows("reconcile_duration_seconds_count", 1),
+            "{}",
+            rig.metrics.render()
+        );
+        assert!(rig.shows("status_write_failures_total", 0));
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_status_write_is_counted() {
+        let rig = Rig::start_with(&[false], |_| {});
+        rig.synced().await;
+        assert!(
+            rig.shows("status_write_failures_total", 1),
+            "{}",
+            rig.metrics.render()
+        );
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_after_the_first_pass_even_when_haproxy_refuses() {
+        let rig = Rig::start();
+        rig.facts.lock().unwrap().haproxy = Err("haproxy refused the configuration".into());
+        rig.changes.send(()).unwrap();
+        sleep(Duration::from_secs(1)).await;
+        assert!(!rig.ready(), "ready before the stores synced");
+        rig.synced().await;
+        assert!(rig.ready());
         rig.stop().await.unwrap();
     }
 

@@ -6,6 +6,7 @@ mod common;
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use common::{
-    echo_server, edge_options, free_tcp_port, free_udp_port, udp_echo_server, udp_roundtrip,
+    STEP, echo_server, edge_options, free_tcp_port, free_udp_port, udp_echo_server, udp_roundtrip,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_iroh-gateway-operator");
@@ -357,12 +358,11 @@ fn run_needs_a_namespace() {
     assert!(stderr.contains("--namespace"), "stderr: {stderr}");
 }
 
-#[test]
-fn run_stops_on_sigterm_during_start_up() {
-    // An API server that takes connections and never answers: the identity load hangs.
+/// An API server that takes connections and never answers, so `run` stays in start-up, and a
+/// kubeconfig in `home` that points at it. Hold the listener for as long as `run` should hang.
+fn silent_cluster(home: &Path) -> (std::net::TcpListener, PathBuf) {
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let kubeconfig = home.path().join("kubeconfig");
+    let kubeconfig = home.join("kubeconfig");
     std::fs::write(
         &kubeconfig,
         format!(
@@ -385,15 +385,29 @@ fn run_stops_on_sigterm_during_start_up() {
         ),
     )
     .unwrap();
-    let runtime = common::short_dir();
+    (silent, kubeconfig)
+}
+
+/// `run` against `kubeconfig`, with HAProxy's directory in `runtime` and `args` added.
+fn run_against(home: &Path, kubeconfig: &Path, runtime: &Path, args: &[&str]) -> Command {
     let mut cmd = bin();
     cmd.env_remove("KUBERNETES_SERVICE_HOST")
         .env_remove("KUBERNETES_SERVICE_PORT")
-        .env("HOME", home.path())
-        .env("KUBECONFIG", &kubeconfig)
+        .env("HOME", home)
+        .env("KUBECONFIG", kubeconfig)
         .env("RUST_LOG", "info")
         .args(["run", "--namespace", "ns", "--runtime-dir"])
-        .arg(runtime.path());
+        .arg(runtime)
+        .args(args);
+    cmd
+}
+
+#[test]
+fn run_stops_on_sigterm_during_start_up() {
+    let home = tempfile::tempdir().unwrap();
+    let (silent, kubeconfig) = silent_cluster(home.path());
+    let runtime = common::short_dir();
+    let cmd = run_against(home.path(), &kubeconfig, runtime.path(), &[]);
     let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
     let (mut child, lines) = spawn_with_nofile(cmd, soft, hard);
     // Logged just before the client is built.
@@ -406,4 +420,163 @@ fn run_stops_on_sigterm_during_start_up() {
     // Nothing was started: no HAProxy directory.
     assert!(!runtime.path().join("haproxy").exists());
     drop(silent);
+}
+
+/// The status code and the body of `GET <path>` over HTTP/1.0 from `addr`.
+async fn http_get(addr: &str, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(STEP, stream.read_to_end(&mut response))
+        .await
+        .expect("no response in time")
+        .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no end of headers in {response:?}"));
+    let code = head
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {head:?}"));
+    (code, body.to_owned())
+}
+
+/// The output of `cmd`, which must exit within 10 s.
+fn output_within_10s(cmd: &mut Command) -> Output {
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = Pid::from_raw(child.id() as i32);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(out) => out.unwrap(),
+        Err(_) => {
+            let _ = kill(pid, Signal::SIGKILL);
+            panic!("still running after 10 s");
+        }
+    }
+}
+
+/// A `static` configuration with one edge at an address nothing answers on, and its key file.
+fn unreachable_static_config(dir: &Path) -> PathBuf {
+    let cfg = dir.join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "key_file = {:?}\n[[edge]]\nendpoint_id = \"{}\"\naddress = \"127.0.0.1:1\"\n\
+             [[edge.listener]]\nprotocol = \"tcp\"\nport = 8080\ntarget = \"127.0.0.1:3000\"\n",
+            dir.join("o.key").to_str().unwrap(),
+            SecretKey::generate().public()
+        ),
+    )
+    .unwrap();
+    cfg
+}
+
+#[tokio::test]
+async fn static_serves_metrics_and_is_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = unreachable_static_config(dir.path());
+    let addr = format!("127.0.0.1:{}", free_tcp_port());
+    let mut cmd = bin();
+    cmd.env("RUST_LOG", "info")
+        .args(["static", "--config", cfg.to_str().unwrap()])
+        .args(["--metrics-listen", &addr]);
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    let (mut child, lines) = spawn_with_nofile(cmd, soft, hard);
+    line_with(&lines, &format!("on http://{addr}"));
+
+    // Ready once every link is spawned, which is just after the listener is bound.
+    let deadline = Instant::now() + STEP;
+    loop {
+        let (code, body) = http_get(&addr, "/readyz").await;
+        if code == 200 {
+            assert_eq!(body, "ready");
+            break;
+        }
+        assert!(Instant::now() < deadline, "not ready within {STEP:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (code, metrics) = http_get(&addr, "/metrics").await;
+    assert_eq!(code, 200);
+    assert!(
+        metrics.contains("iroh_gateway_operator_tunnel_up{edge=\""),
+        "{metrics}"
+    );
+    assert_eq!(http_get(&addr, "/healthz").await, (200, "ok".to_owned()));
+    let status = child.terminate();
+    assert!(status.success(), "{status:?}");
+}
+
+#[tokio::test]
+async fn run_answers_healthz_before_it_has_a_cluster() {
+    let home = tempfile::tempdir().unwrap();
+    let (silent, kubeconfig) = silent_cluster(home.path());
+    let runtime = common::short_dir();
+    let addr = format!("127.0.0.1:{}", free_tcp_port());
+    let cmd = run_against(
+        home.path(),
+        &kubeconfig,
+        runtime.path(),
+        &["--metrics-listen", &addr],
+    );
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    let (mut child, lines) = spawn_with_nofile(cmd, soft, hard);
+    line_with(&lines, &format!("on http://{addr}"));
+
+    // The API server never answers, so `run` is still loading its identity.
+    assert_eq!(http_get(&addr, "/healthz").await, (200, "ok".to_owned()));
+    assert_eq!(
+        http_get(&addr, "/readyz").await,
+        (503, "not ready".to_owned())
+    );
+    let (code, metrics) = http_get(&addr, "/metrics").await;
+    assert_eq!(code, 200);
+    assert!(
+        metrics.contains("iroh_gateway_operator_reconciles_total 0"),
+        "{metrics}"
+    );
+    let status = child.terminate();
+    assert!(status.success(), "{status:?}");
+    assert!(!runtime.path().join("haproxy").exists());
+    drop(silent);
+}
+
+#[test]
+fn metrics_listen_on_a_taken_address_fails_at_start() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = held.local_addr().unwrap().to_string();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = unreachable_static_config(dir.path());
+    let out = output_within_10s(
+        bin()
+            .args(["static", "--config", cfg.to_str().unwrap()])
+            .args(["--metrics-listen", &addr]),
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&addr), "{stderr}");
+
+    // `run` binds it before it looks for a cluster.
+    let out = run_without_cluster(&["--namespace", "ns", "--metrics-listen", &addr]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&addr), "{stderr}");
+    assert!(
+        !stderr.contains("Kubernetes configuration"),
+        "stderr: {stderr}"
+    );
+    drop(held);
 }

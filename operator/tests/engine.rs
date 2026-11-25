@@ -698,6 +698,83 @@ async fn retry_after_failed_reloads_backs_off_and_resets() {
     engine.shutdown().await;
 }
 
+#[tokio::test]
+async fn reloads_are_counted_by_result() {
+    let w = World::new().await;
+    let p = free_tcp_port();
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let opts = w.options();
+    let metrics = opts.metrics.clone();
+    let mut engine = Engine::start(endpoint, opts, w.plan(&[("gw", &[p])], &[]))
+        .await
+        .unwrap();
+    let value = |series: &str| metric(&metrics.render(), series);
+    let ok = "haproxy_reloads_total{result=\"ok\"}";
+    let refused = "haproxy_reloads_total{result=\"refused\"}";
+    let failed = "haproxy_reloads_total{result=\"failed\"}";
+    // HAProxy runs the initial configuration; starting it is not a reload.
+    assert_eq!(value("haproxy_config_ok"), 1.0);
+    assert_eq!(value(ok), 0.0);
+
+    let q = free_tcp_port();
+    let accepted = w.plan(&[("gw", &[p, q])], &[]);
+    engine.apply(accepted.clone()).await;
+    assert_eq!((value(ok), value("haproxy_config_ok")), (1.0, 1.0));
+    // The same plan again changes nothing in HAProxy and counts nothing.
+    engine.apply(accepted).await;
+    assert_eq!((value(ok), value("haproxy_config_ok")), (1.0, 1.0));
+
+    let mut bad = w.plan(&[("gw", &[p])], &[]);
+    bad.haproxy_cfg = INVALID_CFG.into();
+    engine.apply(bad).await;
+    assert_eq!((value(refused), value("haproxy_config_ok")), (1.0, 0.0));
+    assert_eq!((value(ok), value(failed)), (1.0, 0.0));
+
+    // Without the master socket the reload cannot be sent.
+    let master = w.dir.path().join("master.sock");
+    let away = w.dir.path().join("master.away");
+    std::fs::rename(&master, &away).unwrap();
+    failed_then_waited(&mut engine, w.plan(&[("gw", &[q])], &[])).await;
+    assert!(value(failed) >= 1.0, "{}", metrics.render());
+    assert_eq!(value("haproxy_config_ok"), 0.0);
+    assert_eq!((value(ok), value(refused)), (1.0, 1.0));
+    std::fs::rename(&away, &master).unwrap();
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn links_of_the_engine_report_into_its_metrics() {
+    let w = World::new().await;
+    let edge = w.edge().await;
+    let p = free_tcp_port();
+    let endpoint = bind_endpoint(w.operator_key.clone(), &Relay::Disabled)
+        .await
+        .unwrap();
+    let opts = w.options();
+    let metrics = opts.metrics.clone();
+    let mut engine = Engine::start(
+        endpoint,
+        opts,
+        w.plan(&[("gw", &[p])], &[at("e", "gw", &edge)]),
+    )
+    .await
+    .unwrap();
+    wait_facts(&mut engine, |f| serving(f, "e", &[p])).await;
+    let label = format!("edge=\"{}\"", edge.endpoint_id());
+    assert_eq!(
+        metric(&metrics.render(), &format!("tunnel_up{{{label}}}")),
+        1.0
+    );
+
+    engine.apply(w.plan(&[("gw", &[p])], &[])).await;
+    let text = metrics.render();
+    assert!(!text.contains(&label), "{text}");
+    engine.shutdown().await;
+    edge.shutdown().await;
+}
+
 /// `rendered` with a frontend that binds `<dir>/s/tls.sock` with `ssl crt <dir>/certs/<name>`,
 /// and the file that line names.
 fn with_cert(w: &World, mut rendered: Rendered, name: &str) -> Rendered {

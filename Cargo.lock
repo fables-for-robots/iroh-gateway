@@ -1882,6 +1882,7 @@ name = "iroh-gateway-operator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "bytes",
  "clap",

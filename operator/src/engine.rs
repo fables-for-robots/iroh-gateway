@@ -24,7 +24,8 @@ use tokio::time::{Instant, sleep_until};
 use tracing::{error, info, warn};
 
 use crate::haproxy::render::{EdgePlan, PortPlan, Rendered};
-use crate::haproxy::{ApplyError, Supervisor, SupervisorOptions};
+use crate::haproxy::{Applied, ApplyError, Supervisor, SupervisorOptions};
+use crate::metrics::Metrics;
 use crate::model::ObjRef;
 use crate::status::Facts;
 use crate::tunnel::{
@@ -46,15 +47,18 @@ pub struct EngineOptions {
     /// The delay doubles after each further failure, up to [`MAX_RETRY`], and is back to this
     /// after a success.
     pub retry: Duration,
+    /// Where the engine counts HAProxy's reloads, and where its links report their edges.
+    pub metrics: Metrics,
 }
 
 impl EngineOptions {
-    /// Options with [`DEFAULT_RETRY`].
+    /// Options with [`DEFAULT_RETRY`] and metrics of their own.
     pub fn new(supervisor: SupervisorOptions, relay: Relay) -> Self {
         Self {
             supervisor,
             relay,
             retry: DEFAULT_RETRY,
+            metrics: Metrics::new(),
         }
     }
 }
@@ -84,6 +88,8 @@ pub struct Engine {
     unreachable: BTreeMap<ObjRef, EdgeState>,
     /// When [`Engine::next_event`] asks for another pass after a failed reload.
     retry_at: Option<Instant>,
+    /// [`EngineOptions::metrics`].
+    metrics: Metrics,
 }
 
 /// One running link and what it was started with.
@@ -122,6 +128,7 @@ impl Engine {
             anyhow::bail!("the initial configuration must not name files");
         }
         let supervisor = Supervisor::start(opts.supervisor, &initial.haproxy_cfg).await?;
+        opts.metrics.control().haproxy_config_ok.set(1);
         let mut engine = Self {
             endpoint,
             relay: opts.relay,
@@ -132,6 +139,7 @@ impl Engine {
             links: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             retry_at: None,
+            metrics: opts.metrics,
         };
         engine.note_unreachable(&initial.edges);
         engine.program(&initial.edges);
@@ -199,8 +207,13 @@ impl Engine {
             stop_links(gone.into_iter().map(|(_, link)| link.handle))
         );
         self.note_unreachable(&rendered.edges);
+        let control = self.metrics.control();
         match applied {
-            Ok(_) => {
+            Ok(applied) => {
+                if applied == Applied::Reloaded {
+                    control.haproxy_reloads_ok.inc();
+                }
+                control.haproxy_config_ok.set(1);
                 self.haproxy = Ok(());
                 self.retry_at = None;
                 self.retry_delay = self.retry;
@@ -208,6 +221,13 @@ impl Engine {
             }
             Err(e) => {
                 warn!(error = %e, "haproxy did not take the configuration; adding nothing");
+                match e {
+                    ApplyError::Invalid(_) => control.haproxy_reloads_refused.inc(),
+                    ApplyError::ReloadFailed(_) | ApplyError::Io(_) => {
+                        control.haproxy_reloads_failed.inc();
+                    }
+                }
+                control.haproxy_config_ok.set(0);
                 // Each attempt can be two reloads, and HAProxy ends the connections of workers
                 // older than `mworker-max-reloads` reloads: a failure that persists must not
                 // reload often.
@@ -319,7 +339,10 @@ impl Engine {
     }
 
     fn link_options(&self, plan: &EdgePlan) -> anyhow::Result<LinkOptions> {
-        LinkOptions::new(plan.endpoint_id, plan.address.clone(), self.relay.clone())
+        let mut opts =
+            LinkOptions::new(plan.endpoint_id, plan.address.clone(), self.relay.clone())?;
+        opts.metrics = self.metrics.clone();
+        Ok(opts)
     }
 
     /// After HAProxy took the configuration: socket tables first, then missing links, each with
