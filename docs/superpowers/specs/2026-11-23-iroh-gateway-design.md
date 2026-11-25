@@ -778,13 +778,24 @@ runtime API without reloading; that is later work.
 
 - **Workspace.** Three crates: `proto` (messages, framing, fragmentation),
   `edge`, `operator` (with a `crdgen` binary).
-- **Operator image.** An official HAProxy LTS image as base with the
-  operator binary added, running as non-root. Published to
-  `ghcr.io/fables-for-robots/iroh-gateway-operator`.
-- **Helm chart** under `charts/iroh-gateway`: Deployment, RBAC, the `Edge`
-  CRD, a `GatewayClass`, an optional `NetworkPolicy`, metrics Service.
-  Gateway API CRDs are a prerequisite, not bundled. Until the chart exists
-  (build step 5) the same objects ship as plain manifests in `deploy/`.
+- **Images.** The operator image is an official HAProxy LTS image with the
+  operator binary added, running as non-root, published to
+  `ghcr.io/fables-for-robots/iroh-gateway-operator`. The edge image, a
+  distroless image with the edge binary, is published next to it as
+  `ghcr.io/fables-for-robots/iroh-gateway-edge`. Both are built for amd64
+  and arm64.
+- **Helm chart** under `charts/iroh-gateway`: Deployment with liveness and
+  readiness probes, RBAC (one `Role` per gateway namespace), the `Edge`
+  CRD, a `GatewayClass`, a metrics Service, an optional `ServiceMonitor`
+  and an optional `NetworkPolicy` that lets nothing in but the metrics
+  port. Gateway API CRDs are a prerequisite, not bundled. The chart is the
+  only way to install; the plain manifests of steps 2 to 4 (`deploy/`) are
+  gone, and the CRD that `crdgen` writes lives in the chart's `crds/`.
+- **Releases.** Every push to `main` publishes both images with the tags
+  `edge` and `sha-<commit>`. A `v*` tag, which must equal the crates'
+  version, publishes them under that version, pushes the chart to
+  `oci://ghcr.io/fables-for-robots/charts`, and creates a GitHub release
+  with the static edge binaries, the systemd unit and checksums.
 - **Operator permissions.** In its own namespace the operator may `get` its
   identity Secret, by name, and `create` Secrets. In every gateway
   namespace a `Role` lets it `list` and `watch` Secrets, for certificates;
@@ -792,17 +803,20 @@ runtime API without reloading; that is later work.
   status subresources it may only `patch`.
 - **Operator resources.** Memory request 128 Mi, limit 1 Gi, sized for one
   edge (see the tunnel protocol's memory bound).
-- **Edge.** Static Linux binaries for x86_64 and aarch64, a hardened systemd
-  unit (dynamic user, `CAP_NET_BIND_SERVICE` only), and a NixOS module from
-  the flake. Subcommands: `run`, and `id` to print the EndpointId.
-  Configuration: key file path, operator EndpointId, iroh listen address,
-  connection cap, relay mode.
+- **Edge.** Static Linux binaries (musl) for x86_64 and aarch64, a hardened
+  systemd unit (dynamic user, `CAP_NET_BIND_SERVICE` only), and a NixOS
+  module from the flake (`nixosModules.edge`) with the same hardening. The
+  flake also builds both binaries (`packages.edge`, `packages.operator`).
+  Subcommands: `run`, and `id` to print the EndpointId. Configuration: key
+  file path, operator EndpointId, iroh listen address, connection cap,
+  relay mode, metrics listen address.
 - **Operator relay mode** is a chart value, default `disabled`.
 - **Toolchain.** Rust 1.100 (`rust-version = "1.100"`). nixpkgs 26.05 ships
   1.95 and unstable 1.99, so the flake takes the toolchain from
   `oxalica/rust-overlay`, pinned by a `rust-toolchain.toml`.
 - **Flake** dev shell: that toolchain, `haproxy`, `kind`, `kubectl`, `helm`,
-  and `openssl`, which the HTTPS tests use to make RSA and SEC1 keys.
+  `yq` and `actionlint` for the chart and workflow checks, and `openssl`,
+  which the HTTPS tests use to make RSA and SEC1 keys.
 - **License** AGPL-3.0-or-later, as the sibling projects.
 
 ## Observability
@@ -811,6 +825,33 @@ Both binaries log with `tracing` and serve Prometheus metrics: tunnel state
 per edge, streams and flows open, bytes each way, dropped and fragmented
 datagrams, bind failures, reload count and failures, reconcile durations.
 HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
+
+- **Endpoint.** `--metrics-listen <addr>` on `iroh-gateway-edge run` and on
+  `iroh-gateway-operator run` and `static`. Without the flag nothing
+  listens; the chart always sets it. An address that cannot be bound stops
+  the process at start.
+- **Paths.** `/metrics` on both. The operator also answers `/healthz` (200
+  while the process serves) and `/readyz`: 200 once the first pass over the
+  cluster's objects has been applied, whatever HAProxy said to it, and in
+  `static` mode once every link is started. An operator that cannot list
+  what it watches is therefore never ready.
+- **One scrape.** The operator's `/metrics` is its own metrics followed by
+  HAProxy's exporter output, fetched over a unix socket in the runtime
+  directory within 2 s. If HAProxy does not answer, the operator's own
+  metrics are served alone and `iroh_gateway_operator_haproxy_exporter_up`
+  is 0.
+- **Names.** `iroh_gateway_edge_…` and `iroh_gateway_operator_…`. Counters
+  end in `_total`; units are bytes and seconds. Tunnel metrics of the
+  operator carry the label `edge` (the EndpointId), and the series of an
+  edge go away with its link. `direction` is `in` for traffic from visitors
+  towards backends and `out` for the way back. No label carries a visitor
+  address, a port, a hostname or a route name.
+- **Full tunnel.** A UDP packet is handed to the tunnel only when the
+  connection's datagram send buffer has room for all of its pieces;
+  otherwise the whole packet is dropped and counted with the reason
+  `tunnel_full`. The QUIC layer would otherwise discard the oldest queued
+  piece without a trace. Under overload the newest packet is lost, not the
+  oldest, and no packet loses only some of its pieces to the buffer.
 
 ## Testing
 
