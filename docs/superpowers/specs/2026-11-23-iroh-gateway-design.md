@@ -1,7 +1,7 @@
 # iroh-gateway — Design
 
 Date: 2026-11-23
-Status: approved design; build steps 1 to 4 are built (see "Build order")
+Status: approved design; build steps 1 to 5 are built (see "Build order")
 
 ## Overview
 
@@ -267,7 +267,7 @@ One setting, with the same value on the operator and on its edges:
   `max(rate, 65 535 + 64 × 18)` bytes, so the largest packet can pass even a
   small limit, and starts full. A packet that does not fit is dropped before
   it makes a flow. The reason: QUIC sends datagrams ahead of stream data, so
-  a UDP flood that fills the tunnel slows every TCP and HTTP stream of the
+  a UDP flood that fills the tunnel can stall every TCP and HTTP stream of the
   same edge, and no share of the tunnel is reserved for TCP. Replies from the
   operator are not limited.
 - Does not let a visitor hold a connection slot indefinitely:
@@ -381,9 +381,10 @@ Rules:
   on the same port (closing that needs negated host conditions). Listener
   isolation, an optional feature of the Gateway API, is therefore still not
   provided.
-- Listeners are not kept off the edge's iroh port. A `UDP` listener on it
-  ends as a bind error that the edge reports, as for any port it cannot
-  open.
+- Listeners are not kept off the edge's iroh port. When the edge's iroh
+  address and its public bind address overlap, as they do with the defaults
+  (`0.0.0.0:7842` and `::`), a `UDP` listener on that port ends as a bind
+  error that the edge reports, as for any port it cannot open.
 - A TCP listener carries one `TCPRoute`, and a UDP listener one `UDPRoute`.
   If several attach, the oldest wins and the others are not accepted.
 - An edge opens a `TCP` or `UDP` listener's port only once the listener has
@@ -630,13 +631,16 @@ listener id u32 | flow id u64 | packet id u32 | fragment index u8 | fragment cou
   incomplete packets give way. A datagram that is shorter than the header,
   has a count of 0 or above 64, an index not below its count, or belongs to a
   packet above 65 535 bytes is dropped; none of it ends a session.
-- Nothing waits, retries or blocks for a UDP packet. Sends use
-  `send_datagram`, never a variant that waits, sockets send without
-  blocking, and what does not fit is dropped. Delivery stays unreliable and
-  unordered, which is what UDP promises. Reliable streams were rejected
-  because they add head-of-line blocking.
+- Nothing waits, retries or blocks for a UDP packet. A packet goes into
+  the tunnel only by the full-tunnel rule (see "Observability"): when the
+  datagram send buffer reports room for all of its pieces, each piece queued
+  in the way that never displaces one already queued, polled once so that it
+  never waits; otherwise the packet is dropped and counted (`tunnel_full`).
+  Sockets send without blocking, and what does not fit is dropped. Delivery
+  stays unreliable and unordered, which is what UDP promises. Reliable
+  streams were rejected because they add head-of-line blocking.
 - QUIC sends datagrams ahead of stream data. A UDP flood that fills the
-  tunnel therefore slows TCP and HTTP through the same edge; the edge's
+  tunnel therefore can stall TCP and HTTP through the same edge; the edge's
   optional rate limit (see "What an edge does") bounds it.
 - On an edge with several public addresses of one family, replies leave
   from the address the system's routing picks, not necessarily the one the
@@ -873,16 +877,32 @@ HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
   `kube-apiserver` and `etcd` (envtest) with the upstream Gateway API CRDs
   installed, so the API server's own validation rules apply to every status
   the operator writes. No nodes, no pods.
-- **End to end.** A kind cluster with the manifests installed (the chart
-  once it exists) and the edge as a pod: TCP, HTTP, an HTTP redirect, HTTPS
+- **Chart.** `scripts/chart-test.sh`, without a cluster: `helm lint`, and
+  `helm template` with several sets of values, the objects read back and
+  checked (names, arguments, RBAC per namespace, the CRD against `crdgen`).
+- **End to end.** A kind cluster with the chart installed (with its
+  `NetworkPolicy`) and the edge as a pod: TCP, HTTP, an HTTP redirect, HTTPS
   with a test certificate and its rotation, UDP (a packet through the edge to a
   backend that answers it, and its end when the `UDPRoute` is deleted),
-  requests through the edge to in-cluster services, and status assertions on `Gateway`,
-  routes and `Edge`.
+  requests through the edge to in-cluster services, status assertions on `Gateway`,
+  routes and `Edge`, both binaries' metrics and the operator's probes. A
+  cert-manager step installs cert-manager v1.21.3 with its Gateway API
+  support: a self-signed `ClusterIssuer` issues a certificate for a listener
+  of an annotated Gateway, which is then served, and
+  `cert-manager.io/ignore-tls-listeners` keeps cert-manager off another
+  listener's Secret. A model test checks that a route of the shape of
+  cert-manager's HTTP-01 solver is served. Let's Encrypt and external-dns are
+  not run.
+- **NixOS VM test** (`nix/edge-test.nix`, x86_64-linux): the module starts
+  the edge as a dynamic user with its key in the state directory, binds the
+  iroh port, opens it in the firewall, serves metrics and keeps its id
+  across a restart. The release workflow starts the tarball's systemd unit
+  on a GitHub runner and checks that it binds the iroh port and logs the id
+  that `systemd-run` printed.
 
 ## Build order
 
-Each step ends in something that runs. Steps 1 to 4 are built.
+Each step ends in something that runs. Steps 1 to 5 are built.
 
 1. Tunnel with static configuration: `proto`, edge, operator-side endpoint,
    TCP forwarding to a fixed target. No Kubernetes. (Built.)
@@ -892,7 +912,7 @@ Each step ends in something that runs. Steps 1 to 4 are built.
    filters. (Built.)
 4. UDP: datagram protocol with fragmentation, `UDPRoute`. (Built.)
 5. Packaging and docs: chart, image, edge releases, NixOS module, README
-   with a walkthrough including cert-manager and external-dns.
+   with a walkthrough including cert-manager and external-dns. (Built.)
 
 ## Phase 2 (not built now, must stay possible)
 
@@ -909,5 +929,4 @@ Each step ends in something that runs. Steps 1 to 4 are built.
 - Header field widths, fragment limits, reassembly window, timeouts, backoff
   values, default caps, coalescing interval.
 - How host and path matching is expressed in HAProxy (ACLs or map files).
-- Metric names.
 - Whether the upstream conformance suite is wired in as a non-gating job.
