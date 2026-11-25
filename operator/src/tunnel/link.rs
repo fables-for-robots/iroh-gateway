@@ -20,13 +20,14 @@ use iroh_gateway_proto::control::{
 };
 use iroh_gateway_proto::datagram::{MAX_UDP_FLOWS, UDP_FLOW_IDLE};
 use iroh_gateway_proto::frame::{FrameError, read_frame, read_frame_max, write_frame};
-use iroh_gateway_proto::splice::splice;
+use iroh_gateway_proto::splice::{SpliceOptions, splice_with};
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use iroh_gateway_proto::{
     ALPN, CLOSE_CONTROL_ENDED, CLOSE_REPLACED, CLOSE_SHUTDOWN, CLOSE_UNAUTHORIZED,
     RESET_BACKEND_UNAVAILABLE, RESET_BAD_HEADER, RESET_UNKNOWN_LISTENER,
 };
+use prometheus::IntGauge;
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -34,6 +35,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::connector::Connector;
 use super::udp::{self, IssuedIds, UdpTargets};
+use crate::metrics::{LinkMetrics, LinkSeries, Metrics};
 
 /// How long an incoming stream may take to deliver its `StreamHeader`.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -109,6 +111,8 @@ pub struct LinkOptions {
     pub udp_max_flows: usize,
     /// A UDP flow is closed after this long without a packet in either direction.
     pub udp_flow_idle: Duration,
+    /// Where the link reports its edge's `tunnel_*` series; it removes them when it ends.
+    pub metrics: Metrics,
 }
 
 impl LinkOptions {
@@ -129,6 +133,7 @@ impl LinkOptions {
             first_status_timeout: Duration::from_secs(10),
             udp_max_flows: MAX_UDP_FLOWS,
             udp_flow_idle: UDP_FLOW_IDLE,
+            metrics: Metrics::new(),
         })
     }
 }
@@ -158,19 +163,30 @@ impl EdgeLink {
         let (state_tx, state) = watch::channel(EdgeState::default());
         let (shutdown, shutdown_rx) = oneshot::channel();
         let span = info_span!("link", edge = %opts.edge_id.fmt_short());
+        let metrics = opts.metrics.link(opts.edge_id);
+        let serving = Arc::new(Serving {
+            connector,
+            connect_timeout: opts.connect_timeout,
+            backend_errors: Mutex::default(),
+            splice: SpliceOptions {
+                meter: Some(Arc::new(metrics.tcp_bytes.clone())),
+                ..SpliceOptions::default()
+            },
+            metrics: metrics.clone(),
+        });
         let link = Link {
             endpoint,
             opts,
             desired,
             desired_open: true,
-            connector,
+            serving,
             udp,
             state: state_tx,
             generation: 0,
             ids: HashMap::new(),
             next_id: 1,
             issued: Arc::new(AtomicU32::new(1)),
-            backend_errors: Arc::default(),
+            metrics,
         };
         let task = tokio::spawn(link.run(shutdown_rx).instrument(span));
         LinkHandle {
@@ -212,7 +228,7 @@ struct Link<C> {
     desired: watch::Receiver<Vec<ListenerKey>>,
     /// False once the sender of `desired` is gone; its last value stays desired.
     desired_open: bool,
-    connector: Arc<C>,
+    serving: Arc<Serving<C>>,
     /// Each session's UDP forwarder follows it; a closed channel keeps its last value.
     udp: watch::Receiver<UdpTargets>,
     state: watch::Sender<EdgeState>,
@@ -225,11 +241,65 @@ struct Link<C> {
     /// The highest `next_id` so far, for the UDP forwarders to tell an id of an earlier config
     /// from one the link never issued.
     issued: IssuedIds,
-    backend_errors: BackendErrors,
+    /// The edge's series, removed when the link ends and drops them.
+    metrics: LinkSeries,
 }
 
-/// Per listener key, how often a failed backend connection is logged at warn.
-type BackendErrors = Arc<Mutex<HashMap<ListenerKey, LogThrottle>>>;
+/// What every visitor stream of a link is served with.
+struct Serving<C> {
+    connector: Arc<C>,
+    /// Limit for `Connector::connect`.
+    connect_timeout: Duration,
+    /// Per listener key, how often a failed backend connection is logged at warn.
+    backend_errors: Mutex<HashMap<ListenerKey, LogThrottle>>,
+    /// Counts the bytes in `tunnel_tcp_bytes_total`.
+    splice: SpliceOptions,
+    metrics: LinkMetrics,
+}
+
+/// Why a visitor stream is reset before forwarding.
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    BadHeader,
+    UnknownListener,
+    BackendUnavailable,
+}
+
+impl Refusal {
+    fn code(self) -> u32 {
+        match self {
+            Refusal::BadHeader => RESET_BAD_HEADER,
+            Refusal::UnknownListener => RESET_UNKNOWN_LISTENER,
+            Refusal::BackendUnavailable => RESET_BACKEND_UNAVAILABLE,
+        }
+    }
+}
+
+/// A visitor stream, counted in `tunnel_streams_open` until it is dropped.
+struct Served(IntGauge);
+
+impl Served {
+    fn new(metrics: &LinkMetrics) -> Self {
+        metrics.streams.inc();
+        metrics.streams_open.inc();
+        Self(metrics.streams_open.clone())
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+/// Sets `tunnel_up` and `tunnel_listeners` to what `state` says.
+fn show(metrics: &LinkMetrics, state: &EdgeState) {
+    let failed = state.listeners.iter().filter(|l| l.bound.is_err()).count();
+    let bound = state.listeners.len() - failed;
+    metrics.up.set(i64::from(state.connected));
+    metrics.listeners.bound.set(bound as i64);
+    metrics.listeners.failed.set(failed as i64);
+}
 
 /// Per-connection state.
 struct Session {
@@ -269,15 +339,19 @@ impl<C: Connector> Link<C> {
                 conn = self.dial() => conn,
             };
             match dialed {
-                Ok(conn) => match self.session(conn, &mut shutdown).await {
-                    Ended::Shutdown => break,
-                    Ended::Lost { got_status } => {
-                        if got_status {
-                            backoff.reset();
+                Ok(conn) => {
+                    self.metrics.sessions.inc();
+                    match self.session(conn, &mut shutdown).await {
+                        Ended::Shutdown => break,
+                        Ended::Lost { got_status } => {
+                            if got_status {
+                                backoff.reset();
+                            }
                         }
                     }
-                },
+                }
                 Err(why) => {
+                    self.metrics.dial_failures.inc();
                     let why = Some(truncate_status_text(&why));
                     self.state.send_if_modified(|st| {
                         let changed = st.last_error != why;
@@ -387,6 +461,7 @@ impl<C: Connector> Link<C> {
                 self.udp.clone(),
                 self.opts.udp_max_flows,
                 self.opts.udp_flow_idle,
+                self.metrics.udp.clone(),
             )
             .in_current_span(),
         );
@@ -429,6 +504,7 @@ impl<C: Connector> Link<C> {
         {
             error!("udp forwarder panicked: {e}");
         }
+        show(&self.metrics, &EdgeState::default());
         self.state.send_if_modified(|st| {
             let mut changed = st.connected || !st.listeners.is_empty();
             st.connected = false;
@@ -554,9 +630,8 @@ impl<C: Connector> Link<C> {
                             send,
                             recv,
                             s.routes.subscribe(),
-                            self.connector.clone(),
-                            self.opts.connect_timeout,
-                            self.backend_errors.clone(),
+                            self.serving.clone(),
+                            Served::new(&self.metrics),
                         );
                         s.streams.spawn(stream.in_current_span());
                     }
@@ -682,6 +757,7 @@ impl<C: Connector> Link<C> {
             last_error: None,
         };
         debug!(?next, "status received");
+        show(&self.metrics, &next);
         self.state.send_if_modified(|st| {
             let changed = *st != next;
             *st = next;
@@ -716,15 +792,15 @@ async fn read_status(mut recv: RecvStream) -> (RecvStream, Result<Option<Status>
 }
 
 /// Reads the header of one visitor stream, opens the local side and splices until either side
-/// ends or the connection is lost. Every failure ends this stream only.
+/// ends or the connection is lost. Every failure ends this stream only. `_served` counts the
+/// stream for as long as this runs, however it ends.
 async fn serve_stream<C: Connector>(
     conn: Connection,
     send: SendStream,
     mut recv: RecvStream,
     routes: watch::Receiver<HashMap<u32, ListenerKey>>,
-    connector: Arc<C>,
-    connect_timeout: Duration,
-    backend_errors: BackendErrors,
+    serving: Arc<Serving<C>>,
+    _served: Served,
 ) {
     let header = match timeout(
         HEADER_TIMEOUT,
@@ -734,15 +810,27 @@ async fn serve_stream<C: Connector>(
     {
         Ok(Ok(Some(header))) => header,
         Ok(Ok(None)) => {
-            return refuse(send, recv, RESET_BAD_HEADER, "stream ended before a header");
+            return serving.refuse(
+                send,
+                recv,
+                Refusal::BadHeader,
+                &"stream ended before a header",
+            );
         }
-        Ok(Err(e)) => return refuse(send, recv, RESET_BAD_HEADER, format!("bad header: {e}")),
-        Err(_) => return refuse(send, recv, RESET_BAD_HEADER, "no header in time"),
+        Ok(Err(e)) => {
+            return serving.refuse(
+                send,
+                recv,
+                Refusal::BadHeader,
+                &format_args!("bad header: {e}"),
+            );
+        }
+        Err(_) => return serving.refuse(send, recv, Refusal::BadHeader, &"no header in time"),
     };
     let key = routes.borrow().get(&header.listener_id).copied();
     let Some(key) = key else {
         let why = format!("unknown listener id {}", header.listener_id);
-        return refuse(send, recv, RESET_UNKNOWN_LISTENER, why);
+        return serving.refuse(send, recv, Refusal::UnknownListener, &why);
     };
     if header.local.port() != key.port {
         let why = format!(
@@ -751,10 +839,11 @@ async fn serve_stream<C: Connector>(
             key.port,
             header.local.port()
         );
-        return refuse(send, recv, RESET_UNKNOWN_LISTENER, why);
+        return serving.refuse(send, recv, Refusal::UnknownListener, &why);
     }
     let visitor = header.visitor;
-    let failed = match timeout(connect_timeout, connector.connect(key, &header)).await {
+    let connecting = serving.connector.connect(key, &header);
+    let failed = match timeout(serving.connect_timeout, connecting).await {
         Ok(Ok(local)) => Ok(local),
         Ok(Err(e)) => Err(format!("backend for {key:?} unavailable: {e}")),
         Err(_) => Err(format!("backend for {key:?} did not connect in time")),
@@ -762,7 +851,8 @@ async fn serve_stream<C: Connector>(
     let local = match failed {
         Ok(local) => local,
         Err(why) => {
-            let suppressed = backend_errors
+            let suppressed = serving
+                .backend_errors
                 .lock()
                 .expect("not poisoned")
                 .entry(key)
@@ -771,11 +861,11 @@ async fn serve_stream<C: Connector>(
             if let Some(suppressed) = suppressed {
                 warn!(suppressed, "{why}");
             }
-            return refuse(send, recv, RESET_BACKEND_UNAVAILABLE, why);
+            return serving.refuse(send, recv, Refusal::BackendUnavailable, &why);
         }
     };
     tokio::select! {
-        stats = splice(local, send, recv) => debug!(
+        stats = splice_with(local, send, recv, serving.splice.clone()) => debug!(
             %visitor, ?key, end = ?stats.end,
             to_remote = stats.to_remote, to_local = stats.to_local,
             "visitor done"
@@ -785,13 +875,28 @@ async fn serve_stream<C: Connector>(
     }
 }
 
-/// Resets and stops the stream with `code`.
-fn refuse(mut send: SendStream, mut recv: RecvStream, code: u32, why: impl Display) {
-    debug!(code, "stream refused: {why}");
-    let code = VarInt::from_u32(code);
-    // Either fails only when that half is already closed.
-    let _ = send.reset(code);
-    let _ = recv.stop(code);
+impl<C> Serving<C> {
+    /// Counts the refusal, then resets and stops the stream with its code.
+    fn refuse(
+        &self,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        refusal: Refusal,
+        why: &dyn Display,
+    ) {
+        let refused = &self.metrics.refused;
+        match refusal {
+            Refusal::BadHeader => refused.bad_header.inc(),
+            Refusal::UnknownListener => refused.unknown_listener.inc(),
+            Refusal::BackendUnavailable => refused.backend_unavailable.inc(),
+        }
+        let code = refusal.code();
+        debug!(code, "stream refused: {why}");
+        let code = VarInt::from_u32(code);
+        // Either fails only when that half is already closed.
+        let _ = send.reset(code);
+        let _ = recv.stop(code);
+    }
 }
 
 /// Redial pauses: doubling from `min` up to `max`, each with ±20 % jitter.

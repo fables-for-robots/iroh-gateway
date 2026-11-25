@@ -35,6 +35,19 @@ use tokio::time::{sleep, timeout};
 /// Upper bound for any single step that should complete promptly on loopback.
 pub const STEP: Duration = Duration::from_secs(10);
 
+/// The value of `series`, a metric name without the `iroh_gateway_operator_` prefix and with its
+/// labels as rendered, in `text`; panics with the whole text if it is absent.
+pub fn metric(text: &str, series: &str) -> f64 {
+    let wanted = format!("iroh_gateway_operator_{series} ");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&wanted))
+        .unwrap_or_else(|| panic!("no {series} in\n{text}"));
+    line[wanted.len()..]
+        .parse()
+        .unwrap_or_else(|e| panic!("{line}: {e}"))
+}
+
 /// A runtime directory short enough for Unix socket paths on macOS.
 pub fn short_dir() -> tempfile::TempDir {
     tempfile::Builder::new()

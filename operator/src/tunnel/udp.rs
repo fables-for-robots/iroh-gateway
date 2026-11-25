@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,8 @@ use iroh_gateway_proto::datagram::{
 };
 use iroh_gateway_proto::idle::IdleMap;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
+use iroh_gateway_proto::transport::{SendPacketError, send_whole};
+use prometheus::{IntCounter, IntGauge};
 use socket2::SockRef;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -29,6 +32,8 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::field::display;
 use tracing::{Instrument, debug, warn};
+
+use crate::metrics::{PerDirection, UdpDrops, UdpMetrics};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpTarget {
@@ -103,13 +108,15 @@ pub(crate) async fn forward(
     mut targets: watch::Receiver<UdpTargets>,
     max_flows: usize,
     idle: Duration,
+    metrics: UdpMetrics,
 ) {
     let shared = Arc::new(Shared {
         conn,
         issued,
         flows: Mutex::new(IdleMap::new(max_flows.max(1), idle)),
         buffer: Mutex::new(vec![0; MAX_PACKET].into_boxed_slice()),
-        drops: Drops::default(),
+        drops: Drops::new(&metrics.dropped),
+        metrics,
     });
     let _close = CloseFlows(shared.clone());
     let mut forwarder = Forwarder {
@@ -161,17 +168,27 @@ pub(crate) async fn forward(
 struct Shared {
     conn: Connection,
     issued: IssuedIds,
+    /// Taken through [`Shared::flows`], which keeps `tunnel_udp_flows` up to date.
     flows: Mutex<IdleMap<u64, Flow>>,
     /// Receives the replies of every flow; held only for one `try_recv` and its split.
     buffer: Mutex<Box<[u8]>>,
     drops: Drops,
+    metrics: UdpMetrics,
 }
 
 impl Shared {
+    /// The flows, locked; `tunnel_udp_flows` is set to how many there are when they are let go.
+    fn flows(&self) -> Flows<'_> {
+        Flows {
+            map: lock(&self.flows),
+            gauge: &self.metrics.flows,
+        }
+    }
+
     /// The listener id and the next packet id of a reply of flow `flow_id`, marking the flow
     /// used; None once the flow is not the one with `seq`.
     fn reply_ids(&self, flow_id: u64, seq: u64) -> Option<(u32, u32)> {
-        let mut flows = lock(&self.flows);
+        let mut flows = self.flows();
         if flows.get(&flow_id)?.seq != seq {
             return None;
         }
@@ -182,12 +199,39 @@ impl Shared {
     }
 }
 
-/// Closes every flow of a forwarder that stops, however it stops.
+/// The locked flows of a forwarder; see [`Shared::flows`].
+struct Flows<'a> {
+    map: MutexGuard<'a, IdleMap<u64, Flow>>,
+    gauge: &'a IntGauge,
+}
+
+impl Deref for Flows<'_> {
+    type Target = IdleMap<u64, Flow>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl DerefMut for Flows<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl Drop for Flows<'_> {
+    fn drop(&mut self) {
+        self.gauge.set(self.map.len() as i64);
+    }
+}
+
+/// Closes every flow of a forwarder that stops, however it stops, which leaves
+/// `tunnel_udp_flows` at 0.
 struct CloseFlows(Arc<Shared>);
 
 impl Drop for CloseFlows {
     fn drop(&mut self) {
-        lock(&self.0.flows).clear();
+        self.0.flows().clear();
     }
 }
 
@@ -238,17 +282,20 @@ impl Forwarder {
                 return;
             }
         };
+        // Every fragment of a packet carries the packet's fragment count.
+        let fragmented = header.count > 1;
         if let Some(packet) = self.reassembler.push(header, payload, now()) {
-            self.send(key, packet, targets);
+            self.send(key, packet, fragmented, targets);
         }
     }
 
-    /// Sends a visitor packet on its flow's socket, making the flow if it is new.
-    fn send(&mut self, key: ListenerKey, packet: Packet, targets: &UdpTargets) {
+    /// Sends a visitor packet on its flow's socket, making the flow if it is new. `fragmented`:
+    /// it was reassembled from more than one datagram.
+    fn send(&mut self, key: ListenerKey, packet: Packet, fragmented: bool, targets: &UdpTargets) {
         let shared = &self.shared;
         let now = now();
         let known = {
-            let mut flows = lock(&shared.flows);
+            let mut flows = shared.flows();
             match flows.get(&packet.flow_id) {
                 Some(flow) if flow.listener_id != packet.listener_id => Err(()),
                 Some(_) => Ok(flows
@@ -295,29 +342,37 @@ impl Forwarder {
                     seq,
                     task,
                 };
-                let pushed_out = lock(&shared.flows).insert(packet.flow_id, flow, now);
+                let pushed_out = shared.flows().insert(packet.flow_id, flow, now);
+                shared.metrics.flows_total.inc();
+                // A flow with the same id would be replaced, not pushed out at the cap.
+                if pushed_out
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id != packet.flow_id)
+                {
+                    shared.metrics.flows_evicted.inc();
+                }
                 drop(pushed_out);
                 socket
             }
         };
         // Straight to the kernel, as a non-blocking send: tokio's `try_send` refuses until the
         // reactor has reported a new socket writable, which would drop a flow's first packets.
-        if SockRef::from(socket.as_ref())
-            .send(&packet.payload)
-            .is_err()
-        {
-            shared.drops.socket_error.hit();
+        match SockRef::from(socket.as_ref()).send(&packet.payload) {
+            Ok(_) => shared
+                .metrics
+                .count(Direction::In, packet.payload.len(), fragmented),
+            Err(_) => shared.drops.socket_error.hit(),
         }
     }
 
     /// Closes the flows `close` picks.
     fn close_where(&self, mut close: impl FnMut(&Flow) -> bool) {
-        let closed = lock(&self.shared.flows).retain(|_, flow| !close(flow));
+        let closed = self.shared.flows().retain(|_, flow| !close(flow));
         drop(closed);
     }
 
     fn expire(&self) {
-        let expired = lock(&self.shared.flows).expire(now());
+        let expired = self.shared.flows().expire(now());
         drop(expired);
     }
 }
@@ -333,7 +388,7 @@ async fn replies(shared: Arc<Shared>, socket: Arc<UdpSocket>, flow_id: u64, seq:
         if socket.readable().await.is_err() {
             return;
         }
-        let datagrams = {
+        let (datagrams, len) = {
             let mut buffer = lock(&shared.buffer);
             let len = match socket.try_recv(&mut buffer) {
                 Ok(len) => len,
@@ -346,17 +401,48 @@ async fn replies(shared: Arc<Shared>, socket: Arc<UdpSocket>, flow_id: u64, seq:
             };
             // The size changes with the path, so it is read for every packet.
             let max = shared.conn.max_datagram_size().unwrap_or(0);
-            split(listener_id, flow_id, packet_id, &buffer[..len], max)
+            (
+                split(listener_id, flow_id, packet_id, &buffer[..len], max),
+                len,
+            )
         };
         let Ok(datagrams) = datagrams else {
             shared.drops.send_error.hit();
             continue;
         };
-        for datagram in datagrams {
-            if shared.conn.send_datagram(datagram).is_err() {
-                shared.drops.send_error.hit();
-                break;
-            }
+        let fragmented = datagrams.len() > 1;
+        match send_whole(&shared.conn, datagrams) {
+            Ok(()) => shared.metrics.count(Direction::Out, len, fragmented),
+            Err(SendPacketError::TunnelFull) => shared.drops.tunnel_full.hit(),
+            Err(SendPacketError::Refused(_)) => shared.drops.send_error.hit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    /// Towards a backend.
+    In,
+    /// Towards the tunnel.
+    Out,
+}
+
+impl Direction {
+    fn of(self, pair: &PerDirection) -> &IntCounter {
+        match self {
+            Direction::In => &pair.inbound,
+            Direction::Out => &pair.outbound,
+        }
+    }
+}
+
+impl UdpMetrics {
+    /// Counts a packet of `len` payload bytes that went through.
+    fn count(&self, direction: Direction, len: usize, fragmented: bool) {
+        direction.of(&self.packets).inc();
+        direction.of(&self.bytes).inc_by(len as u64);
+        if fragmented {
+            direction.of(&self.fragmented).inc();
         }
     }
 }
@@ -373,7 +459,7 @@ fn connect(target: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(socket)
 }
 
-/// Dropped packets, per reason.
+/// Dropped packets, per reason, counted in `tunnel_udp_dropped_total`.
 struct Drops {
     bad_datagram: Counter,
     /// A listener id of an earlier config, during the round trip before the edge applies a new
@@ -389,26 +475,38 @@ struct Drops {
     /// Opening a flow's socket failed, or it refused a packet.
     socket_error: Counter,
     /// A reply that could not be split at the session's datagram size (none known, no room
-    /// past the header, or more than `MAX_FRAGMENTS` pieces), or a datagram `send_datagram`
-    /// refused (too large for the path, datagrams unsupported, or the connection lost). Not
-    /// counted: on a full send buffer the QUIC layer discards the oldest queued datagram, one
-    /// piece of some earlier packet, silently.
+    /// past the header, or more than `MAX_FRAGMENTS` pieces), or one with a datagram the
+    /// connection refused (too large for the path, datagrams unsupported or disabled, or the
+    /// connection lost); see `send_whole`.
     send_error: Counter,
+    /// A reply that did not fit in the connection's datagram send buffer; see `send_whole`.
+    tunnel_full: Counter,
 }
 
-impl Default for Drops {
-    fn default() -> Self {
+impl Drops {
+    fn new(counts: &UdpDrops) -> Self {
         Self {
-            bad_datagram: Counter::new("bad datagram"),
-            retired_listener: Counter::new("listener id of an earlier config"),
+            bad_datagram: Counter::new("bad datagram", &counts.bad_datagram),
+            retired_listener: Counter::new(
+                "listener id of an earlier config",
+                &counts.retired_listener,
+            ),
             unknown_listener: Counter::warning(
                 "listener id the operator never issued; the edge is broken",
+                &counts.unknown_listener,
             ),
-            not_udp: Counter::warning("datagram for a tcp listener; the edge is broken"),
-            wrong_listener: Counter::new("known flow under another listener id"),
-            no_target: Counter::new("no target"),
-            socket_error: Counter::new("backend socket error"),
-            send_error: Counter::new("could not be sent into the tunnel"),
+            not_udp: Counter::warning(
+                "datagram for a tcp listener; the edge is broken",
+                &counts.not_udp,
+            ),
+            wrong_listener: Counter::new(
+                "known flow under another listener id",
+                &counts.wrong_listener,
+            ),
+            no_target: Counter::new("no target", &counts.no_target),
+            socket_error: Counter::new("backend socket error", &counts.socket_error),
+            send_error: Counter::new("could not be sent into the tunnel", &counts.send_error),
+            tunnel_full: Counter::new("tunnel full", &counts.tunnel_full),
         }
     }
 }
@@ -417,24 +515,24 @@ struct Counter {
     reason: &'static str,
     /// Logged at warn rather than debug.
     warn: bool,
-    count: AtomicU64,
+    count: IntCounter,
     log: Mutex<LogThrottle>,
 }
 
 impl Counter {
-    fn new(reason: &'static str) -> Self {
+    fn new(reason: &'static str, count: &IntCounter) -> Self {
         Self {
             reason,
             warn: false,
-            count: AtomicU64::new(0),
+            count: count.clone(),
             log: Mutex::new(LogThrottle::new(LOG_EVERY)),
         }
     }
 
-    fn warning(reason: &'static str) -> Self {
+    fn warning(reason: &'static str, count: &IntCounter) -> Self {
         Self {
             warn: true,
-            ..Self::new(reason)
+            ..Self::new(reason, count)
         }
     }
 
@@ -448,11 +546,12 @@ impl Counter {
     }
 
     fn count_and_log(&self, detail: Option<&dyn fmt::Display>) {
-        let total = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.count.inc();
         let Some(suppressed) = lock(&self.log).hit() else {
             return;
         };
         let detail = detail.map(display);
+        let total = self.count.get();
         if self.warn {
             warn!(
                 total,

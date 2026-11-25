@@ -1895,6 +1895,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "nix",
+ "prometheus",
  "rcgen",
  "rustls",
  "schemars",
