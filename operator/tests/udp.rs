@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::*;
 use iroh::Endpoint;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, SendDatagramError};
 use iroh_gateway_operator::tunnel::{LinkHandle, LinkOptions, UdpTarget, UdpTargets};
 use iroh_gateway_proto::control::{Config, ListenerKey};
 use iroh_gateway_proto::datagram::{
@@ -573,16 +573,27 @@ async fn malformed_datagrams_do_not_end_the_session() {
     // Incomplete packets of 60,000 bytes, each missing its last fragment: about 11.8 MB, far
     // more than the 4 MiB reassembly budget holds. Each datagram waits for room in the send
     // buffer, so none is dropped before it leaves.
-    let max = conn.max_datagram_size().unwrap();
+    //
+    // The size a datagram may have is read for every packet: it shrinks when the connection
+    // takes the losses of such a flood for a path that no longer carries large packets. A
+    // packet caught by that between two of its fragments is abandoned, which leaves it
+    // incomplete as well.
+    let mut smallest = usize::MAX;
     let sent_before = conn.stats().frame_tx.datagram;
     for i in 0..200u32 {
+        let max = conn.max_datagram_size().unwrap();
+        smallest = smallest.min(max);
         let datagrams = split(id, 1, next_packet_id(), &vec![i as u8; 60_000], max).unwrap();
         for datagram in &datagrams[..datagrams.len() - 1] {
-            conn.send_datagram_wait(datagram.clone()).await.unwrap();
+            match conn.send_datagram_wait(datagram.clone()).await {
+                Ok(()) => {}
+                Err(SendDatagramError::TooLarge) => break,
+                Err(e) => panic!("{e}"),
+            }
         }
     }
     let sent = conn.stats().frame_tx.datagram - sent_before;
-    let sent_bytes = sent as usize * (max - HEADER_LEN);
+    let sent_bytes = sent as usize * (smallest - HEADER_LEN);
     assert!(
         sent_bytes > 2 * REASSEMBLY_BYTES,
         "only {sent} datagrams ({sent_bytes} bytes) left"
