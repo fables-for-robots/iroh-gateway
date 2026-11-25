@@ -145,9 +145,20 @@ async fn metrics_append_haproxys() {
         assert!(!line.starts_with("HTTP/"), "{line}");
         let lower = line.to_lowercase();
         assert!(
-            !lower.starts_with("content-type:") && !lower.starts_with("connection:"),
+            !lower.starts_with("content-type:")
+                && !lower.starts_with("connection:")
+                && !lower.starts_with("transfer-encoding:"),
             "{line}"
         );
+        // A comment, or a sample: a metric name, then a space before the value. A chunk-size
+        // line is neither, even one in hex that starts with a letter.
+        if !line.is_empty() && !line.starts_with('#') {
+            let first = line.chars().next().unwrap();
+            assert!(
+                (first.is_ascii_alphabetic() || first == '_' || first == ':') && line.contains(' '),
+                "{line:?}"
+            );
+        }
     }
     sup.shutdown().await;
 }

@@ -554,6 +554,38 @@ async fn run_answers_healthz_before_it_has_a_cluster() {
 }
 
 #[test]
+fn logs_on_a_pipe_have_no_colour_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = unreachable_static_config(dir.path());
+    let mut cmd = bin();
+    // Without it only the destination decides; journald stores a line with ESC as binary.
+    cmd.env_remove("NO_COLOR")
+        .args(["static", "--config", cfg.to_str().unwrap()]);
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+    let (mut child, lines) = spawn_with_nofile(cmd, soft, hard);
+    // Every line through the first with the needle, which `line_with` would drop.
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match lines.recv_timeout(left) {
+            Ok(line) => {
+                let found = line.contains("open file limit is");
+                seen.push(line);
+                if found {
+                    break;
+                }
+            }
+            Err(_) => panic!("no line with the open file limit in {seen:#?}"),
+        }
+    }
+    child.terminate();
+    // The child has exited, so its stderr ends and the reader thread with it.
+    seen.extend(lines.iter());
+    assert!(!seen.iter().any(|l| l.contains('\x1b')), "{seen:#?}");
+}
+
+#[test]
 fn metrics_listen_on_a_taken_address_fails_at_start() {
     let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = held.local_addr().unwrap().to_string();

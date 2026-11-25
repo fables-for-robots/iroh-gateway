@@ -389,9 +389,23 @@ fn no_metrics_listener_without_the_flag() {
 }
 
 #[test]
+fn logs_on_a_pipe_have_no_colour_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = run_command(dir.path(), &[]);
+    // Without it only the destination decides; journald stores a line with ESC as binary.
+    cmd.env_remove("NO_COLOR");
+    let (mut child, lines) = spawn_with_lines(cmd);
+    let mut seen = lines_through(&lines, "serving");
+    // Its exit status is not checked: SIGTERM can arrive before the handler is installed.
+    child.terminate();
+    seen.extend(lines.iter());
+    assert!(!seen.iter().any(|l| l.contains('\x1b')), "{seen:#?}");
+}
+
+#[test]
 fn metrics_listen_on_a_taken_address_fails_at_start() {
     let dir = tempfile::tempdir().unwrap();
-    let held = std::net::TcpListener::bind(("127.0.0.1", free_tcp_port())).unwrap();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = held.local_addr().unwrap().to_string();
     let out = output_within_10s(&mut run_command(dir.path(), &["--metrics-listen", &addr]));
     assert!(!out.status.success());

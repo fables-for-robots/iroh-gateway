@@ -409,7 +409,7 @@ async fn the_flow_cap_counts_an_eviction_and_idle_flows_leave_the_gauge() {
     let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let t = hand(&[], &[5300], &[(5300, addr(&a))], |opts| {
         opts.udp_max_flows = 2;
-        opts.udp_flow_idle = Duration::from_millis(300);
+        opts.udp_flow_idle = Duration::from_secs(2);
     })
     .await;
     let id = t.id(udp(5300));
@@ -570,6 +570,12 @@ async fn a_full_tunnel_drops_whole_replies_and_counts_them() {
     let text = m.render();
     assert!(metric(&text, &tunnel_full) > 0.0, "{text}");
     assert_eq!(metric(&text, &send_error), 0.0, "{text}");
+    // Not every reply was dropped, and none was counted twice.
+    assert!(metric(&text, &packets_out) > 0.0, "{text}");
+    assert!(
+        metric(&text, &packets_out) + metric(&text, &tunnel_full) <= REPLIES as f64,
+        "{text}"
+    );
     link.shutdown().await;
     drop(edge.release);
     edge.thread.join().unwrap();

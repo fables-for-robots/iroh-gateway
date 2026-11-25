@@ -409,6 +409,13 @@ async fn a_full_tunnel_drops_whole_packets_and_counts_them() {
         0.0,
         "{text}"
     );
+    // Not every packet was dropped, and none was counted twice.
+    let sent = metric(&text, r#"udp_packets_total{direction="in"}"#);
+    assert!(sent > 0.0, "{text}");
+    assert!(
+        sent + metric(&text, r#"udp_dropped_total{reason="tunnel_full"}"#) <= PACKETS as f64,
+        "{text}"
+    );
     edge.shutdown().await;
     drop(release);
     stalled.join().unwrap();

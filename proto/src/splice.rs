@@ -336,6 +336,10 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
                         written += n;
                         moved.touch();
                         deadline = deadline_after(stall);
+                        *copied += n as u64;
+                        if let Some(meter) = meter {
+                            meter.to_local(n as u64);
+                        }
                     }
                     _ => return Err(SpliceEnd::LocalAborted),
                 },
@@ -344,10 +348,6 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
                 }
                 () = sleep_until(deadline) => return Err(SpliceEnd::LocalAborted),
             }
-        }
-        *copied += out.len() as u64;
-        if let Some(meter) = meter {
-            meter.to_local(out.len() as u64);
         }
         out.clear();
         std::mem::swap(&mut out, &mut ahead);

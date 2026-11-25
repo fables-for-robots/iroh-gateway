@@ -85,12 +85,13 @@ struct Rig {
     splice: JoinHandle<SpliceStats>,
 }
 
-/// tcp_b as splice's local side, taking `room` more bytes and then none, as if tcp_a had
-/// stopped reading and every buffer on the way were full. Signals `stalled` when it gets
-/// there. Reads, shutdown and `abort` go to the real socket.
+/// tcp_b as splice's local side, taking `room` more bytes, at most `per_write` per write, and
+/// then none, as if tcp_a had stopped reading and every buffer on the way were full. Signals
+/// `stalled` when it gets there. Reads, shutdown and `abort` go to the real socket.
 struct StallingLocal {
     tcp: TcpStream,
     room: usize,
+    per_write: usize,
     stalled: Option<oneshot::Sender<()>>,
 }
 
@@ -118,7 +119,7 @@ impl AsyncWrite for StallingLocal {
             // Never woken: only an abort can end a splice stuck here.
             return Poll::Pending;
         }
-        let n = buf.len().min(this.room);
+        let n = buf.len().min(this.room).min(this.per_write);
         let written = ready!(Pin::new(&mut this.tcp).poll_write(cx, &buf[..n]));
         if let Ok(written) = written {
             this.room -= written;
@@ -426,6 +427,7 @@ async fn blocked_on_local_write() -> Rig {
     let local_b = StallingLocal {
         tcp: tcp_b,
         room: ROOM,
+        per_write: usize::MAX,
         stalled: Some(stalled_tx),
     };
     let mut r = rig_from(tcp_a, local_b, None).await;
@@ -563,6 +565,35 @@ async fn the_meter_has_the_bytes_of_a_dropped_splice() {
     assert_eq!(recorder.to_remote.load(Ordering::Relaxed), LEN as u64);
 }
 
+#[tokio::test]
+async fn the_meter_has_the_bytes_a_stalled_local_took() {
+    const LEN: usize = 10_000;
+    // Less than one buffer, taken a few bytes per write: every write is counted as it happens.
+    const TAKEN: usize = 1_000;
+    let recorder = Arc::new(Recorder::default());
+    let opts = SpliceOptions {
+        meter: Some(recorder.clone()),
+        ..SpliceOptions::default()
+    };
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    let (stalled_tx, stalled) = oneshot::channel();
+    let local_b = StallingLocal {
+        tcp: tcp_b,
+        room: TAKEN,
+        per_write: 100,
+        stalled: Some(stalled_tx),
+    };
+    let mut r = rig_from(tcp_a, local_b, Some(opts)).await;
+    within(r.far_send.write_all(&[4; LEN])).await.unwrap();
+    within(stalled).await.unwrap();
+    let mut buf = vec![0; TAKEN];
+    within(r.tcp_a.read_exact(&mut buf)).await.unwrap();
+
+    r.splice.abort();
+    assert!(within(r.splice).await.unwrap_err().is_cancelled());
+    assert_eq!(recorder.to_local.load(Ordering::Relaxed), TAKEN as u64);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_stream_splices_and_sees_remote_reset_as_eof() {
@@ -601,6 +632,7 @@ async fn stalled_local_write_aborts_after_timeout() {
     let local_b = StallingLocal {
         tcp: tcp_b,
         room: ROOM,
+        per_write: usize::MAX,
         stalled: Some(stalled_tx),
     };
     let Rig {
