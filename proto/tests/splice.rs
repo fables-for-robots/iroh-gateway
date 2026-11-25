@@ -4,6 +4,10 @@ use std::{
     future::Future,
     io::{self, ErrorKind},
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -14,7 +18,9 @@ use iroh::{
 };
 use iroh_gateway_proto::{
     ALPN, RESET_ABORTED,
-    splice::{LocalStream, SpliceEnd, SpliceOptions, SpliceStats, splice, splice_with},
+    splice::{
+        LocalStream, SpliceEnd, SpliceMeter, SpliceOptions, SpliceStats, splice, splice_with,
+    },
     transport::{Relay, Role, endpoint_builder},
 };
 use sha2::{Digest, Sha256};
@@ -473,6 +479,88 @@ async fn cancelled_splice_aborts_both_sides() {
     assert_eq!(within(r.far_send.stopped()).await.unwrap(), Some(aborted()));
     let err = read_until_reset(&mut r.tcp_a).await;
     assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+}
+
+/// A `SpliceMeter` that adds up what it is told.
+#[derive(Default)]
+struct Recorder {
+    to_remote: AtomicU64,
+    to_local: AtomicU64,
+}
+
+impl SpliceMeter for Recorder {
+    fn to_remote(&self, bytes: u64) {
+        self.to_remote.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn to_local(&self, bytes: u64) {
+        self.to_local.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// A rig whose splice reports to the returned recorder.
+async fn metered_rig() -> (Rig, Arc<Recorder>) {
+    let recorder = Arc::new(Recorder::default());
+    let opts = SpliceOptions {
+        meter: Some(recorder.clone()),
+        ..SpliceOptions::default()
+    };
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    (rig_from(tcp_a, tcp_b, Some(opts)).await, recorder)
+}
+
+#[tokio::test]
+async fn the_meter_sees_every_byte_in_both_directions() {
+    // Larger than one read buffer each way, so the meter is told of several chunks.
+    const UP: usize = 300 << 10;
+    const DOWN: usize = 200 << 10;
+    let (r, recorder) = metered_rig().await;
+    let Rig {
+        tcp_a,
+        mut far_send,
+        mut far_recv,
+        quic: _quic,
+        splice,
+    } = r;
+    let (mut rd, mut wr) = tcp_a.into_split();
+    let up = tokio::spawn(async move {
+        wr.write_all(&[1; UP]).await.unwrap();
+        wr.shutdown().await.unwrap();
+    });
+    let down = tokio::spawn(async move {
+        far_send.write_all(&[2; DOWN]).await.unwrap();
+        far_send.finish().unwrap();
+    });
+    let got_up = within(far_recv.read_to_end(UP + 1)).await.unwrap();
+    let mut got_down = Vec::new();
+    within(rd.read_to_end(&mut got_down)).await.unwrap();
+    within(up).await.unwrap();
+    within(down).await.unwrap();
+    assert_eq!((got_up.len(), got_down.len()), (UP, DOWN));
+
+    let stats = within(splice).await.unwrap();
+    assert_eq!(stats.end, SpliceEnd::Clean);
+    assert_eq!((stats.to_remote, stats.to_local), (UP as u64, DOWN as u64));
+    assert_eq!(
+        (
+            recorder.to_remote.load(Ordering::Relaxed),
+            recorder.to_local.load(Ordering::Relaxed)
+        ),
+        (stats.to_remote, stats.to_local)
+    );
+}
+
+#[tokio::test]
+async fn the_meter_has_the_bytes_of_a_dropped_splice() {
+    const LEN: usize = 10_000;
+    let (mut r, recorder) = metered_rig().await;
+    r.tcp_a.write_all(&[3; LEN]).await.unwrap();
+    let mut buf = vec![0; LEN];
+    within(r.far_recv.read_exact(&mut buf)).await.unwrap();
+
+    r.splice.abort();
+    assert!(within(r.splice).await.unwrap_err().is_cancelled());
+    assert_eq!(recorder.to_remote.load(Ordering::Relaxed), LEN as u64);
 }
 
 #[cfg(unix)]

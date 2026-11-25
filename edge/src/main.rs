@@ -7,10 +7,11 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use iroh::EndpointId;
-use iroh_gateway_edge::{Edge, EdgeOptions};
+use iroh_gateway_edge::{Edge, EdgeOptions, Metrics, metrics};
 use iroh_gateway_proto::datagram::UDP_FLOW_IDLE;
 use iroh_gateway_proto::key::load_or_generate;
 use iroh_gateway_proto::transport::Relay;
+use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -90,6 +91,9 @@ enum Command {
         /// "disabled", "n0" or an https relay URL; the operator must use the same.
         #[arg(long, env = "IROH_GATEWAY_EDGE_RELAY", default_value = "disabled")]
         relay: Relay,
+        /// Address to serve Prometheus metrics on, at /metrics; not served when unset.
+        #[arg(long, env = "IROH_GATEWAY_EDGE_METRICS_LISTEN", value_name = "ADDR")]
+        metrics_listen: Option<SocketAddr>,
     },
 }
 
@@ -118,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
             udp_rate_limit,
             tunnel_grace,
             relay,
+            metrics_listen,
         } => {
             let secret_key = load_or_generate(&key_file)
                 .with_context(|| format!("key file {}", key_file.display()))?;
@@ -131,6 +136,22 @@ async fn main() -> anyhow::Result<()> {
                      more than the limit of {limit}: visitors past it will fail to be accepted"
                 );
             }
+            let metrics = Metrics::new();
+            let server = match metrics_listen {
+                Some(addr) => {
+                    let listener = TcpListener::bind(addr)
+                        .await
+                        .with_context(|| format!("binding the metrics listener on {addr}"))?;
+                    info!("metrics on http://{addr}/metrics");
+                    let metrics = metrics.clone();
+                    Some(tokio::spawn(async move {
+                        if let Err(e) = metrics::serve(listener, metrics).await {
+                            error!("serving metrics failed: {e}");
+                        }
+                    }))
+                }
+                None => None,
+            };
             let edge = Edge::spawn(EdgeOptions {
                 secret_key,
                 operator,
@@ -142,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 max_udp_flows: max_udp_flows as usize,
                 udp_flow_idle: UDP_FLOW_IDLE,
                 udp_rate_limit,
+                metrics,
             })
             .await?;
             info!(id = %edge.endpoint_id(), "serving; waiting for SIGINT or SIGTERM");
@@ -154,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
             }
             info!("shutting down");
             edge.shutdown().await;
+            if let Some(server) = server {
+                server.abort();
+            }
         }
     }
     Ok(())

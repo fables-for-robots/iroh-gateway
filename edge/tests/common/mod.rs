@@ -14,9 +14,9 @@ use iroh::endpoint::{
 };
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
-use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions};
+use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions, Metrics};
 use iroh_gateway_proto::ALPN;
-use iroh_gateway_proto::control::{Config, Listener, Protocol, Status, StreamHeader};
+use iroh_gateway_proto::control::{BindState, Config, Listener, Protocol, Status, StreamHeader};
 use iroh_gateway_proto::datagram::{
     Header, MAX_UDP_FLOWS, Packet, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler, UDP_FLOW_IDLE,
     split,
@@ -24,9 +24,12 @@ use iroh_gateway_proto::datagram::{
 use iroh_gateway_proto::frame::{read_frame, write_frame};
 use iroh_gateway_proto::transport::{MAX_TUNNEL_STREAMS, Relay, Role, endpoint_builder};
 use tokio::net::UdpSocket;
+use tokio::time::{Instant, timeout, timeout_at};
 
 /// Upper bound for any single step that should complete promptly on loopback.
 pub const STEP: Duration = Duration::from_secs(10);
+/// How long one attempt waits for its answer before sending again.
+pub const ATTEMPT: Duration = Duration::from_millis(300);
 
 /// The next port of this process's walk through 20000..30000. That range lies below every
 /// ephemeral range (Linux 32768.., macOS 49152..), so neither a socket bound to port 0 nor the
@@ -83,6 +86,7 @@ pub fn edge_options(operator: EndpointId, grace: Duration, max_connections: usiz
         max_udp_flows: MAX_UDP_FLOWS,
         udp_flow_idle: UDP_FLOW_IDLE,
         udp_rate_limit: None,
+        metrics: Metrics::new(),
     }
 }
 
@@ -135,6 +139,18 @@ pub fn cfg(generation: u64, listeners: &[(u32, Protocol, u16)]) -> Config {
     }
 }
 
+/// Whether every listener of `st` is bound, and there is at least one.
+pub fn bound(st: &Status) -> bool {
+    !st.listeners.is_empty() && st.listeners.iter().all(|l| l.state == BindState::Bound)
+}
+
+/// A UDP listener with id 1 on a free port, configured on `fake`.
+pub async fn udp_port(fake: &mut FakeOperator) -> u16 {
+    let p = free_udp_port();
+    assert!(bound(&fake.push(cfg(1, &[(1, Protocol::Udp, p)])).await));
+    p
+}
+
 /// A UDP visitor on loopback.
 pub async fn udp_visitor() -> UdpSocket {
     UdpSocket::bind("127.0.0.1:0").await.unwrap()
@@ -163,6 +179,33 @@ pub async fn recv_packet(conn: &Connection) -> Packet {
     })
     .await
     .expect("no packet")
+}
+
+/// Sends `payload` from `v` to port `p` until the whole packet arrives on `conn`; returns it
+/// with the number of datagrams it came in.
+pub async fn send_until_packet(
+    v: &UdpSocket,
+    p: u16,
+    payload: &[u8],
+    conn: &Connection,
+) -> (Packet, u8) {
+    let mut reassembler = Reassembler::new(REASSEMBLY_BYTES, REASSEMBLY_WINDOW);
+    timeout(STEP, async {
+        loop {
+            v.send_to(payload, ("127.0.0.1", p)).await.unwrap();
+            let deadline = Instant::now() + ATTEMPT;
+            while let Ok((header, got)) = timeout_at(deadline, recv_datagram(conn)).await {
+                let now = Instant::now().into_std();
+                if let Some(packet) = reassembler.push(header, got, now)
+                    && packet.payload == payload
+                {
+                    return (packet, header.count);
+                }
+            }
+        }
+    })
+    .await
+    .expect("the visitor's packet did not arrive")
 }
 
 /// Sends `payload` as one packet, split by the connection's current datagram size.

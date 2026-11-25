@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -19,10 +19,14 @@ use iroh_gateway_proto::datagram::{
 };
 use iroh_gateway_proto::idle::IdleMap;
 use iroh_gateway_proto::throttle::{LOG_EVERY, LogThrottle};
+use iroh_gateway_proto::transport::{SendPacketError, send_whole};
+use prometheus::IntCounter;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
+
+use crate::metrics::{Metrics, UdpDrops};
 
 /// Packets queued for one UDP port to send to its visitors.
 pub(crate) const REPLY_QUEUE: usize = 256;
@@ -44,7 +48,12 @@ pub struct UdpHub {
 impl UdpHub {
     /// `rate_limit` counts the UDP bytes sent into the tunnel: each visitor packet's payload
     /// plus an 18-byte header per fragment. Panics if `max_flows` is 0.
-    pub fn new(max_flows: usize, idle: Duration, rate_limit: Option<u64>) -> Arc<Self> {
+    pub fn new(
+        max_flows: usize,
+        idle: Duration,
+        rate_limit: Option<u64>,
+        metrics: Metrics,
+    ) -> Arc<Self> {
         let now = now();
         Arc::new(Self {
             shared: Arc::new(Shared {
@@ -52,9 +61,10 @@ impl UdpHub {
                     conn: None,
                     session: 0,
                     bucket: rate_limit.map(|rate| TokenBucket::new(rate, now)),
-                    flows: Flows::new(max_flows, idle),
+                    flows: Flows::new(max_flows, idle, metrics.clone()),
                 }),
-                drops: Drops::default(),
+                drops: Drops::new(&metrics.udp_dropped),
+                metrics,
             }),
             reader: Mutex::new(None),
             unlimited_warning_due: AtomicBool::new(rate_limit.is_none()),
@@ -111,8 +121,9 @@ impl UdpHub {
     /// Forwards one visitor packet received on `port`, whose listener's current id
     /// `listener_id` holds; replies to it go to `replies`. The id is read under the lock that
     /// reads the session, so the packet goes under an id of the session it is sent on. Drops it
-    /// when it cannot be sent at once, or when the bytes it becomes in the tunnel (its payload
-    /// and an 18-byte header per fragment) exceed the rate limit.
+    /// when it cannot be sent at once, when the bytes it becomes in the tunnel (its payload and
+    /// an 18-byte header per fragment) exceed the rate limit, or when it does not fit in the
+    /// connection's datagram send buffer.
     pub(crate) fn forward(
         &self,
         port: u16,
@@ -121,7 +132,7 @@ impl UdpHub {
         payload: &[u8],
         replies: &mpsc::Sender<Reply>,
     ) {
-        let drops = &self.shared.drops;
+        let Shared { drops, metrics, .. } = &*self.shared;
         let now = now();
         let (conn, max, listener_id, flow_id, packet_id) = {
             let mut state = self.shared.lock();
@@ -158,11 +169,17 @@ impl UdpHub {
             drops.send_error.hit();
             return;
         };
-        for datagram in datagrams {
-            if conn.send_datagram(datagram).is_err() {
-                drops.send_error.hit();
-                return;
+        let fragmented = datagrams.len() > 1;
+        match send_whole(&conn, datagrams) {
+            Ok(()) => {
+                metrics.udp_packets.inbound.inc();
+                metrics.udp_bytes.inbound.inc_by(payload.len() as u64);
+                if fragmented {
+                    metrics.udp_fragmented.inbound.inc();
+                }
             }
+            Err(SendPacketError::TunnelFull) => drops.tunnel_full.hit(),
+            Err(SendPacketError::Refused(_)) => drops.send_error.hit(),
         }
     }
 }
@@ -179,6 +196,7 @@ impl Drop for UdpHub {
 struct Shared {
     state: Mutex<State>,
     drops: Drops,
+    metrics: Metrics,
 }
 
 impl Shared {
@@ -197,6 +215,9 @@ impl Shared {
         let Some(packet) = reassembler.push(header, payload, now) else {
             return true;
         };
+        if header.count > 1 {
+            self.metrics.udp_fragmented.outbound.inc();
+        }
         let mut state = self.lock();
         if state.session != session {
             return false;
@@ -276,25 +297,32 @@ struct Flow {
     replies: mpsc::Sender<Reply>,
 }
 
-/// The flows, by id and by `(port, visitor)`.
+/// The flows, by id and by `(port, visitor)`; their number is kept in `udp_flows`.
 struct Flows {
     /// The id of the next new flow; ids are never reused.
     next_id: u64,
     by_id: IdleMap<u64, Flow>,
     by_visitor: HashMap<(u16, SocketAddr), u64>,
+    metrics: Metrics,
 }
 
 impl Flows {
-    fn new(max_flows: usize, idle: Duration) -> Self {
+    fn new(max_flows: usize, idle: Duration, metrics: Metrics) -> Self {
         Self {
             next_id: 1,
             by_id: IdleMap::new(max_flows, idle),
             by_visitor: HashMap::new(),
+            metrics,
         }
     }
 
     fn len(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// Sets `udp_flows` to the flows held now; called after every change.
+    fn counted(&self) {
+        self.metrics.udp_flows.set(self.len() as i64);
     }
 
     /// The flow of a visitor packet, made if it is new (replacing the least recently used one
@@ -326,8 +354,11 @@ impl Flows {
         };
         if let Some((_, old)) = self.by_id.insert(id, flow, now) {
             self.by_visitor.remove(&(old.port, old.visitor));
+            self.metrics.udp_flows_evicted.inc();
         }
         self.by_visitor.insert((port, visitor), id);
+        self.metrics.udp_flows_total.inc();
+        self.counted();
         (id, 0)
     }
 
@@ -344,24 +375,28 @@ impl Flows {
         if let Some(flow) = self.by_id.remove(&flow_id) {
             self.by_visitor.remove(&(flow.port, flow.visitor));
         }
+        self.counted();
     }
 
     fn forget_port(&mut self, port: u16) {
         for (_, flow) in self.by_id.retain(|_, flow| flow.port != port) {
             self.by_visitor.remove(&(flow.port, flow.visitor));
         }
+        self.counted();
     }
 
     fn expire(&mut self, now: Instant) {
         for (_, flow) in self.by_id.expire(now) {
             self.by_visitor.remove(&(flow.port, flow.visitor));
         }
+        self.counted();
     }
 
     /// Forgets every flow; ids go on counting.
     fn clear(&mut self) {
         self.by_id.clear();
         self.by_visitor.clear();
+        self.counted();
     }
 }
 
@@ -406,57 +441,62 @@ impl TokenBucket {
     }
 }
 
-/// Dropped packets, per reason.
+/// Dropped packets, per reason, counted in `udp_dropped_total`.
 struct Drops {
     no_session: Counter,
     rate_limit: Counter,
     /// A visitor packet that cannot be split at the session's datagram size (none known, no
-    /// room past the header, or more than `MAX_FRAGMENTS` pieces), a datagram `send_datagram`
+    /// room past the header, or more than `MAX_FRAGMENTS` pieces), a datagram the connection
     /// refused (too large for the path, datagrams unsupported, or the connection lost), or a
-    /// reply whose port's queue was full or gone. Not counted: on a full send buffer the QUIC
-    /// layer discards the oldest queued datagram, one piece of some earlier packet, silently.
+    /// reply whose port's queue was full or gone. A UDP port counts the replies the kernel
+    /// refused under the same reason.
     send_error: Counter,
+    /// A visitor packet that did not fit in the connection's datagram send buffer; see
+    /// `send_whole`.
+    tunnel_full: Counter,
     unknown_flow: Counter,
     bad_datagram: Counter,
 }
 
-impl Default for Drops {
-    fn default() -> Self {
+impl Drops {
+    fn new(counts: &UdpDrops) -> Self {
         Self {
-            no_session: Counter::new("no session"),
-            rate_limit: Counter::new("over the rate limit"),
-            send_error: Counter::new("could not be sent"),
-            unknown_flow: Counter::new("unknown flow"),
-            bad_datagram: Counter::new("bad datagram"),
+            no_session: Counter::new("no session", &counts.no_session),
+            rate_limit: Counter::new("over the rate limit", &counts.rate_limit),
+            send_error: Counter::new("could not be sent", &counts.send_error),
+            tunnel_full: Counter::new("tunnel full", &counts.tunnel_full),
+            unknown_flow: Counter::new("unknown flow", &counts.unknown_flow),
+            bad_datagram: Counter::new("bad datagram", &counts.bad_datagram),
         }
     }
 }
 
 struct Counter {
     reason: &'static str,
-    count: AtomicU64,
+    count: IntCounter,
     log: Mutex<LogThrottle>,
 }
 
 impl Counter {
-    fn new(reason: &'static str) -> Self {
+    fn new(reason: &'static str, count: &IntCounter) -> Self {
         Self {
             reason,
-            count: AtomicU64::new(0),
+            count: count.clone(),
             log: Mutex::new(LogThrottle::new(LOG_EVERY)),
         }
     }
 
     fn hit(&self) {
-        let total = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.count.inc();
         if let Some(suppressed) = lock(&self.log).hit() {
+            let total = self.count.get();
             debug!(total, suppressed, "udp packet dropped: {}", self.reason);
         }
     }
 
     #[cfg(test)]
     fn get(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
+        self.count.get()
     }
 }
 
@@ -529,7 +569,7 @@ mod tests {
     fn one_visitor_is_one_flow_and_ids_are_never_reused() {
         let t = Instant::now();
         let (tx, _rx) = replies();
-        let mut f = Flows::new(8, Duration::from_secs(60));
+        let mut f = Flows::new(8, Duration::from_secs(60), Metrics::new());
         assert_eq!(f.outgoing(53, visitor(1), 7, &tx, t), (1, 0));
         assert_eq!(f.outgoing(53, visitor(1), 7, &tx, t), (1, 1));
         assert_eq!(f.outgoing(53, visitor(2), 7, &tx, t), (2, 0));
@@ -545,7 +585,7 @@ mod tests {
     fn packet_ids_wrap() {
         let t = Instant::now();
         let (tx, _rx) = replies();
-        let mut f = Flows::new(8, Duration::from_secs(60));
+        let mut f = Flows::new(8, Duration::from_secs(60), Metrics::new());
         f.outgoing(53, visitor(1), 7, &tx, t);
         f.by_id.touch(&1, t).unwrap().next_packet = u32::MAX;
         assert_eq!(f.outgoing(53, visitor(1), 7, &tx, t), (1, u32::MAX));
@@ -556,7 +596,7 @@ mod tests {
     fn a_reply_needs_the_listener_id_of_the_last_visitor_packet() {
         let t = Instant::now();
         let (tx, _rx) = replies();
-        let mut f = Flows::new(8, Duration::from_secs(60));
+        let mut f = Flows::new(8, Duration::from_secs(60), Metrics::new());
         let (id, _) = f.outgoing(53, visitor(1), 7, &tx, t);
         assert_eq!(f.incoming(id, 7, t).unwrap().visitor, visitor(1));
         assert!(f.incoming(id, 8, t).is_none());
@@ -571,7 +611,7 @@ mod tests {
     fn at_the_cap_the_least_recently_used_flow_is_replaced() {
         let t = Instant::now();
         let (tx, _rx) = replies();
-        let mut f = Flows::new(2, Duration::from_secs(60));
+        let mut f = Flows::new(2, Duration::from_secs(60), Metrics::new());
         let (a, _) = f.outgoing(53, visitor(1), 7, &tx, t);
         let (b, _) = f.outgoing(53, visitor(2), 7, &tx, t + MS(1));
         f.outgoing(53, visitor(1), 7, &tx, t + MS(2));
@@ -589,7 +629,7 @@ mod tests {
     fn idle_flows_expire_and_a_reply_keeps_one_alive() {
         let t = Instant::now();
         let (tx, _rx) = replies();
-        let mut f = Flows::new(8, MS(300));
+        let mut f = Flows::new(8, MS(300), Metrics::new());
         let (a, _) = f.outgoing(53, visitor(1), 7, &tx, t);
         let (b, _) = f.outgoing(53, visitor(2), 7, &tx, t);
         assert!(f.incoming(a, 7, t + MS(200)).is_some());
@@ -606,7 +646,7 @@ mod tests {
     fn forget_port_forgets_only_that_port() {
         let t = Instant::now();
         let (tx, _rx) = replies();
-        let mut f = Flows::new(8, Duration::from_secs(60));
+        let mut f = Flows::new(8, Duration::from_secs(60), Metrics::new());
         let (a, _) = f.outgoing(53, visitor(1), 7, &tx, t);
         let (b, _) = f.outgoing(54, visitor(1), 8, &tx, t);
         f.forget_port(53);
@@ -617,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_session_packets_are_dropped_and_counted() {
-        let hub = UdpHub::new(8, Duration::from_secs(60), None);
+        let hub = UdpHub::new(8, Duration::from_secs(60), None, Metrics::new());
         let (tx, _rx) = replies();
         let id = AtomicU32::new(7);
         hub.forward(53, &id, visitor(1), b"hello", &tx);
@@ -630,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_reply_queue_removes_the_flow() {
-        let hub = UdpHub::new(8, Duration::from_secs(60), None);
+        let hub = UdpHub::new(8, Duration::from_secs(60), None, Metrics::new());
         let (tx, rx) = replies();
         let (id, _) = hub
             .shared

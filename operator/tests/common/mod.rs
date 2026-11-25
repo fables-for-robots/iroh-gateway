@@ -12,7 +12,7 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream};
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointId, SecretKey};
-use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions};
+use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions, Metrics};
 use iroh_gateway_operator::tunnel::{
     EdgeLink, EdgeState, LinkHandle, LinkOptions, StaticConnector, UdpTarget, UdpTargets,
     bind_endpoint,
@@ -248,6 +248,7 @@ pub fn edge_options(operator: EndpointId, key: SecretKey, iroh_listen: SocketAdd
         max_udp_flows: MAX_UDP_FLOWS,
         udp_flow_idle: UDP_FLOW_IDLE,
         udp_rate_limit: None,
+        metrics: Metrics::new(),
     }
 }
 

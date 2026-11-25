@@ -1,6 +1,7 @@
 //! The public side of iroh-gateway: listeners that forward visitors into the tunnel.
 
 pub mod listeners;
+pub mod metrics;
 mod pending;
 mod session;
 pub mod udp;
@@ -21,7 +22,8 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 use tokio::time::Sleep;
 use tracing::{debug, error, info, warn};
 
-pub use listeners::{Accepted, ListenerSet, canonical};
+pub use listeners::{Accepted, ListenerSet, Slot, canonical};
+pub use metrics::Metrics;
 pub use udp::UdpHub;
 
 use pending::PendingHandshakes;
@@ -56,6 +58,8 @@ pub struct EdgeOptions {
     /// Most UDP bytes per second sent from visitors into the tunnel, counted as each packet's
     /// payload plus an 18-byte header per fragment; None: no limit.
     pub udp_rate_limit: Option<u64>,
+    /// Where the edge counts what it does.
+    pub metrics: Metrics,
 }
 
 pub struct Edge;
@@ -89,9 +93,18 @@ impl Edge {
             .context("iroh endpoint has no bound socket")?;
         let endpoint_id = endpoint.id();
 
-        let udp = UdpHub::new(opts.max_udp_flows, opts.udp_flow_idle, opts.udp_rate_limit);
-        let (listeners, accepted) =
-            ListenerSet::new(opts.public_bind, opts.max_connections, udp.clone());
+        let udp = UdpHub::new(
+            opts.max_udp_flows,
+            opts.udp_flow_idle,
+            opts.udp_rate_limit,
+            opts.metrics.clone(),
+        );
+        let (listeners, accepted) = ListenerSet::new(
+            opts.public_bind,
+            opts.max_connections,
+            udp.clone(),
+            opts.metrics.clone(),
+        );
         let (apply_tx, apply_rx) = mpsc::channel(APPLY_QUEUE);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (running, running_rx) = watch::channel(());
@@ -110,6 +123,7 @@ impl Edge {
             current: None,
             next_id: 0,
             grace_timer: None,
+            metrics: opts.metrics,
         };
         info!(id = %endpoint_id, addr = %iroh_addr, operator = %opts.operator, "edge started");
         let task = tokio::spawn(supervisor.run(shutdown_rx));
@@ -177,6 +191,7 @@ struct Supervisor {
     next_id: u64,
     /// Runs while no session has been configured since the last one ended.
     grace_timer: Option<Pin<Box<Sleep>>>,
+    metrics: Metrics,
 }
 
 impl Supervisor {
@@ -263,23 +278,33 @@ impl Supervisor {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.current = Some(Session::start(id, conn, self.apply_tx.clone()));
+        self.metrics.sessions_total.inc();
+        self.current = Some(Session::start(
+            id,
+            conn,
+            self.apply_tx.clone(),
+            self.metrics.clone(),
+        ));
     }
 
     /// Forwards `accepted` under the id the current session's last `Config` gave its listener;
     /// drops it (closing the visitor) when there is no such id.
     fn visitor(&mut self, mut accepted: Accepted) {
+        let refused = &self.metrics.refused.no_session;
         let Some(session) = self.current.as_mut() else {
+            refused.inc();
             debug!(visitor = %accepted.visitor, "visitor dropped: no session");
             return;
         };
-        if !session.configured {
+        if !session.configured() {
+            refused.inc();
             debug!(visitor = %accepted.visitor, "visitor dropped: session not configured yet");
             return;
         }
         // The id is read now, not when the visitor was accepted: a `Config` applied since then
         // may have changed or removed it.
         let Some(id) = self.listeners.id_of(accepted.key) else {
+            refused.inc();
             debug!(visitor = %accepted.visitor, "visitor dropped: listener closed");
             return;
         };
@@ -293,10 +318,10 @@ impl Supervisor {
             return;
         };
         let status = self.listeners.apply(&req.cfg).await;
-        if !session.configured {
+        if !session.configured() {
             self.udp.set_session(Some(session.conn().clone()));
+            session.set_configured();
         }
-        session.configured = true;
         self.grace_timer = None;
         info!(
             session = session.id,

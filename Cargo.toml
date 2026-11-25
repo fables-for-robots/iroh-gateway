@@ -10,6 +10,7 @@ repository = "https://github.com/fables-for-robots/iroh-gateway"
 
 [workspace.dependencies]
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -39,3 +40,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 nix = { version = "0.30", default-features = false, features = ["signal"] }
+prometheus = { version = "0.14", default-features = false }

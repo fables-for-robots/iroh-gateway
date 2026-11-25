@@ -1,12 +1,23 @@
 //! QUIC transport settings and endpoint construction shared by edge and operator.
 
-use std::{fmt, str::FromStr, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    pin::pin,
+    str::FromStr,
+    task::{Context as TaskContext, Poll, Waker},
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
+use bytes::Bytes;
 use iroh::{
     RelayMode, RelayUrl, SecretKey,
     address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver},
-    endpoint::{Builder, PortmapperConfig, QuicTransportConfig, VarInt, presets},
+    endpoint::{
+        Builder, Connection, PortmapperConfig, QuicTransportConfig, SendDatagramError, VarInt,
+        presets,
+    },
 };
 
 pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
@@ -22,11 +33,52 @@ pub const MAX_TUNNEL_STREAMS: u32 = 4_096;
 pub const STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 /// How much one edge may send across all streams before the operator reads it.
 pub const OPERATOR_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
-/// Datagrams queued for sending, per connection. When it is full the oldest are dropped, which
-/// is what UDP does under load.
+/// Bytes of datagrams queued for sending, per connection. `send_datagram` on a full buffer
+/// pushes out the oldest queued datagram, which may be a piece of an earlier packet, so
+/// packets go to it only through [`send_whole`], which drops the new packet instead.
 pub const DATAGRAM_SEND_BUFFER: usize = 256 * 1024;
 /// Datagrams received and not yet read, per connection; the oldest are dropped beyond it.
 pub const DATAGRAM_RECEIVE_BUFFER: usize = 1024 * 1024;
+
+/// Why [`send_whole`] did not send a packet.
+#[derive(Debug, thiserror::Error)]
+pub enum SendPacketError {
+    /// The connection's datagram send buffer has no room for the packet.
+    #[error("the datagram send buffer is full")]
+    TunnelFull,
+    /// The connection refused a datagram: too large for the path, datagrams unsupported or
+    /// disabled, or the connection lost.
+    #[error("the connection refused a datagram: {0}")]
+    Refused(SendDatagramError),
+}
+
+/// Queues the datagrams of one packet without pushing out any datagram already queued.
+///
+/// Returns `TunnelFull`, having sent nothing, when `datagram_send_buffer_space()` is less than
+/// the sum of their lengths. That check alone is not enough: in noq 1.5.0 the reported space
+/// counts the 32-byte per-datagram overhead once, while the buffer charges it for every queued
+/// datagram, so near a full buffer `send_datagram` would still discard older datagrams to
+/// make room. Each datagram therefore goes through `send_datagram_wait`, polled exactly once,
+/// which queues it only if it fits and never discards another; when it does not fit, the
+/// packet ends there as `TunnelFull`. A packet of several datagrams can thus still be cut
+/// after its first pieces on a nearly full buffer; those pieces are wasted, but no earlier
+/// packet loses one.
+pub fn send_whole(conn: &Connection, datagrams: Vec<Bytes>) -> Result<(), SendPacketError> {
+    let len: usize = datagrams.iter().map(Bytes::len).sum();
+    if conn.datagram_send_buffer_space() < len {
+        return Err(SendPacketError::TunnelFull);
+    }
+    let mut cx = TaskContext::from_waker(Waker::noop());
+    for datagram in datagrams {
+        let mut send = pin!(conn.send_datagram_wait(datagram));
+        match send.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Err(SendPacketError::Refused(e)),
+            Poll::Pending => return Err(SendPacketError::TunnelFull),
+        }
+    }
+    Ok(())
+}
 
 /// `incoming_bidi_streams` is how many streams the peer may have open towards us.
 ///
@@ -142,6 +194,106 @@ mod tests {
 
     use super::*;
     use crate::ALPN;
+
+    /// A peer on a runtime of its own that accepts one connection on `a` and reports it, then
+    /// blocks its only thread until released: until then it reads and acknowledges nothing.
+    /// Released with a count, it reads datagrams until that many have arrived or `STEP` passes
+    /// without one, and reports how many arrived.
+    struct StalledPeer {
+        addr: EndpointAddr,
+        release: std::sync::mpsc::Sender<usize>,
+        received: tokio::sync::oneshot::Receiver<usize>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    const STEP: Duration = Duration::from_secs(10);
+
+    async fn stalled_peer() -> StalledPeer {
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<usize>();
+        let (received_tx, received) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let ep = endpoint_builder(SecretKey::generate(), 4, &Relay::Disabled, Role::Edge)
+                    .alpns(vec![ALPN.to_vec()])
+                    .bind_addr("127.0.0.1:0")
+                    .unwrap()
+                    .bind()
+                    .await
+                    .unwrap();
+                let _ =
+                    addr_tx.send(EndpointAddr::new(ep.id()).with_ip_addr(ep.bound_sockets()[0]));
+                let conn = ep.accept().await.unwrap().await.unwrap();
+                // Blocks the thread, and with it every task of this endpoint.
+                let Ok(expected) = released.recv() else {
+                    return;
+                };
+                let mut n = 0;
+                while n < expected {
+                    match tokio::time::timeout(STEP, conn.read_datagram()).await {
+                        Ok(Ok(_)) => n += 1,
+                        _ => break,
+                    }
+                }
+                let _ = received_tx.send(n);
+            });
+        });
+        StalledPeer {
+            addr: addr_rx.await.unwrap(),
+            release,
+            received,
+            thread,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_whole_refuses_a_full_buffer_and_displaces_nothing() {
+        let peer = stalled_peer().await;
+        let ep = endpoint_builder(SecretKey::generate(), 4, &Relay::Disabled, Role::Operator)
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let conn = tokio::time::timeout(STEP, ep.connect(peer.addr.clone(), ALPN))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // No await in the loop, so the connection sends nothing meanwhile and only the buffer
+        // decides; four times its size is plenty to fill it.
+        let datagram = Bytes::from(vec![7u8; 1_000]);
+        let mut accepted = 0;
+        let mut full = false;
+        for _ in 0..4 * DATAGRAM_SEND_BUFFER / datagram.len() {
+            match send_whole(&conn, vec![datagram.clone()]) {
+                Ok(()) => accepted += 1,
+                Err(SendPacketError::TunnelFull) => {
+                    full = true;
+                    break;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(full, "{accepted} datagrams fit in the buffer");
+        assert!(matches!(
+            send_whole(&conn, vec![datagram.clone()]),
+            Err(SendPacketError::TunnelFull)
+        ));
+
+        // Every datagram accepted reaches the peer once it reads again: none was pushed out.
+        peer.release.send(accepted).unwrap();
+        let received = tokio::time::timeout(2 * STEP, peer.received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, accepted);
+        peer.thread.join().unwrap();
+    }
 
     #[tokio::test]
     async fn two_endpoints_connect_directly_by_key() {
