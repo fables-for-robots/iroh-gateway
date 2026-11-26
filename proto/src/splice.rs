@@ -4,7 +4,10 @@
 use std::{
     future::{Future, pending},
     pin::{Pin, pin},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -62,7 +65,15 @@ pub enum SpliceEnd {
     HalfClosedIdle,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Told of every chunk a splice writes, as it is written.
+pub trait SpliceMeter: Send + Sync + 'static {
+    /// Bytes written to the tunnel stream.
+    fn to_remote(&self, bytes: u64);
+    /// Bytes written to the local stream.
+    fn to_local(&self, bytes: u64);
+}
+
+#[derive(Clone)]
 pub struct SpliceOptions {
     /// Abort, as `LocalAborted`, once the local side has accepted no bytes for this long while
     /// data is waiting for it. Never applies while nothing is waiting.
@@ -70,6 +81,19 @@ pub struct SpliceOptions {
     /// Abort, as `HalfClosedIdle`, once one direction has ended cleanly and the other has moved
     /// no byte for this long. Never applies while both directions are open.
     pub half_closed_idle: Duration,
+    /// Told of the bytes as they are written, so that what a splice moved is known while it
+    /// runs and after it is dropped.
+    pub meter: Option<Arc<dyn SpliceMeter>>,
+}
+
+impl std::fmt::Debug for SpliceOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpliceOptions")
+            .field("local_write_stall", &self.local_write_stall)
+            .field("half_closed_idle", &self.half_closed_idle)
+            .field("meter", &self.meter.as_ref().map(|_| "SpliceMeter"))
+            .finish()
+    }
 }
 
 impl Default for SpliceOptions {
@@ -77,6 +101,7 @@ impl Default for SpliceOptions {
         Self {
             local_write_stall: LOCAL_WRITE_STALL,
             half_closed_idle: HALF_CLOSED_IDLE,
+            meter: None,
         }
     }
 }
@@ -117,19 +142,21 @@ pub async fn splice_with<L: LocalStream>(
     let mut to_remote = 0;
     let mut to_local = 0;
     let moved = Moved::new();
+    let meter = opts.meter.as_deref();
     let ended = {
         let Ends {
             send, recv, local, ..
         } = &mut ends;
         let (local_rd, local_wr) = local.as_mut().expect("present until drop");
         both_directions(
-            local_to_remote(local_rd, send, &mut to_remote, &moved),
+            local_to_remote(local_rd, send, &mut to_remote, &moved, meter),
             remote_to_local(
                 recv,
                 local_wr,
                 opts.local_write_stall,
                 &mut to_local,
                 &moved,
+                meter,
             ),
             opts.half_closed_idle,
             &moved,
@@ -248,6 +275,7 @@ async fn local_to_remote<R: AsyncRead + Unpin>(
     send: &mut SendStream,
     copied: &mut u64,
     moved: &Moved,
+    meter: Option<&dyn SpliceMeter>,
 ) -> Result<(), SpliceEnd> {
     let mut buf = vec![0; BUF_LEN];
     // A write sees a stop as an error; this catches one while the local side is idle.
@@ -266,6 +294,9 @@ async fn local_to_remote<R: AsyncRead + Unpin>(
         send.write_all(&buf[..n]).await.map_err(write_end)?;
         moved.touch();
         *copied += n as u64;
+        if let Some(meter) = meter {
+            meter.to_remote(n as u64);
+        }
     }
 }
 
@@ -281,6 +312,7 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
     stall: Duration,
     copied: &mut u64,
     moved: &Moved,
+    meter: Option<&dyn SpliceMeter>,
 ) -> Result<(), SpliceEnd> {
     let mut out = Vec::with_capacity(BUF_LEN);
     let mut ahead = Vec::with_capacity(BUF_LEN);
@@ -304,6 +336,10 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
                         written += n;
                         moved.touch();
                         deadline = deadline_after(stall);
+                        *copied += n as u64;
+                        if let Some(meter) = meter {
+                            meter.to_local(n as u64);
+                        }
                     }
                     _ => return Err(SpliceEnd::LocalAborted),
                 },
@@ -313,7 +349,6 @@ async fn remote_to_local<W: AsyncWrite + Unpin>(
                 () = sleep_until(deadline) => return Err(SpliceEnd::LocalAborted),
             }
         }
-        *copied += out.len() as u64;
         out.clear();
         std::mem::swap(&mut out, &mut ahead);
     }

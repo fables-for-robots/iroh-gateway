@@ -2,151 +2,17 @@
 
 iroh-gateway is a TCP and UDP tunnel between a small public machine (the edge) and a private machine (the operator, for example a home cluster). The operator dials out to the edge over iroh (QUIC, peers identified by ed25519 key), so the private side needs no open port and no public address. Visitors connect to the edge, and their connections and packets are carried through the tunnel to a target next to the operator. The design is in [the spec](docs/superpowers/specs/2026-11-23-iroh-gateway-design.md).
 
+In a Kubernetes cluster the operator is a Gateway API controller, installed with the Helm chart in `charts/iroh-gateway`, and the edge is a static binary on a VPS. To put a site online, read [Install in a cluster](#install-in-a-cluster) and follow the [walkthrough](#walkthrough-from-an-empty-vps-to-an-https-site). Without a cluster, the [quickstart](#quickstart) runs both sides on one machine.
+
 ## Status
 
-The edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, UDP, HTTP and HTTPS (see [Kubernetes](#kubernetes); the images are not published yet).
+What exists: the edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, UDP, HTTP and HTTPS; Prometheus metrics in both, and health endpoints in the operator; a Helm chart; container images for both; static Linux binaries of the edge with a hardened systemd unit; nix packages of both binaries and a NixOS module for the edge.
 
-## Build
+No version has been released yet: there is no `v*` tag, so there is no release tarball, no image tagged with a version, and no chart in the OCI registry. On every push to `main`, the release workflow publishes both images built from `main` with the tags `edge` and `sha-<commit>`; until the first release, install the chart from a checkout with those images (see [The chart](#the-chart)). GitHub may create those image packages private at first (see [Known limitations](#known-limitations)).
 
-```sh
-direnv allow        # or: nix develop
-cargo build --release
-cargo test
-```
+## Install in a cluster
 
-The binaries are `target/release/iroh-gateway-edge` and `target/release/iroh-gateway-operator`.
-
-## Quickstart
-
-Everything on one machine, over loopback. Run every command below in the same terminal, from the repository root, one block after another.
-
-1. Build, create both keys and note the two ids:
-
-   ```sh
-   cargo build --release
-   EDGE=target/release/iroh-gateway-edge
-   OPERATOR=target/release/iroh-gateway-operator
-   EDGE_ID=$($EDGE id --key-file edge.key)
-   OPERATOR_ID=$($OPERATOR id --key-file operator.key)
-   echo "edge: $EDGE_ID"; echo "operator: $OPERATOR_ID"
-   ```
-
-2. Start something to expose, in the background (the `docs` directory, so the keys are not served):
-
-   ```sh
-   python3 -m http.server 3000 --bind 127.0.0.1 --directory docs >/dev/null 2>&1 &
-   TARGET_PID=$!
-   ```
-
-3. Start the edge in the background, serving only that operator:
-
-   ```sh
-   $EDGE run --key-file edge.key --operator "$OPERATOR_ID" \
-       --iroh-listen 127.0.0.1:7842 --public-bind 127.0.0.1 2>edge.log &
-   EDGE_PID=$!
-   ```
-
-4. Write the operator configuration and start the operator in the background:
-
-   ```sh
-   cat > operator.toml <<EOF
-   key_file = "operator.key"
-
-   [[edge]]
-   endpoint_id = "$EDGE_ID"
-   address = "127.0.0.1:7842"
-
-   [[edge.listener]]
-   protocol = "tcp"
-   port = 8080
-   target = "127.0.0.1:3000"
-   EOF
-   $OPERATOR static --config operator.toml 2>operator.log &
-   OPERATOR_PID=$!
-   ```
-
-5. Visit the target through the edge port (give the operator a moment to connect):
-
-   ```sh
-   sleep 2
-   curl http://127.0.0.1:8080/
-   ```
-
-   You get the directory listing of `python3 -m http.server`. The edge and operator logs are in `edge.log` and `operator.log`.
-
-6. Stop everything and remove what the quickstart created:
-
-   ```sh
-   kill $OPERATOR_PID $EDGE_PID $TARGET_PID
-   wait
-   rm -f edge.key operator.key operator.toml edge.log operator.log
-   ```
-
-On a real deployment the edge runs on the public machine with `--iroh-listen <public-ip>:7842` and the default `--public-bind ::`, the operator config names the edge's public address, and `port = 8080` is whatever public port you want. Key files must be backed up: the key is the identity. Both binaries log to stderr; set `RUST_LOG` to change the level (default `info`).
-
-## `iroh-gateway-edge`
-
-| Command | Flags (env) | Default |
-|---|---|---|
-| `id` | `--key-file` (`IROH_GATEWAY_EDGE_KEY_FILE`) | `/var/lib/iroh-gateway-edge/edge.key` |
-| `run` | `--key-file` as above | |
-| | `--operator <EndpointId>` (`IROH_GATEWAY_EDGE_OPERATOR`) | required |
-| | `--iroh-listen <addr>` (`IROH_GATEWAY_EDGE_IROH_LISTEN`) | `0.0.0.0:7842` |
-| | `--public-bind <ip>` (`IROH_GATEWAY_EDGE_PUBLIC_BIND`) | `::` |
-| | `--max-connections <n>` (`IROH_GATEWAY_EDGE_MAX_CONNECTIONS`), 1 to 4096; about 400 KiB per connection in the worst case | `2048` |
-| | `--max-udp-flows <n>` (`IROH_GATEWAY_EDGE_MAX_UDP_FLOWS`), 1 to 4096; at the cap a new UDP flow replaces the least recently used one | `4096` |
-| | `--udp-rate-limit <BYTES_PER_SECOND>` (`IROH_GATEWAY_EDGE_UDP_RATE_LIMIT`), 1 or more; see [UDP](#udp) | no limit |
-| | `--tunnel-grace <duration>` (`IROH_GATEWAY_EDGE_TUNNEL_GRACE`), for example `5s` | `5s` |
-| | `--relay <disabled\|n0\|URL>` (`IROH_GATEWAY_EDGE_RELAY`) | `disabled` |
-
-`id` prints the EndpointId and a newline, nothing else, and creates the key file if it is missing. A malformed key file is an error and is never overwritten. `--public-bind ::` also accepts IPv4 on a dual-stack host. On a host with IPv6 disabled the bind fails and shows up as a listener bind error; set `--public-bind 0.0.0.0` there.
-
-## `iroh-gateway-operator`
-
-| Command | Flags | Default |
-|---|---|---|
-| `id` | `--key-file` | `operator.key` |
-| `static` | `--config <file>` | required |
-| `run` | see [Kubernetes](#kubernetes) | |
-
-The static configuration file:
-
-```toml
-key_file = "operator.key"
-relay = "disabled"             # optional; "disabled" (default), "n0", or a relay URL
-
-[[edge]]
-endpoint_id = "<edge EndpointId>"
-address = "203.0.113.7:7842"   # optional when relay is not "disabled"
-
-[[edge.listener]]
-protocol = "tcp"
-port = 8080
-target = "127.0.0.1:3000"
-
-[[edge.listener]]
-protocol = "udp"              # "tcp" or "udp"; both may use one port number
-port = 5353
-target = "127.0.0.1:5353"
-```
-
-A UDP listener forwards each visitor's packets to its `target` as described under [UDP](#udp) (flows, limits, the backend seeing the operator's address); a listener has one target. A relative `key_file` is taken relative to the directory of the configuration file. An `address` is `host:port`: an IP address (IPv6 in brackets, as in `[2001:db8::1]:7842`) or a DNS name, and a port from 1 to 65535. Unknown fields, a file without any `[[edge]]`, an edge listed twice, an edge without listeners, a listener on port 0, two listeners with the same protocol and port in one edge (a `tcp` and a `udp` listener may share a port number), a malformed `address`, and a missing `address` while `relay` is `disabled` are rejected at start.
-
-## Kubernetes
-
-`iroh-gateway-operator run` turns the operator into a Gateway API controller. It watches `GatewayClass`, `Gateway`, `TCPRoute`, `UDPRoute`, `HTTPRoute`, `Service` and `Namespace` objects, the `Edge` resource of this project, and the TLS Secrets of the namespaces it serves Gateways in. It runs HAProxy as a child process, which forwards TCP listeners to their backend Service and routes HTTP and HTTPS requests by host, path, method and header, terminating TLS in the cluster. UDP listeners do not go through HAProxy: the operator forwards their packets itself (see [UDP](#udp)). It tells every edge which public ports to open, and writes status back to the objects.
-
-What this step does and does not do:
-
-- `TCP`, `UDP`, `HTTP` and `HTTPS` listeners, `TCPRoute`, `UDPRoute` and `HTTPRoute` (see [UDP](#udp) and [HTTP and HTTPS](#http-and-https) for what a `UDPRoute` and an `HTTPRoute` may use). There is no TLS passthrough and no `TLSRoute` or `GRPCRoute` yet; a listener with any other protocol is not accepted.
-- One operator replica. The manifests use one replica with the `Recreate` strategy; running two would make both dial the edges and write the same status.
-- The images are not published yet. `deploy/operator.yaml` names `ghcr.io/fables-for-robots/iroh-gateway-operator:0.1.0`, which does not exist until the packaging step is done. Build the images yourself and load them into your cluster (see below).
-- No health endpoint, no metrics, no NetworkPolicy. The operator pod must be able to send UDP to the edges, and TCP and UDP to the backend Services.
-- Everything the manifests create lives in the namespace `iroh-gateway`.
-- Long-lived connections. A configuration change anywhere (any serving listener's routes, backends or certificates, in any namespace) reloads HAProxy. Connections that are still open 30 minutes after a reload, or after 50 further reloads, are closed, and a connection idle for an hour is closed. This is a known limit of this step for long-lived TCP such as SSH or database sessions.
-- Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The manifest's limit of 1 GiB fits one edge; raise it by about that much for each further edge. UDP adds about 5.3 MiB per edge to the worst case (a 4 MiB budget for reassembling large packets, 1 MiB of received datagrams and 256 KiB queued to send), which the 1 GiB limit still covers; the kernel's buffers for the flow sockets (one per UDP flow, up to 4096 per edge) are not counted.
-
-### Prerequisites
+### Prerequisites: the Gateway API CRDs
 
 The Gateway API v1.7.0 standard CRDs, which include `HTTPRoute`, `TCPRoute` and `UDPRoute`:
 
@@ -154,83 +20,151 @@ The Gateway API v1.7.0 standard CRDs, which include `HTTPRoute`, `TCPRoute` and 
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 ```
 
-The `UDPRoute` CRD must be installed: the operator applies nothing until every kind it watches has been listed once.
+The `UDPRoute` CRD must be installed: the operator applies nothing until every kind it watches has been listed once. Install the CRDs before the chart, which creates a `GatewayClass`.
 
-### Install
+### The chart
 
-Build the two images and make them available to the cluster. For a kind cluster named `kind`:
+The chart installs the `Edge` CRD, the RBAC rules, the `GatewayClass` named `iroh-gateway`, the operator with its probes, and a Service in front of its metrics port. With `--wait`, Helm returns once the operator's pod is ready (see [Readiness](#readiness)).
+
+A released version, from the OCI registry (Helm 3.8 or later):
+
+```sh
+helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway --version <X.Y.Z> \
+  --namespace iroh-gateway --create-namespace --wait --timeout 180s
+```
+
+The chart is pushed there only when a version is tagged, so until the first release this command finds nothing. Install from a checkout instead, with the operator image built from `main`:
+
+```sh
+git clone https://github.com/fables-for-robots/iroh-gateway
+cd iroh-gateway
+helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway --create-namespace \
+  --set image.tag=edge --set image.pullPolicy=Always --wait --timeout 180s
+```
+
+Without `image.tag`, the chart asks for the image tagged with its own `appVersion`, which in a checkout is the placeholder `0.0.0-dev` and does not exist. `edge` is moved to every new build of `main`, so `image.pullPolicy=Always` makes a restarted pod take the newest one. To use an image you built yourself, in a kind cluster named `kind`:
 
 ```sh
 docker build --target operator -t iroh-gateway-operator:dev .
 docker build --target edge -t iroh-gateway-edge:dev .
 kind load docker-image iroh-gateway-operator:dev iroh-gateway-edge:dev
+helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway --create-namespace \
+  --set image.repository=iroh-gateway-operator --set image.tag=dev \
+  --set image.pullPolicy=IfNotPresent --wait --timeout 180s
 ```
 
-Install the CRD, the namespace, the RBAC rules, the `GatewayClass` named `iroh-gateway` and the operator, then point the operator at the image you built:
+`scripts/e2e-kind.sh` installs the chart this way (with its own tag and `networkPolicy.enabled=true`). Helm installs the `Edge` CRD only on the first install and never upgrades it; the [chart's README](charts/iroh-gateway/README.md#crd-lifecycle) gives the command for a changed CRD. The chart creates no namespace; `--create-namespace` creates the release namespace.
+
+The release name `iroh-gateway` gives the chart's objects the name `iroh-gateway`; the commands in this README assume it, and the namespace `iroh-gateway`.
+
+### Values that matter
+
+The chart's README lists [every value](charts/iroh-gateway/README.md#values). The ones most installations touch:
+
+- `gatewayNamespaces`: the namespaces whose `Gateway` and `Edge` objects the operator serves; by default only the release namespace. Each listed namespace must exist before the install and gets a Role that lets the operator read its Secrets (see [Secrets](#secrets)). For example `--set 'gatewayNamespaces={iroh-gateway,apps}'`.
+- `relay`: `disabled` (the default), `n0` or a relay URL; it must match the edges' `--relay` (see [Relay mode](#relay-mode)).
+- `metrics.port` (default 8080), where the operator serves `/metrics`, `/healthz` and `/readyz`; `metrics.service.enabled` (default `true`) puts a ClusterIP Service in front of it, and `metrics.serviceMonitor.enabled=true` adds a ServiceMonitor for the Prometheus Operator (see [Metrics and health](#metrics-and-health)). The port is bound on `metrics.bindAddress`, by default `0.0.0.0`, which is IPv4 only: on a cluster whose pod IPs are IPv6, pass `--set 'metrics.bindAddress=[::]'`, or the kubelet's probes cannot reach the operator and `helm install --wait` times out.
+- `networkPolicy.enabled=true` adds a NetworkPolicy that admits ingress to the operator pod only on the metrics port, from the peers in `networkPolicy.metricsFrom` (any source when empty), and leaves egress open: the operator must be able to send UDP to the edges, and TCP and UDP to the backend Services.
+
+### What the chart grants
+
+A ClusterRole lets the operator `get`, `list` and `watch` `GatewayClass`, `Gateway`, `TCPRoute`, `UDPRoute`, `HTTPRoute`, `Edge`, `Service` and `Namespace` objects in every namespace, and `patch` the status of the Gateway API objects and the `Edge`s; it writes status only with `patch`. It holds no rule on Secrets.
+
+The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start: a Role there lets it `get` that Secret by name and `create` Secrets there (the chart's `identity.secretName` sets both the flag and the Role's `resourceNames`). For HTTPS it also lists and watches the Secrets of every namespace it serves Gateways in, which means it can read every Secret there; see [Secrets](#secrets). The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to a private directory `haproxy` that the operator creates in the in-memory volume at `/run/iroh-gateway`. `rbac.create=false` leaves all of this out, and you grant the same rules yourself.
+
+## The edge on a machine of its own
+
+The edge needs a machine with a public address, its iroh UDP port (7842 by default) reachable from the operator, and the ports of the Gateway reachable from visitors. It keeps nothing but its key. There are three ways to run it.
+
+### From the release tarball, with systemd
+
+A release attaches, for each of `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, a tarball `iroh-gateway-edge-<tag>-<target>.tar.gz`, and a file `SHA256SUMS` with their checksums. A tarball holds four files at its top level, which go:
+
+| File | Goes to |
+|---|---|
+| `iroh-gateway-edge`, the edge, a static binary | `/usr/local/bin/iroh-gateway-edge` |
+| `iroh-gateway-edge.service`, its systemd unit | `/etc/systemd/system/iroh-gateway-edge.service` |
+| `README.md`, `LICENSE` | nowhere in particular |
+
+The unit runs the edge as a dynamic user with `CAP_NET_BIND_SERVICE` as its only capability (so it can open ports below 1024), keeps the key in its state directory `/var/lib/iroh-gateway-edge`, reads its settings from `/etc/iroh-gateway-edge/env`, raises the open-file limit to 65536 and restarts the edge 2 s after it exits. The env file holds `IROH_GATEWAY_EDGE_*` variables, one per flag of `iroh-gateway-edge run` (see [`iroh-gateway-edge`](#iroh-gateway-edge)); `IROH_GATEWAY_EDGE_OPERATOR` is required. Steps 3 and 5 of the walkthrough install it.
+
+Until the first release there is no tarball. The release workflow builds the binary with the commands below, on a Linux machine of the target's architecture with [rustup](https://rustup.rs) (the repository's `rust-toolchain.toml` selects Rust 1.100.0, and rustup adds the components it lists on first use) and Debian's or Ubuntu's `musl-tools`; for aarch64 use `aarch64-unknown-linux-musl`:
 
 ```sh
-kubectl apply -f deploy/
-kubectl -n iroh-gateway patch deployment iroh-gateway-operator --type strategic -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"operator","imagePullPolicy":"IfNotPresent"}]}}}}'
-kubectl -n iroh-gateway set image deployment/iroh-gateway-operator operator=iroh-gateway-operator:dev
-kubectl -n iroh-gateway rollout status deployment/iroh-gateway-operator
+git clone https://github.com/fables-for-robots/iroh-gateway
+cd iroh-gateway
+sudo apt-get install -y musl-tools
+rustup toolchain install 1.100.0 --target x86_64-unknown-linux-musl
+TARGET_CC=musl-gcc cargo build --release --locked -p iroh-gateway-edge --target x86_64-unknown-linux-musl
 ```
 
-The operator creates its own key in the Secret `iroh-gateway-identity` in `iroh-gateway` on first start (it may `get` that Secret by name and `create` Secrets there; with another `--identity-secret`, change the Role's `resourceNames` to match). For HTTPS it also lists and watches the Secrets of every namespace it serves Gateways in, which means it can read every Secret there; see [Secrets](#secrets). It writes status only with `patch`. The container runs as user 65532 with a read-only root filesystem; HAProxy's files go to a private directory `haproxy` that the operator creates in the in-memory volume at `/run/iroh-gateway`.
+The binary is then `target/x86_64-unknown-linux-musl/release/iroh-gateway-edge`, and the unit is `dist/iroh-gateway-edge.service`; copy both to the VPS and use them as the tarball's files. On a GitHub x86_64 runner, the release workflow checks that the binary is static, that `systemd-analyze verify` accepts the unit, and that the unit, installed and started as in the walkthrough, binds UDP 7842 and logs the id that `systemd-run` printed. It checks nothing with an operator connected.
 
-### Enrolling an edge
+To update the edge, replace the binary and run `systemctl restart iroh-gateway-edge`; the key stays.
 
-The two sides pin each other's key, so enrolling an edge is an exchange of two ids:
+### With NixOS
 
-1. Create the edge's key and read its id. For an edge in the cluster, as in the example below:
+The flake has a NixOS module, `nixosModules.edge`, that runs the edge as the service `iroh-gateway-edge` with the same hardening as the unit, and packages `packages.<system>.edge` and `packages.<system>.operator` for `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`. In a flake-based system configuration:
 
-   ```sh
-   mkdir keys
-   docker run --rm -v "$PWD/keys:/keys" --user "$(id -u)" iroh-gateway-edge:dev id --key-file /keys/edge.key
-   kubectl -n iroh-gateway create secret generic edge-key --from-file=edge.key=keys/edge.key
-   ```
-
-   On a separate machine use `iroh-gateway-edge id --key-file <file>` instead. The command prints the id and creates the file if it is missing.
-2. Create the `Edge` resource with that id and the address where the operator can reach the edge's iroh UDP port, and the `Gateway` it serves (see the example).
-3. Read the operator's id from the `Edge`:
-
-   ```sh
-   kubectl -n iroh-gateway get edge e2e -o jsonpath='{.status.gatewayEndpointId}'
-   ```
-
-   It is filled in as soon as the operator has seen the `Edge`, whether or not the `Edge` is accepted.
-4. Start the edge with `--operator <that id>`. It then serves only that operator, and the `Edge` turns `Connected`.
-
-### Worked example
-
-This is what `scripts/e2e-kind.sh` does (the script is the tested version of it). The Gateway and the Edge:
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: public
-  namespace: iroh-gateway
-spec:
-  gatewayClassName: iroh-gateway
-  listeners:
-    - name: tcp-8080
-      protocol: TCP
-      port: 8080
----
-apiVersion: gateway.fables-for-robots.ch/v1alpha1
-kind: Edge
-metadata:
-  name: e2e
-  namespace: iroh-gateway
-spec:
-  endpointId: <edge id from step 1>
-  address: edge.iroh-gateway.svc:7842
-  gatewayRef:
-    name: public
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    iroh-gateway.url = "github:fables-for-robots/iroh-gateway";
+  };
+  outputs = { nixpkgs, iroh-gateway, ... }: {
+    nixosConfigurations.edge = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        iroh-gateway.nixosModules.edge
+        ./configuration.nix
+      ];
+    };
+  };
+}
 ```
 
-The edge, with the key from step 1 and the operator id from step 3:
+```nix
+# configuration.nix, the part about the edge
+{ ... }:
+{
+  services.iroh-gateway-edge = {
+    enable = true;
+    # The operator's EndpointId (step 5 of the walkthrough): 64 lowercase hex characters.
+    operator = "<operator id>";
+    # Opens the UDP port of irohListen (7842) in the NixOS firewall, and only that port.
+    openFirewall = true;
+    # Prometheus metrics on the machine itself; null (the default) serves none.
+    metricsListen = "127.0.0.1:9090";
+  };
+  # The Gateway's ports, which the module leaves to you.
+  networking.firewall.allowedTCPPorts = [ 80 443 ];
+}
+```
+
+The other options are `package`, `keyFile` (default `/var/lib/iroh-gateway-edge/edge.key`), `irohListen` (`0.0.0.0:7842`), `publicBind` (`::`), `maxConnections` (2048), `maxUdpFlows` (4096), `udpRateLimit` (`null`, no limit), `tunnelGrace` (`"5s"`), `relay` (`"disabled"`) and `extraArgs` (`[]`, appended to `iroh-gateway-edge run`); they set the flags of the same names. The module refuses an `operator` that is not 64 lowercase hex characters, so the edge's id has to be read before the module is enabled. This prints it and creates the key in the service's state directory, the same way as on any other systemd machine (it needs the `nix` command with flakes enabled):
+
+```sh
+sudo systemd-run --wait --pipe --collect -p DynamicUser=yes -p StateDirectory=iroh-gateway-edge \
+  "$(nix build --no-link --print-out-paths github:fables-for-robots/iroh-gateway#edge)/bin/iroh-gateway-edge" id
+```
+
+A NixOS VM test (`nix build .#checks.x86_64-linux.edge-module`, on x86_64 Linux with KVM) checks that the module starts the edge as a dynamic user with its key in the state directory, that it binds UDP 7842 and the firewall lets it in, that metrics are served, and that a restart keeps the id. The `systemd-run` command above is not part of it, and nothing tests the module with an operator connected. `aarch64-linux` is neither built nor evaluated by CI.
+
+The operator package runs HAProxy as a child process; its wrapper puts nixpkgs' `haproxy` first on `PATH`, so only `--haproxy-bin` or `IROH_GATEWAY_HAPROXY_BIN` choose another one.
+
+### As a container
+
+The image `ghcr.io/fables-for-robots/iroh-gateway-edge` (tags as for the operator: `edge` and `sha-<commit>` from `main`; `<X.Y.Z>` and `latest` for a release) is a distroless image whose entrypoint is the edge binary; it runs as user 65532. Create the key and read the id with it:
+
+```sh
+mkdir keys
+docker run --rm -v "$PWD/keys:/keys" --user "$(id -u)" ghcr.io/fables-for-robots/iroh-gateway-edge:edge \
+  id --key-file /keys/edge.key
+```
+
+`scripts/e2e-kind.sh` runs the edge this way as a pod in the cluster, next to the operator, which is a way to try everything in one test cluster. The key goes into a Secret, `kubectl -n iroh-gateway create secret generic edge-key --from-file=edge.key=keys/edge.key`, and the edge is a Deployment with a Service that lists the iroh port and every port of the Gateway:
 
 ```yaml
 apiVersion: apps/v1
@@ -250,14 +184,14 @@ spec:
     spec:
       containers:
         - name: edge
-          image: iroh-gateway-edge:dev
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/fables-for-robots/iroh-gateway-edge:edge
           args:
             - run
             - --key-file=/keys/edge.key
-            - --operator=<operator id from step 3>
+            - --operator=<operator id>
             - --iroh-listen=0.0.0.0:7842
             - --public-bind=0.0.0.0
+            - --metrics-listen=0.0.0.0:9090
           volumeMounts:
             - name: key
               mountPath: /keys
@@ -282,11 +216,547 @@ spec:
     - name: public
       protocol: TCP
       port: 8080
+    - name: metrics
+      protocol: TCP
+      port: 9090
 ```
 
-A backend and the route to it:
+The Service lists the public port 8080, which fits the Gateway of the [raw TCP example](#raw-tcp); for another Gateway, list that Gateway's ports instead. Its `Edge` then has `address: edge.iroh-gateway.svc:7842`. Visitors inside the cluster reach the Gateway's ports at the Service; nothing reaches it from outside. Running the image on a VPS instead needs the iroh port and every port of the Gateway published (or host networking), a writable volume for the key, and, for ports below 1024, a way to bind them as a non-root user; none of that is tested.
+
+## Walkthrough: from an empty VPS to an HTTPS site
+
+This puts `https://app.example.com/` online: a cluster that is not reachable from the internet runs the operator and the site, and a VPS with the public address `203.0.113.10` runs the edge. Replace `example.com`, `app.example.com` and `203.0.113.10` with your own; the operator and the Gateway are in the namespace `iroh-gateway`.
+
+What a test runs and what none does: `scripts/e2e-kind.sh`, in CI, installs the Gateway API CRDs and the chart from the checkout into a kind cluster, enrols an edge that runs as a pod in that cluster (the same exchange of ids as steps 3 to 5, but no VPS), sends TCP, HTTP, HTTPS and UDP through it, installs cert-manager v1.21.3 as in step 8, has a self-signed `ClusterIssuer` issue a certificate for an annotated Gateway and checks that the HTTPS listener serves it, and checks that `cert-manager.io/ignore-tls-listeners` keeps cert-manager off another listener's Secret. A model test (`the_acme_http01_solver_route_is_served`) checks that the operator serves an `HTTPRoute` of the shape cert-manager's HTTP-01 solver creates. No test runs Let's Encrypt, external-dns, or the VPS itself: an edge on a separate machine connected to an operator, and the path from the internet through it. This text was written on 2026-11-25 against Gateway API v1.7.0, cert-manager v1.21.3 and external-dns v0.24.0. cert-manager v1.21.3 is built against Gateway API v1.6.0; its documentation says cert-manager 1.14 and later is tested with the v1 Gateway API, and it uses only the `v1` `Gateway` and `HTTPRoute`, which v1.7.0's standard channel serves.
+
+What you need:
+
+- A Kubernetes cluster, `kubectl` and `helm` (3.8 or later) pointed at it. The cluster needs outbound UDP to the VPS's port 7842, and outbound TCP to the VPS's port 80 for cert-manager's check in step 8; it needs no inbound port.
+- A Linux VPS with systemd, x86_64 or aarch64, with the public address `203.0.113.10`, and root on it.
+- A domain whose DNS you control.
+
+### 1. The Gateway API CRDs
+
+```sh
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
+```
+
+### 2. The chart
+
+Until the first release, from a checkout, with the operator image built from `main`:
+
+```sh
+git clone https://github.com/fables-for-robots/iroh-gateway
+cd iroh-gateway
+helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway --create-namespace \
+  --set image.tag=edge --set image.pullPolicy=Always --wait --timeout 180s
+```
+
+For a released version, use `helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway --version <X.Y.Z> --namespace iroh-gateway --create-namespace --wait --timeout 180s` instead. `helm install` returns once the operator is ready; `kubectl -n iroh-gateway get pods` shows it `Running` and `1/1` ready. If the pod stays in `ImagePullBackOff`, the image cannot be pulled (see [Known limitations](#known-limitations)).
+
+### 3. The edge on the VPS, and its id
+
+On the VPS, as root. Download the tarball of a release and check it (with `aarch64-unknown-linux-musl` on an ARM machine); until the first release, build the binary as described under [From the release tarball](#from-the-release-tarball-with-systemd) and copy it and `dist/iroh-gateway-edge.service` to the VPS instead:
+
+```sh
+VERSION=<vX.Y.Z>
+TARGET=x86_64-unknown-linux-musl
+curl -fLO "https://github.com/fables-for-robots/iroh-gateway/releases/download/$VERSION/iroh-gateway-edge-$VERSION-$TARGET.tar.gz"
+curl -fLO "https://github.com/fables-for-robots/iroh-gateway/releases/download/$VERSION/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+mkdir edge && tar -xzf "iroh-gateway-edge-$VERSION-$TARGET.tar.gz" -C edge && cd edge
+```
+
+Install the binary and the unit, and create the directory of the env file:
+
+```sh
+install -m 0755 iroh-gateway-edge /usr/local/bin/iroh-gateway-edge
+install -m 0644 iroh-gateway-edge.service /etc/systemd/system/iroh-gateway-edge.service
+install -d -m 0755 /etc/iroh-gateway-edge
+systemctl daemon-reload
+```
+
+Print the edge's id. This runs `iroh-gateway-edge id` as the service would run, so the key it creates lands in the service's state directory, `/var/lib/iroh-gateway-edge`:
+
+```sh
+systemd-run --wait --pipe --collect -p DynamicUser=yes -p StateDirectory=iroh-gateway-edge /usr/local/bin/iroh-gateway-edge id
+```
+
+It prints 64 hex characters, the edge's EndpointId; running it again prints the same. Back up the key: it is the edge's identity. The key is in `/var/lib/private/iroh-gateway-edge/edge.key` (systemd keeps a dynamic user's state directory there and links `/var/lib/iroh-gateway-edge` to it).
+
+Open the VPS's firewall, in the provider's settings and on the machine if it runs one, for TCP 80 and 443 from visitors and UDP 7842 from the operator. With `ufw`, for example:
+
+```sh
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 7842/udp
+```
+
+On NixOS, read the id with the command under [With NixOS](#with-nixos) and leave the firewall to the module's `openFirewall` and `networking.firewall.allowedTCPPorts`.
+
+### 4. The `Edge` and the `Gateway`
+
+On the machine with `kubectl`. The `Edge` names the edge's id and the address where the operator dials it; the `Gateway` has an `HTTP` listener on port 80, which cert-manager's challenge needs, and an `HTTPS` listener on port 443 for `app.example.com` with the certificate cert-manager will write into the Secret `app-tls`:
 
 ```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: iroh-gateway
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: app.example.com
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-tls
+---
+apiVersion: gateway.fables-for-robots.ch/v1alpha1
+kind: Edge
+metadata:
+  name: vps
+  namespace: iroh-gateway
+spec:
+  endpointId: <edge id from step 3>
+  address: 203.0.113.10:7842
+  gatewayRef:
+    name: public
+```
+
+Save it as `gateway.yaml` and apply it with `kubectl apply -f gateway.yaml`. Until the Secret `app-tls` exists, the `https` listener shows `ResolvedRefs` `False` with `InvalidCertificateRef` and serves nothing, and the Gateway is `Accepted` `True` with reason `ListenersNotValid`; the `http` listener is not affected.
+
+The Gateway's address comes from the `Edge`: `kubectl -n iroh-gateway get gateway public` shows `203.0.113.10` under `ADDRESS`. The operator lists in `Gateway.status.addresses` the `spec.publicAddresses` of every accepted `Edge` bound to the Gateway, or, for an `Edge` without them, the host of its `address`; an IP address as type `IPAddress`, a DNS name as `Hostname`. An address stays while its `Edge` exists, whether or not the edge is connected. Set `publicAddresses` when visitors use other addresses than the one the operator dials, for example to add the VPS's IPv6 address: `publicAddresses: [203.0.113.10, "2001:db8::10"]`.
+
+### 5. The operator's id, and the edge started
+
+Read the operator's id from the `Edge`; it is filled in as soon as the operator has seen the `Edge`:
+
+```sh
+kubectl -n iroh-gateway get edge vps -o jsonpath='{.status.gatewayEndpointId}'
+```
+
+On the VPS, as root, write it into the env file and start the edge:
+
+```sh
+cat > /etc/iroh-gateway-edge/env <<'EOF'
+IROH_GATEWAY_EDGE_OPERATOR=<operator id>
+IROH_GATEWAY_EDGE_METRICS_LISTEN=127.0.0.1:9090
+EOF
+systemctl enable --now iroh-gateway-edge
+```
+
+The second line is optional: it serves the edge's metrics on the VPS itself (see [Metrics and health](#metrics-and-health)). `journalctl -u iroh-gateway-edge` shows `edge started` with the id from step 3, and `session started` once the operator has connected. In the cluster:
+
+```sh
+kubectl -n iroh-gateway wait --for=condition=Connected edges.gateway.fables-for-robots.ch/vps --timeout=120s
+```
+
+The edge now serves only that operator. No port is open for visitors yet: a port opens once a route is attached to its listener.
+
+On NixOS, put the operator's id into `services.iroh-gateway-edge.operator` and switch to the configuration instead.
+
+### 6. A backend and an `HTTPRoute`
+
+A small web server stands in for the site; replace it with your own Service in the namespace `iroh-gateway` (a backend must be in the route's namespace). The route `app` sends requests for `app.example.com` on both listeners to it:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: iroh-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - "mkdir -p /www && echo 'hello from web' >/www/index.html && exec httpd -f -p 8080 -h /www"
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: iroh-gateway
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app
+  namespace: iroh-gateway
+spec:
+  parentRefs:
+    - name: public
+      sectionName: http
+    - name: public
+      sectionName: https
+  hostnames:
+    - app.example.com
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080
+```
+
+Apply it like the Gateway. The edge opens port 80 once the route is attached; the `http` listener is then `Programmed` `True`, which this prints:
+
+```sh
+kubectl -n iroh-gateway get gateway public \
+  -o jsonpath='{.status.listeners[?(@.name=="http")].conditions[?(@.type=="Programmed")].status}'
+```
+
+Before any DNS record exists, ask the edge directly:
+
+```sh
+curl --resolve app.example.com:80:203.0.113.10 http://app.example.com/
+```
+
+It prints `hello from web`. Port 443 opens in step 8, once the certificate exists.
+
+### 7. DNS
+
+`app.example.com` must resolve to `203.0.113.10` before step 8: Let's Encrypt connects to it, and cert-manager checks the challenge through it first. Either create an `A` record for `app.example.com` with the value `203.0.113.10` at your DNS provider, or let external-dns create it from the cluster's objects.
+
+external-dns v0.24.0 (`registry.k8s.io/external-dns/external-dns:v0.24.0`) reads `HTTPRoute`s with `--source=gateway-httproute`. For each route it publishes the route's `spec.hostnames`, each of which must match a listener's `hostname` (a listener without one matches any), and it takes the targets from every entry of the Gateway's `status.addresses`, unless the Gateway carries the annotation `external-dns.kubernetes.io/target`, which then wins. Here that is `203.0.113.10`, from the `Edge` (see step 4). According to its source, it considers a route only when the route's `status.parents` has an entry for the Gateway with `Accepted` `True`, and it does not look at the Gateway's `Programmed` condition. `--policy` is required since v0.22.0 and has no default: `upsert-only` never deletes records, `sync` also deletes them. Annotations are read with the prefix `external-dns.kubernetes.io/` since v0.22.0; the older `external-dns.alpha.kubernetes.io/` is read only with `--annotation-prefix=external-dns.alpha.kubernetes.io/` or `--enable-legacy-annotation-prefix`.
+
+A deployment with the RBAC rules external-dns's documentation lists for its Gateway API sources. Fill in your provider and its credentials as external-dns's tutorial for that provider says, and an owner id of your own:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-dns
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-dns
+  namespace: external-dns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways", "httproutes", "grpcroutes", "tlsroutes", "tcproutes", "udproutes", "listenersets"]
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns
+subjects:
+  - kind: ServiceAccount
+    name: external-dns
+    namespace: external-dns
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: external-dns
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: external-dns
+  template:
+    metadata:
+      labels:
+        app: external-dns
+    spec:
+      serviceAccountName: external-dns
+      containers:
+        - name: external-dns
+          image: registry.k8s.io/external-dns/external-dns:v0.24.0
+          args:
+            - --source=gateway-httproute
+            - --policy=upsert-only
+            - --gateway-namespace=iroh-gateway
+            - --domain-filter=example.com
+            - --provider=<your provider>
+            - --registry=txt
+            - --txt-owner-id=<an id of yours>
+          # The provider's credentials, as its tutorial says (env or a mounted Secret).
+```
+
+`--gateway-namespace` limits it to the Gateways in `iroh-gateway`; `--gateway-name` and `--gateway-label-filter` narrow it further, and `--namespace` and `--label-filter` narrow the routes. external-dns also has a Helm chart, version 1.24.0 for v0.24.0 (`oci://registry.k8s.io/external-dns/charts/external-dns`); its value `policy` is required, and `sources` defaults to `["service","ingress"]`, so it must be set to `["gateway-httproute"]`.
+
+For `TCPRoute`s and `UDPRoute`s, which have no hostnames, external-dns takes the name from the annotation `external-dns.kubernetes.io/hostname` on the route (`--source=gateway-tcproute`, `--source=gateway-udproute`). v0.24.0 reads `UDPRoute` as `v1alpha2`, which the standard channel of Gateway API v1.7.0 does not serve (it serves `v1` only; the experimental channel still serves `v1alpha2`), so `--source=gateway-udproute` with v0.24.0 needs the experimental channel's `UDPRoute` CRD. Whether v0.24.0 then fails or only logs was not tried. It reads `TCPRoute` as `v1`, which needs Gateway API v1.6.0 or later.
+
+Check the record with `dig +short app.example.com`, which prints `203.0.113.10` once it has spread.
+
+### 8. A certificate from Let's Encrypt with cert-manager
+
+Install cert-manager v1.21.3 with its Gateway API support, which is off by default. The Gateway API CRDs must be installed before cert-manager starts, as they are here; installed afterwards, they need a restart of cert-manager (`kubectl rollout restart deployment cert-manager -n cert-manager`):
+
+```sh
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+  --version v1.21.3 --namespace cert-manager --create-namespace \
+  --set crds.enabled=true --set config.gatewayAPI.enabled=true --wait --timeout 300s
+```
+
+A `ClusterIssuer` for Let's Encrypt that answers the HTTP-01 challenge through the Gateway itself (cert-manager's `gatewayHTTPRoute` solver; since cert-manager 1.20 its `parentRefs` may be left out, and the annotated Gateway is used). Put your address in `email`:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          gatewayHTTPRoute: {}
+```
+
+Apply it (the webhook may refuse it for a minute after the install; apply again), then annotate the Gateway:
+
+```sh
+kubectl -n iroh-gateway annotate gateway public cert-manager.io/cluster-issuer=letsencrypt
+```
+
+To rehearse without Let's Encrypt's production rate limits, make a second `ClusterIssuer` with the staging server `https://acme-staging-v02.api.letsencrypt.org/directory` and its own `privateKeySecretRef`, and annotate the Gateway with that one first; its certificates are not trusted by browsers.
+
+What cert-manager then does, from its documentation unless a point says otherwise (the parts this repository tests are named at the head of the walkthrough):
+
+- For each listener of the annotated Gateway with protocol `HTTPS` or `TLS`, a `hostname`, `tls.mode: Terminate` and a Secret in `tls.certificateRefs`, it creates a `Certificate` named after the Secret, in the Gateway's namespace, for the listener's `hostname`: here the `Certificate` `app-tls` for `app.example.com`. It does not edit the Gateway.
+- For the challenge it creates a temporary `HTTPRoute` named `cm-acme-http-solver-…` in the `Certificate`'s namespace, attached to the Gateway (according to cert-manager's source, without a `sectionName` or `port`, so to both listeners), for the hostname `app.example.com`, with one rule for the `Exact` path `/.well-known/acme-challenge/<token>` and a solver Service on port 8089 as its backend. On port 80 the operator tries an `Exact` path before the route `app`'s rule for every path, so the challenge reaches the solver.
+- Before it asks Let's Encrypt, cert-manager fetches the challenge URL itself from inside the cluster, through DNS and the edge. Then Let's Encrypt fetches it, through the edge.
+- Once the certificate is issued, cert-manager deletes the temporary route and writes the Secret `app-tls` of type `kubernetes.io/tls`. The operator checks the certificate, the `https` listener becomes usable, and the edge opens port 443. cert-manager renews the certificate before it expires (its general behaviour, not part of what was checked for this text), and the operator loads a renewed Secret as it loads any changed one (the kind test checks that with a Secret it replaces itself).
+
+Watch it with `kubectl -n iroh-gateway get certificates.cert-manager.io,challenges.acme.cert-manager.io,httproutes`, and wait for it:
+
+```sh
+kubectl -n iroh-gateway wait --for=condition=Ready certificates.cert-manager.io/app-tls --timeout=300s
+curl https://app.example.com/
+```
+
+`curl` prints `hello from web`. A challenge that does not pass shows why in `kubectl -n iroh-gateway describe challenges.acme.cert-manager.io`.
+
+cert-manager takes every qualifying listener of an annotated Gateway and owns and overwrites its Secret. If the Gateway has HTTPS listeners whose Secrets you manage yourself, name them in the annotation `cert-manager.io/ignore-tls-listeners` (a comma-separated list of listener names, new in cert-manager 1.21), for example `kubectl -n iroh-gateway annotate gateway public cert-manager.io/ignore-tls-listeners=mine`.
+
+When port 80 cannot be used, or for a wildcard name, use the DNS-01 challenge instead: cert-manager then proves control of the domain with a TXT record that it writes through your DNS provider's API, and the Gateway needs no `HTTP` listener for it. The solvers and their credentials are described in [cert-manager's DNS-01 documentation](https://cert-manager.io/docs/configuration/acme/dns01/).
+
+### 9. HTTP redirected to HTTPS
+
+With the certificate in place, send HTTP visitors to HTTPS. The route `app` keeps only the `https` listener, and a second route answers every HTTP request for `app.example.com` with a redirect to the same path and query over HTTPS:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app
+  namespace: iroh-gateway
+spec:
+  parentRefs:
+    - name: public
+      sectionName: https
+  hostnames:
+    - app.example.com
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app-redirect
+  namespace: iroh-gateway
+spec:
+  parentRefs:
+    - name: public
+      sectionName: http
+  hostnames:
+    - app.example.com
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+```
+
+`curl -I 'http://app.example.com/a?b=c'` then answers 301 with `Location: https://app.example.com/a?b=c`. The redirect's rule matches every path, so the `Exact` path of a renewal's challenge route still comes first on port 80, as in step 8; this combination is not covered by a test.
+
+## Metrics and health
+
+### Endpoints
+
+Both binaries serve Prometheus metrics only when `--metrics-listen <addr>` is given (`IROH_GATEWAY_EDGE_METRICS_LISTEN` on the edge, `IROH_GATEWAY_METRICS_LISTEN` on the operator); without it nothing listens. An address that cannot be bound ends the process at start with an error that names it. The flag exists on `iroh-gateway-edge run` and on `iroh-gateway-operator run` and `static`. The chart always sets it, to `<metrics.bindAddress>:<metrics.port>` (`0.0.0.0:8080` by default). The operator's endpoint has no authentication, and as the chart installs it any pod in the cluster can reach it, unless `networkPolicy.enabled=true` with `networkPolicy.metricsFrom` set.
+
+Three paths:
+
+- `/metrics`, on both, in the Prometheus text format 0.0.4. On the operator in `run` mode it is the operator's own metrics followed by the output of HAProxy's Prometheus exporter (its `haproxy_*` metrics), which the operator fetches over a unix socket in its runtime directory within 2 s; if HAProxy does not answer, the operator's own metrics are served alone and `iroh_gateway_operator_haproxy_exporter_up` is 0.
+- `/healthz`, on the operator: 200 `ok` while the process serves, from before it has reached the cluster. The chart's liveness probe uses it.
+- `/readyz`, on the operator: see below. The chart's readiness probe uses it.
+
+The edge serves only `/metrics`. Every other path is 404.
+
+### Readiness
+
+`/readyz` answers 503 `not ready` until the operator has applied its first pass over the cluster's objects, and 200 `ready` from then on, whatever HAProxy said to that configuration; it does not go back to 503. The first pass runs only once every watched kind has been listed, so an operator that cannot list what it watches (a missing CRD, a namespace without the Secret rules) is never ready, and `helm install --wait` times out. In `static` mode `/readyz` answers 200 once every link to an edge is started.
+
+### Metrics of the edge
+
+Every name starts with `iroh_gateway_edge_`. `direction` is `in` for traffic from visitors towards the backends and `out` for the way back. Every series exists from the start.
+
+| Name | Type | Labels | What it counts |
+|---|---|---|---|
+| `build_info` | gauge | `version` | Always 1; `version` is the edge's version. |
+| `session_up` | gauge | | 1 from a session's first applied configuration until that session ends. |
+| `sessions_total` | counter | | Sessions with the operator installed. |
+| `listeners` | gauge | `protocol` (`tcp`, `udp`) | Public ports open now. |
+| `bind_failures_total` | counter | `protocol` (`tcp`, `udp`) | Binds of a public port the operating system refused. |
+| `connections_open` | gauge | | TCP visitors holding a slot of `--max-connections`. |
+| `connections_total` | counter | | TCP visitors accepted into a slot. |
+| `connections_refused_total` | counter | `reason` (`cap`, `no_session`, `queue_full`) | TCP visitors dropped before a tunnel stream: the cap was reached; there was no session, the session had no configuration yet, or the visitor's listener had closed since; the queue from the ports to the edge's supervisor was full. |
+| `tcp_bytes_total` | counter | `direction` | Bytes written to the tunnel stream (`in`) and to the visitor (`out`). |
+| `udp_flows` | gauge | | UDP flows held. |
+| `udp_flows_total` | counter | | UDP flows created. |
+| `udp_flows_evicted_total` | counter | | UDP flows pushed out at the flow cap. |
+| `udp_packets_total` | counter | `direction` | UDP packets handed to the tunnel in full (`in`) and sent to a visitor (`out`). |
+| `udp_bytes_total` | counter | `direction` | Payload bytes of the packets in `udp_packets_total`. |
+| `udp_fragmented_packets_total` | counter | `direction` | UDP packets split into more than one datagram (`in`) or reassembled from more than one (`out`). |
+| `udp_dropped_total` | counter | `reason` (`no_session`, `rate_limit`, `send_error`, `tunnel_full`, `unknown_flow`, `bad_datagram`) | Dropped UDP packets or datagrams: no session; over `--udp-rate-limit`; the packet could not be sent (no datagram fits the path, it needs more than 64 pieces, the connection refused it, or a reply's port queue was full or gone); [the tunnel was full](#the-full-tunnel-rule); a reply for a flow the edge no longer holds; a datagram from the operator that cannot be read. |
+
+### Metrics of the operator
+
+Every name starts with `iroh_gateway_operator_`. Every `tunnel_*` metric has the label `edge`, the edge's EndpointId as 64 hex characters; a link to an edge sets up all of its series at 0 when it starts and removes them when it ends (its `Edge` is deleted or no longer accepted, or its id or address changes). `direction` is as on the edge. In `static` mode the HAProxy and controller series exist and stay at 0, `haproxy_config_ok` included.
+
+| Name | Type | Labels | What it counts |
+|---|---|---|---|
+| `build_info` | gauge | `version` | Always 1; `version` is the operator's version. |
+| `tunnel_up` | gauge | `edge` | 1 while the edge is connected. |
+| `tunnel_sessions_total` | counter | `edge` | Dials of the edge that connected. |
+| `tunnel_dial_failures_total` | counter | `edge` | Dials of the edge that failed. |
+| `tunnel_listeners` | gauge | `edge`, `state` (`bound`, `failed`) | The edge's listeners, bound or failed, from its last status; both 0 while it is not connected. |
+| `tunnel_streams_open` | gauge | `edge` | Visitor streams being served. |
+| `tunnel_streams_total` | counter | `edge` | Visitor streams accepted. |
+| `tunnel_streams_refused_total` | counter | `edge`, `reason` (`bad_header`, `unknown_listener`, `backend_unavailable`) | Visitor streams reset before forwarding. |
+| `tunnel_tcp_bytes_total` | counter | `edge`, `direction` | Bytes written to the backend (`in`) and to the tunnel stream (`out`). |
+| `tunnel_udp_flows` | gauge | `edge` | UDP flows held; 0 after a session. |
+| `tunnel_udp_flows_total` | counter | `edge` | UDP flows created. |
+| `tunnel_udp_flows_evicted_total` | counter | `edge` | UDP flows pushed out at the flow cap. |
+| `tunnel_udp_packets_total` | counter | `edge`, `direction` | UDP packets sent to a backend (`in`) and replies handed to the tunnel in full (`out`). |
+| `tunnel_udp_bytes_total` | counter | `edge`, `direction` | Payload bytes of the packets in `tunnel_udp_packets_total`. |
+| `tunnel_udp_fragmented_packets_total` | counter | `edge`, `direction` | UDP packets reassembled from more than one datagram (`in`) and replies split into more than one (`out`). |
+| `tunnel_udp_dropped_total` | counter | `edge`, `reason` (`bad_datagram`, `retired_listener`, `unknown_listener`, `not_udp`, `wrong_listener`, `no_target`, `socket_error`, `send_error`, `tunnel_full`) | Dropped UDP packets or datagrams: a datagram that cannot be read; one for a listener of an earlier configuration of the link (normal at every change); one for a listener id the operator never issued, or issued to a TCP listener (both logged as warnings: the edge is then broken); a known flow under another listener id; no backend for the listener; sending to the backend failed; a reply that could not be sent into the tunnel; [the tunnel was full](#the-full-tunnel-rule). |
+| `haproxy_reloads_total` | counter | `result` (`ok`, `refused`, `failed`) | HAProxy configurations applied with a reload (`ok`; an unchanged configuration counts nothing), refused as invalid (`refused`), or whose reload failed (`failed`). |
+| `haproxy_config_ok` | gauge | | 1 when HAProxy took the last configuration applied, else 0. |
+| `reconciles_total` | counter | | Passes of the controller loop. |
+| `reconcile_duration_seconds` | histogram | | A pass of the controller loop, from taking the snapshot to the end of its status write. |
+| `status_write_failures_total` | counter | | Passes whose status write failed. |
+| `haproxy_exporter_up` | gauge | | Whether the last scrape of HAProxy's exporter was answered; only in `run` mode, written with each `/metrics` answer. |
+
+### Example queries
+
+An edge that is down, as the operator sees it (on the edge itself, `iroh_gateway_edge_session_up == 0`):
+
+```promql
+iroh_gateway_operator_tunnel_up == 0
+```
+
+An edge without a link has no series at all, so this query does not see it: one added while HAProxy refuses the configuration, one with no address while the relay is disabled, one just removed. Alert on `iroh_gateway_operator_haproxy_config_ok == 0` (below) alongside.
+
+A configuration HAProxy refused, or a reload that failed; the Gateways are then `Programmed` `False` with HAProxy's message:
+
+```promql
+iroh_gateway_operator_haproxy_config_ok == 0
+```
+
+UDP drops by reason, per second, on the edges and on the operator:
+
+```promql
+sum by (reason) (rate(iroh_gateway_edge_udp_dropped_total[5m]))
+sum by (edge, reason) (rate(iroh_gateway_operator_tunnel_udp_dropped_total[5m]))
+```
+
+### The full-tunnel rule
+
+A UDP packet goes into the tunnel only when the connection's datagram send buffer (256 KiB) reports room for all of its pieces, and its pieces are queued in the way that never displaces one already queued; otherwise the packet is dropped and counted with the reason `tunnel_full`, on whichever side was sending it. Under overload the newest packet is lost, not one already queued. The reported room is slightly generous (the QUIC library counts its per-datagram overhead once, not per queued datagram), so on a nearly full buffer a packet of several pieces can still have a later piece refused after earlier ones were queued; it is then counted once, and its remaining pieces are not sent.
+
+## Kubernetes
+
+`iroh-gateway-operator run` turns the operator into a Gateway API controller. It watches `GatewayClass`, `Gateway`, `TCPRoute`, `UDPRoute`, `HTTPRoute`, `Service` and `Namespace` objects, the `Edge` resource of this project, and the TLS Secrets of the namespaces it serves Gateways in. It runs HAProxy as a child process, which forwards TCP listeners to their backend Service and routes HTTP and HTTPS requests by host, path, method and header, terminating TLS in the cluster. UDP listeners do not go through HAProxy: the operator forwards their packets itself (see [UDP](#udp)). It tells every edge which public ports to open, and writes status back to the objects.
+
+What this step does and does not do:
+
+- `TCP`, `UDP`, `HTTP` and `HTTPS` listeners, `TCPRoute`, `UDPRoute` and `HTTPRoute` (see [UDP](#udp) and [HTTP and HTTPS](#http-and-https) for what a `UDPRoute` and an `HTTPRoute` may use). There is no TLS passthrough and no `TLSRoute` or `GRPCRoute` yet; a listener with any other protocol is not accepted.
+- One operator replica. The chart runs one replica with the `Recreate` strategy; running two would make both dial the edges and write the same status.
+- Several edges may serve one Gateway, but only one is tested; there is no failover between them (see the design's phase 2).
+- The chart puts the operator, its ServiceAccount, its Service and its Roles in the release namespace (`iroh-gateway` here), and a Role and RoleBinding in each further namespace of `gatewayNamespaces`.
+- Long-lived connections. A configuration change anywhere (any serving listener's routes, backends or certificates, in any namespace) reloads HAProxy. Connections that are still open 30 minutes after a reload, or after 50 further reloads, are closed, and a connection idle for an hour is closed. This is a known limit of this step for long-lived TCP such as SSH or database sessions.
+- Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The chart's default limit of 1 GiB (`resources`) fits one edge; raise it by about that much for each further edge. UDP adds about 5.3 MiB per edge to the worst case (a 4 MiB budget for reassembling large packets, 1 MiB of received datagrams and 256 KiB queued to send), which the 1 GiB limit still covers; the kernel's buffers for the flow sockets (one per UDP flow, up to 4096 per edge) are not counted.
+
+### Enrolling an edge
+
+The two sides pin each other's key, so enrolling an edge is an exchange of two ids. Steps 3 to 5 of the [walkthrough](#walkthrough-from-an-empty-vps-to-an-https-site) do it for an edge on a VPS:
+
+1. Create the edge's key and read its id: `iroh-gateway-edge id --key-file <file>` prints the id and creates the file if it is missing (on a systemd machine, through `systemd-run` as in step 3; in a container, as under [As a container](#as-a-container)).
+2. Create the `Edge` resource with that id and the address where the operator can reach the edge's iroh UDP port, and the `Gateway` it serves.
+3. Read the operator's id from the `Edge`: `kubectl -n <namespace> get edge <name> -o jsonpath='{.status.gatewayEndpointId}'`. It is filled in as soon as the operator has seen the `Edge`, whether or not the `Edge` is accepted.
+4. Start the edge with `--operator <that id>` (`IROH_GATEWAY_EDGE_OPERATOR`). It then serves only that operator, and the `Edge` turns `Connected`.
+
+### Raw TCP
+
+The examples of this section and of [HTTP and HTTPS](#http-and-https) and [UDP](#udp) each define a `Gateway` named `public` in `iroh-gateway`, as the walkthrough does, so applying one replaces the walkthrough's Gateway and its listeners. If you followed the walkthrough, add the example's listener to your Gateway instead.
+
+A `TCP` listener and a `TCPRoute` forward a port to one Service, through HAProxy in TCP mode. `scripts/e2e-kind.sh` runs this one, with an echo server as the backend:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: iroh-gateway
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: tcp-8080
+      protocol: TCP
+      port: 8080
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -334,11 +804,11 @@ spec:
           port: 9000
 ```
 
-Once `kubectl -n iroh-gateway get gateway public` shows `Programmed` `True` and the `Edge` shows `Connected` `True`, a connection to the edge's port 8080 reaches the echo server. Delete the `TCPRoute` and the edge closes port 8080 again.
+Once `kubectl -n iroh-gateway get gateway public` shows `Programmed` `True` and the `Edge` shows `Connected` `True`, a connection to the edge's port 8080 reaches the echo server. Delete the `TCPRoute` and the edge closes port 8080 again. The backend sees the operator pod's address, not the visitor's.
 
 ### HTTP and HTTPS
 
-An HTTPS site with a redirect from HTTP. The certificate and its key are a Secret of type `kubernetes.io/tls` in the Gateway's namespace, made by cert-manager or by hand:
+An HTTPS site with a redirect from HTTP. The certificate and its key are a Secret of type `kubernetes.io/tls` in the Gateway's namespace, made by cert-manager (step 8 of the walkthrough) or by hand:
 
 ```sh
 kubectl -n iroh-gateway create secret tls site-tls --cert=site.crt --key=site.key
@@ -432,35 +902,14 @@ Certificates:
 
 The operator reads two kinds of Secret:
 
-- Its identity, `iroh-gateway-identity` in its own namespace, which it may `get` by name and creates on first start.
-- The certificates of HTTPS listeners. It watches the Secrets of type `kubernetes.io/tls` in each namespace of `--gateway-namespaces`, and requests and holds no other Secret. Kubernetes cannot limit `list` and `watch` to a type, though, so the Role in `deploy/rbac.yaml` lets the operator list and watch every Secret of `iroh-gateway`, and so read every Secret there.
+- Its identity, `iroh-gateway-identity` in its own namespace, which it may `get` by name and creates on first start. Back it up: every edge pins the operator's key.
+- The certificates of HTTPS listeners. It watches the Secrets of type `kubernetes.io/tls` in each namespace of `--gateway-namespaces`, and requests and holds no other Secret. Kubernetes cannot limit `list` and `watch` to a type, though, so the chart's Role lets the operator list and watch every Secret of `iroh-gateway`, and so read every Secret there.
 
-For each further namespace in `--gateway-namespaces` (here `apps`, which must exist), give the operator the same in a Role and RoleBinding of that namespace, and know that it can then read every Secret there:
+The chart's `gatewayNamespaces` sets `--gateway-namespaces` and gives the operator the same rule in a Role and RoleBinding of each namespace listed, which must exist before the install; the operator can then read every Secret there. For example, to serve `iroh-gateway` and `apps`:
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: iroh-gateway-operator
-  namespace: apps
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: iroh-gateway-operator
-  namespace: apps
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: iroh-gateway-operator
-subjects:
-  - kind: ServiceAccount
-    name: iroh-gateway-operator
-    namespace: iroh-gateway
+```sh
+helm upgrade iroh-gateway charts/iroh-gateway --namespace iroh-gateway --reuse-values \
+  --set 'gatewayNamespaces={iroh-gateway,apps}'
 ```
 
 Until the operator has listed every resource it watches once, it applies nothing: no edge is dialed, no port opens and no status is written. While it waits (for a missing CRD, or a namespace where it may not list Secrets) it logs every 30 s which lists are missing, for example `still waiting for the first list of: Secret in apps`. One namespace without the Role therefore holds up every Gateway.
@@ -521,15 +970,10 @@ What to know:
 - **Packets up to 65,535 bytes work.** A packet that does not fit one QUIC datagram (on a new path that is a packet of more than about 1,140 bytes once the 18-byte header is taken off; the limit grows when the path is known to carry larger packets) is split into at most 64 pieces inside the tunnel, each with an 18-byte header, and put back together within 1 s on the other side. One lost piece loses the packet, as with IP fragments, and delivery is neither ordered nor retried, as with UDP. Reassembly holds at most 4 MiB of pieces per edge session, counting a small overhead for each piece.
 - **A `UDP` and a `TCP`, `HTTP` or `HTTPS` listener may share a port number** on one `Gateway` (DNS on 53, for example). Two `UDP` listeners on one port conflict. A `UDP` listener takes one `UDPRoute` with one rule (the oldest wins), as a `TCP` listener does.
 - **A UDP flood can stall TCP and HTTP through the same edge.** QUIC sends datagrams ahead of stream data, so while UDP fills the tunnel, stream data waits behind the datagrams and new connections fail rather than slow down. `--udp-rate-limit <BYTES_PER_SECOND>` on the edge bounds it: it limits the UDP bytes the edge sends into the tunnel, counting each packet's payload plus an 18-byte header for every piece it is split into, and drops packets beyond it. Its burst is at least one largest packet (65,535 bytes plus 64 headers), so a small limit still lets a big packet through now and then. It is off by default and does not limit replies coming back from the operator. Without it, the edge logs a warning when it opens its first UDP port.
+- **A full tunnel drops the newest packet.** A packet goes into the tunnel only when the datagram send buffer has room for all of its pieces, without pushing out any piece already queued; otherwise it is dropped and counted as `tunnel_full` (see [The full-tunnel rule](#the-full-tunnel-rule)).
 - **On an edge with several public addresses,** replies leave from the address the system's routing picks, which may not be the one the visitor sent to.
-- **UDP keeps following the cluster while HAProxy refuses a configuration,** on edges already connected: the targets of UDP listeners change with every render, whether or not HAProxy takes it. The operator starts its link to a new edge only once HAProxy takes a configuration.
-- **Packets are dropped quietly when they cannot be delivered:** a full tunnel, a packet no path can carry, a packet for a listener with no backend left, a datagram for a listener that an earlier configuration of the edge still named. When a flow's backend leaves, the flow ends and its next packet starts a new flow to another backend; only replies still on their way from the old backend are lost. A datagram for a listener id the operator never issued, or for a TCP listener, is logged as a warning, because the edge is then broken.
-
-### Upgrading from the TCP-only version
-
-The new version watches `HTTPRoute`s, `UDPRoute`s and TLS Secrets, which the old RBAC rules do not allow. Apply `deploy/rbac.yaml` before switching to the new image; otherwise the operator waits for its permissions, logging which lists it cannot get, and applies nothing, so no edge serves any port until the rules are in place. The `UDPRoute` CRD must also be installed, as it is with the standard channel of Gateway API v1.7.0; without it the operator applies nothing either.
-
-Old and new binaries work together: an edge of the previous version answers a `UDP` listener with a bind error, and a previous operator never asks for one. Update the edges to serve UDP.
+- **UDP keeps following the cluster while HAProxy refuses a configuration,** on edges already connected: the targets of UDP listeners change with every render, whether or not HAProxy takes it. The operator starts its link to a new edge only once HAProxy takes a configuration (see [Known limitations](#known-limitations)).
+- **Packets that cannot be delivered are dropped without a log line at the default level,** and counted by reason in `udp_dropped_total` on the edge and `tunnel_udp_dropped_total` on the operator (see [Metrics and health](#metrics-and-health)): a full tunnel, a packet no path can carry, a packet for a listener with no backend left, a datagram for a listener that an earlier configuration of the edge still named. When a flow's backend leaves, the flow ends and its next packet starts a new flow to another backend; only replies still on their way from the old backend are lost. A datagram for a listener id the operator never issued, or for a TCP listener, is logged as a warning, because the edge is then broken.
 
 ### `iroh-gateway-operator run`
 
@@ -541,9 +985,10 @@ Old and new binaries work together: an edge of the previous version answers a `U
 | `--identity-secret <name>` | `IROH_GATEWAY_IDENTITY_SECRET` | `iroh-gateway-identity` |
 | `--relay <disabled\|n0\|URL>` | `IROH_GATEWAY_RELAY` | `disabled` |
 | `--runtime-dir <dir>` | `IROH_GATEWAY_RUNTIME_DIR` | `/run/iroh-gateway`; the operator creates a private directory `haproxy` inside it for HAProxy's configuration and sockets |
-| `--haproxy-bin <path>` | `IROH_GATEWAY_HAPROXY_BIN` | `haproxy` (from `PATH`) |
+| `--haproxy-bin <path>` | `IROH_GATEWAY_HAPROXY_BIN` | `haproxy` (from `PATH`; the nix package puts its own first on `PATH`) |
+| `--metrics-listen <addr>` | `IROH_GATEWAY_METRICS_LISTEN` | not served; `/metrics`, `/healthz` and `/readyz` (see [Metrics and health](#metrics-and-health)) |
 
-`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit.
+`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. The HAProxy that `--haproxy-bin` names must be built with its Prometheus exporter, as the official image's and nixpkgs' are, because every configuration the operator renders uses it. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit. The chart sets `--gateway-namespaces` (when `gatewayNamespaces` is not empty), `--controller-name`, `--identity-secret`, `--relay` and `--metrics-listen`, and `POD_NAMESPACE` from the pod's namespace.
 
 ### Status conditions
 
@@ -579,12 +1024,178 @@ Every condition below is also visible with `kubectl describe`. A False condition
 - A port opens on the edges only when a listener is accepted and has no conflict, and: for `TCP` or `UDP`, has a `TCPRoute` or `UDPRoute` attached whose backend resolved; for `HTTP`, has an `HTTPRoute` attached; for `HTTPS`, has an `HTTPRoute` attached and usable certificates. A `Gateway` with no route opens nothing (it is `Programmed` once an edge is connected); deleting the last route closes the port.
 - A certificate Secret must be in the Gateway's namespace, and that namespace needs the Secret rules of [Secrets](#secrets).
 - A `Gateway` cannot ask for addresses; they come from the edges' `publicAddresses`, or from the host in their `address`. A DNS name is published in lower case without a trailing dot. A `Gateway` lists at most 16 addresses, the first 16 in sorted order; when there are more, its `Programmed` message (when True) or its `Accepted` message says how many are not listed.
+- A `UDP` listener on the edge's iroh port fails to bind when the edge's iroh address and its public bind address overlap, as they do with the defaults (`0.0.0.0:7842` and `::`); the edge reports it as a bind error.
+
+## Upgrading from the manifests in `deploy/`
+
+Earlier versions were installed from plain manifests in `deploy/`, which the chart replaces. Their objects: the Namespace `iroh-gateway`; the `Edge` CRD `edges.gateway.fables-for-robots.ch`; the `GatewayClass` `iroh-gateway`; and, all named `iroh-gateway-operator`, a Deployment, a ServiceAccount, a Role and a RoleBinding in `iroh-gateway`, and a ClusterRole and a ClusterRoleBinding. The operator itself created the Secret `iroh-gateway-identity` in `iroh-gateway`, which holds its key.
+
+The namespace, the CRD with every `Edge`, the `GatewayClass` and the identity Secret stay: with the Secret, the new operator has the same id, so the edges' `--operator` stays right. The chart's objects are named `iroh-gateway` (after the release), so its Deployment, ServiceAccount and RBAC objects do not collide with the old ones, but the old Deployment must go, or two operators would fight over the edges, and the old RBAC objects would linger. Helm refuses to install over an object that exists and does not carry its ownership label and annotations, which is the case of the `GatewayClass`: it has to be handed to Helm, or deleted and left to the chart to re-create (deleting it leaves the Gateways of that class unserved until the chart has installed it). Helm skips a CRD of the chart's `crds/` directory that already exists; the chart's `crds/edges.yaml` is the same as the last `deploy/crd.yaml`.
+
+1. Delete the old operator and its RBAC objects. The edges close their public ports `--tunnel-grace` (5 s by default) after the operator goes, until the new one has connected:
+
+   ```sh
+   kubectl -n iroh-gateway delete deployment iroh-gateway-operator
+   kubectl -n iroh-gateway delete serviceaccount iroh-gateway-operator
+   kubectl -n iroh-gateway delete role,rolebinding iroh-gateway-operator
+   kubectl delete clusterrole,clusterrolebinding iroh-gateway-operator
+   ```
+
+2. Hand the `GatewayClass` to the release `iroh-gateway` in the namespace `iroh-gateway`:
+
+   ```sh
+   kubectl label gatewayclass iroh-gateway app.kubernetes.io/managed-by=Helm
+   kubectl annotate gatewayclass iroh-gateway meta.helm.sh/release-name=iroh-gateway \
+     meta.helm.sh/release-namespace=iroh-gateway
+   ```
+
+3. Install the Gateway API v1.7.0 standard CRDs if they are older (see [Prerequisites](#prerequisites-the-gateway-api-crds)): the operator watches `UDPRoute`s and applies nothing until it can list them. Then install the chart as under [The chart](#the-chart), without `--create-namespace`, since the namespace exists:
+
+   ```sh
+   helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway \
+     --set image.tag=edge --set image.pullPolicy=Always --wait --timeout 180s
+   ```
+
+   If the old Deployment was edited to set `--gateway-namespaces` or `--relay`, pass the same as `gatewayNamespaces` and `relay` to `helm install`, or the operator stops serving the Gateways in the other namespaces, or stops matching the edges' relay mode.
+
+The RBAC rules the new version needs (for `HTTPRoute`s, `UDPRoute`s, TLS Secrets and status) are the chart's; with `rbac.create=false` they are yours to grant. `kubectl -n iroh-gateway get edge` then shows the edges `Connected` again. These commands were checked against the old manifests and the chart's rendered objects, not run against a cluster that had the old manifests installed.
+
+Old and new binaries work together: an edge of a version without UDP answers a `UDP` listener with a bind error, and an operator of that version never asks for one. Update the edges to serve UDP. An edge of any earlier version serves no metrics.
+
+## Build
+
+```sh
+direnv allow        # or: nix develop
+cargo build --release
+cargo test
+```
+
+The binaries are `target/release/iroh-gateway-edge` and `target/release/iroh-gateway-operator`. With nix, `nix build .#edge` and `nix build .#operator` build them as packages.
+
+## Quickstart
+
+Everything on one machine, over loopback, without Kubernetes: the operator with a static configuration file. Run every command below in the same terminal, from the repository root, one block after another.
+
+1. Build, create both keys and note the two ids:
+
+   ```sh
+   cargo build --release
+   EDGE=target/release/iroh-gateway-edge
+   OPERATOR=target/release/iroh-gateway-operator
+   EDGE_ID=$($EDGE id --key-file edge.key)
+   OPERATOR_ID=$($OPERATOR id --key-file operator.key)
+   echo "edge: $EDGE_ID"; echo "operator: $OPERATOR_ID"
+   ```
+
+2. Start something to expose, in the background (the `docs` directory, so the keys are not served):
+
+   ```sh
+   python3 -m http.server 3000 --bind 127.0.0.1 --directory docs >/dev/null 2>&1 &
+   TARGET_PID=$!
+   ```
+
+3. Start the edge in the background, serving only that operator:
+
+   ```sh
+   $EDGE run --key-file edge.key --operator "$OPERATOR_ID" \
+       --iroh-listen 127.0.0.1:7842 --public-bind 127.0.0.1 2>edge.log &
+   EDGE_PID=$!
+   ```
+
+4. Write the operator configuration and start the operator in the background:
+
+   ```sh
+   cat > operator.toml <<EOF
+   key_file = "operator.key"
+
+   [[edge]]
+   endpoint_id = "$EDGE_ID"
+   address = "127.0.0.1:7842"
+
+   [[edge.listener]]
+   protocol = "tcp"
+   port = 8080
+   target = "127.0.0.1:3000"
+   EOF
+   $OPERATOR static --config operator.toml 2>operator.log &
+   OPERATOR_PID=$!
+   ```
+
+5. Visit the target through the edge port (give the operator a moment to connect):
+
+   ```sh
+   sleep 2
+   curl http://127.0.0.1:8080/
+   ```
+
+   You get the directory listing of `python3 -m http.server`. The edge and operator logs are in `edge.log` and `operator.log`.
+
+6. Stop everything and remove what the quickstart created:
+
+   ```sh
+   kill $OPERATOR_PID $EDGE_PID $TARGET_PID
+   wait
+   rm -f edge.key operator.key operator.toml edge.log operator.log
+   ```
+
+On a real deployment the edge runs on the public machine with `--iroh-listen <public-ip>:7842` and the default `--public-bind ::`, the operator config names the edge's public address, and `port = 8080` is whatever public port you want. Key files must be backed up: the key is the identity. Both binaries log to stderr; set `RUST_LOG` to change the level (default `info`).
+
+## `iroh-gateway-edge`
+
+| Command | Flags (env) | Default |
+|---|---|---|
+| `id` | `--key-file` (`IROH_GATEWAY_EDGE_KEY_FILE`) | `/var/lib/iroh-gateway-edge/edge.key` |
+| `run` | `--key-file` as above | |
+| | `--operator <EndpointId>` (`IROH_GATEWAY_EDGE_OPERATOR`) | required |
+| | `--iroh-listen <addr>` (`IROH_GATEWAY_EDGE_IROH_LISTEN`) | `0.0.0.0:7842` |
+| | `--public-bind <ip>` (`IROH_GATEWAY_EDGE_PUBLIC_BIND`) | `::` |
+| | `--max-connections <n>` (`IROH_GATEWAY_EDGE_MAX_CONNECTIONS`), 1 to 4096; about 400 KiB per connection in the worst case | `2048` |
+| | `--max-udp-flows <n>` (`IROH_GATEWAY_EDGE_MAX_UDP_FLOWS`), 1 to 4096; at the cap a new UDP flow replaces the least recently used one | `4096` |
+| | `--udp-rate-limit <BYTES_PER_SECOND>` (`IROH_GATEWAY_EDGE_UDP_RATE_LIMIT`), 1 or more; see [UDP](#udp) | no limit |
+| | `--tunnel-grace <duration>` (`IROH_GATEWAY_EDGE_TUNNEL_GRACE`), for example `5s` | `5s` |
+| | `--relay <disabled\|n0\|URL>` (`IROH_GATEWAY_EDGE_RELAY`) | `disabled` |
+| | `--metrics-listen <addr>` (`IROH_GATEWAY_EDGE_METRICS_LISTEN`); see [Metrics and health](#metrics-and-health) | not served |
+
+`id` prints the EndpointId and a newline, nothing else, and creates the key file if it is missing. A malformed key file is an error and is never overwritten. `--public-bind ::` also accepts IPv4 on a dual-stack host. On a host with IPv6 disabled the bind fails and shows up as a listener bind error; set `--public-bind 0.0.0.0` there.
+
+## `iroh-gateway-operator`
+
+| Command | Flags (env) | Default |
+|---|---|---|
+| `id` | `--key-file` | `operator.key` |
+| `static` | `--config <file>` | required |
+| | `--metrics-listen <addr>` (`IROH_GATEWAY_METRICS_LISTEN`); see [Metrics and health](#metrics-and-health) | not served |
+| `run` | see [`iroh-gateway-operator run`](#iroh-gateway-operator-run) | |
+
+The static configuration file:
+
+```toml
+key_file = "operator.key"
+relay = "disabled"             # optional; "disabled" (default), "n0", or a relay URL
+
+[[edge]]
+endpoint_id = "<edge EndpointId>"
+address = "203.0.113.7:7842"   # optional when relay is not "disabled"
+
+[[edge.listener]]
+protocol = "tcp"
+port = 8080
+target = "127.0.0.1:3000"
+
+[[edge.listener]]
+protocol = "udp"              # "tcp" or "udp"; both may use one port number
+port = 5353
+target = "127.0.0.1:5353"
+```
+
+A UDP listener forwards each visitor's packets to its `target` as described under [UDP](#udp) (flows, limits, the backend seeing the operator's address); a listener has one target. A relative `key_file` is taken relative to the directory of the configuration file. An `address` is `host:port`: an IP address (IPv6 in brackets, as in `[2001:db8::1]:7842`) or a DNS name, and a port from 1 to 65535. Unknown fields, a file without any `[[edge]]`, an edge listed twice, an edge without listeners, a listener on port 0, two listeners with the same protocol and port in one edge (a `tcp` and a `udp` listener may share a port number), a malformed `address`, and a missing `address` while `relay` is `disabled` are rejected at start.
 
 ## Running in production
 
-- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection); each UDP flow uses one on the operator (its socket to the backend), up to 4096 per edge. `iroh-gateway-edge run`, `iroh-gateway-operator run` and `iroh-gateway-operator static` raise their soft open-file limit to the hard limit at start (on macOS to at most 10240) and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit.
-- **Ports below 1024.** On Linux, a public port below 1024 needs `CAP_NET_BIND_SERVICE` or root on the edge.
+- **File descriptors.** Each visitor uses one file descriptor on the edge and one on the operator (its backend connection); each UDP flow uses one on the operator (its socket to the backend), up to 4096 per edge. `iroh-gateway-edge run`, `iroh-gateway-operator run` and `iroh-gateway-operator static` raise their soft open-file limit to the hard limit at start (on macOS to at most 10240) and log the limit in force; the edge warns when `--max-connections` plus 64 exceeds it. If the hard limit is too low, raise it, for example with `LimitNOFILE=` in a systemd unit (the shipped unit and the NixOS module set 65536).
+- **Ports below 1024.** On Linux, a public port below 1024 needs `CAP_NET_BIND_SERVICE` or root on the edge. The shipped unit and the NixOS module grant that capability and no other.
 - **The iroh port.** The edge's iroh UDP port (`--iroh-listen`, default 7842) must be reachable from the operator for a direct connection.
+- **The edge's metrics.** Serve them on an address visitors cannot reach (`127.0.0.1:9090` and a local agent, or a firewall rule): they show traffic and session state.
 
 ## Trust
 
@@ -592,17 +1203,20 @@ The visitor address a backend sees (in `X-Forwarded-For` for HTTP and HTTPS) is 
 
 ## Relay mode
 
-Relay mode is off by default (`disabled`): the operator reaches the edge at the `address` you give, and nothing else is contacted, except that a DNS name in `address` is resolved through the operator's normal system resolver. Turn it on when the operator cannot reach the edge directly, for example when the edge has no stable address. Both sides must use the same value (`--relay` on the edge, `relay` in the operator config).
+Relay mode is off by default (`disabled`): the operator reaches the edge at the `address` you give, and nothing else is contacted, except that a DNS name in `address` is resolved through the operator's normal system resolver. Turn it on when the operator cannot reach the edge directly, for example when the edge has no stable address. Both sides must use the same value (`--relay` on the edge, `relay` in the operator config or the chart).
 
 A relay learns the home IP, the edge's IP, and the size and timing of the relayed traffic. With `n0` it also sees address lookups from home. A relay cannot read or alter the traffic: it is encrypted end to end between the two keys.
 
 ## Known limitations
 
+- **Images may be private at first.** A container package that a workflow pushes to GitHub's registry for the first time may come up private, even for a public repository (GitHub's documentation is not consistent about this). Until its owner makes it public once, by hand, in the package's settings (Danger Zone, Change visibility; this cannot be undone), the images and the chart cannot be pulled without credentials, and the operator's pod stays in `ImagePullBackOff`. The chart's `imagePullSecrets` can name a Secret with credentials meanwhile.
 - **Addresses exchanged in direct mode.** iroh's QUIC NAT traversal cannot be switched off in iroh 1.5: even with relay mode disabled, each side tells the other its local interface addresses and sends probe packets to the addresses it is told. Port mapping (UPnP/NAT-PMP/PCP) is disabled. Mitigation, for the edge only: start the edge with `--iroh-listen <public-ip>:7842` instead of `0.0.0.0:7842`, since only a wildcard bind advertises every interface. This limits only what the edge advertises: the operator binds wildcard sockets and still advertises its own interface addresses (its LAN addresses, for example) to the edge.
 - **Stalled visitors are cut after 5 minutes.** If a visitor accepts no data for 300 seconds while data is waiting for it, the connection is aborted. Idle connections with nothing pending are not affected.
 - **Half-closed connections are cut after 5 minutes of silence.** Once one side has finished sending, the connection is aborted if the other side sends nothing for 300 seconds.
-- **UDP is best effort.** A packet that does not fit the tunnel, or loses a piece, is lost, and a UDP flood can slow TCP and HTTP through the same edge unless `--udp-rate-limit` is set; see [UDP](#udp).
-- **No metrics yet.** Both binaries log to stderr only.
+- **UDP is best effort.** A packet that does not fit the tunnel, or loses a piece, is lost, and a UDP flood can stall TCP and HTTP through the same edge unless `--udp-rate-limit` is set; see [UDP](#udp).
+- **A UDP-only Gateway shows `Programmed` `False` while HAProxy refuses a configuration.** A configuration HAProxy refused sets the `Programmed` condition of every accepted Gateway to `False`, including a Gateway that has only `UDP` listeners, although its listeners stay `Programmed` `True` and its packets keep flowing.
+- **An `Edge` added while HAProxy refuses a configuration gets no UDP.** The operator starts its link to a new edge only once HAProxy takes a configuration, so until then that edge opens no port, its UDP ports included.
+- **Only the operator has health endpoints.** The edge serves only `/metrics`, and only with `--metrics-listen`.
 
 ## License
 

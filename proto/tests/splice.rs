@@ -4,6 +4,10 @@ use std::{
     future::Future,
     io::{self, ErrorKind},
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -14,7 +18,9 @@ use iroh::{
 };
 use iroh_gateway_proto::{
     ALPN, RESET_ABORTED,
-    splice::{LocalStream, SpliceEnd, SpliceOptions, SpliceStats, splice, splice_with},
+    splice::{
+        LocalStream, SpliceEnd, SpliceMeter, SpliceOptions, SpliceStats, splice, splice_with,
+    },
     transport::{Relay, Role, endpoint_builder},
 };
 use sha2::{Digest, Sha256};
@@ -79,12 +85,13 @@ struct Rig {
     splice: JoinHandle<SpliceStats>,
 }
 
-/// tcp_b as splice's local side, taking `room` more bytes and then none, as if tcp_a had
-/// stopped reading and every buffer on the way were full. Signals `stalled` when it gets
-/// there. Reads, shutdown and `abort` go to the real socket.
+/// tcp_b as splice's local side, taking `room` more bytes, at most `per_write` per write, and
+/// then none, as if tcp_a had stopped reading and every buffer on the way were full. Signals
+/// `stalled` when it gets there. Reads, shutdown and `abort` go to the real socket.
 struct StallingLocal {
     tcp: TcpStream,
     room: usize,
+    per_write: usize,
     stalled: Option<oneshot::Sender<()>>,
 }
 
@@ -112,7 +119,7 @@ impl AsyncWrite for StallingLocal {
             // Never woken: only an abort can end a splice stuck here.
             return Poll::Pending;
         }
-        let n = buf.len().min(this.room);
+        let n = buf.len().min(this.room).min(this.per_write);
         let written = ready!(Pin::new(&mut this.tcp).poll_write(cx, &buf[..n]));
         if let Ok(written) = written {
             this.room -= written;
@@ -420,6 +427,7 @@ async fn blocked_on_local_write() -> Rig {
     let local_b = StallingLocal {
         tcp: tcp_b,
         room: ROOM,
+        per_write: usize::MAX,
         stalled: Some(stalled_tx),
     };
     let mut r = rig_from(tcp_a, local_b, None).await;
@@ -475,6 +483,117 @@ async fn cancelled_splice_aborts_both_sides() {
     assert_eq!(err.kind(), ErrorKind::ConnectionReset);
 }
 
+/// A `SpliceMeter` that adds up what it is told.
+#[derive(Default)]
+struct Recorder {
+    to_remote: AtomicU64,
+    to_local: AtomicU64,
+}
+
+impl SpliceMeter for Recorder {
+    fn to_remote(&self, bytes: u64) {
+        self.to_remote.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn to_local(&self, bytes: u64) {
+        self.to_local.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// A rig whose splice reports to the returned recorder.
+async fn metered_rig() -> (Rig, Arc<Recorder>) {
+    let recorder = Arc::new(Recorder::default());
+    let opts = SpliceOptions {
+        meter: Some(recorder.clone()),
+        ..SpliceOptions::default()
+    };
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    (rig_from(tcp_a, tcp_b, Some(opts)).await, recorder)
+}
+
+#[tokio::test]
+async fn the_meter_sees_every_byte_in_both_directions() {
+    // Larger than one read buffer each way, so the meter is told of several chunks.
+    const UP: usize = 300 << 10;
+    const DOWN: usize = 200 << 10;
+    let (r, recorder) = metered_rig().await;
+    let Rig {
+        tcp_a,
+        mut far_send,
+        mut far_recv,
+        quic: _quic,
+        splice,
+    } = r;
+    let (mut rd, mut wr) = tcp_a.into_split();
+    let up = tokio::spawn(async move {
+        wr.write_all(&[1; UP]).await.unwrap();
+        wr.shutdown().await.unwrap();
+    });
+    let down = tokio::spawn(async move {
+        far_send.write_all(&[2; DOWN]).await.unwrap();
+        far_send.finish().unwrap();
+    });
+    let got_up = within(far_recv.read_to_end(UP + 1)).await.unwrap();
+    let mut got_down = Vec::new();
+    within(rd.read_to_end(&mut got_down)).await.unwrap();
+    within(up).await.unwrap();
+    within(down).await.unwrap();
+    assert_eq!((got_up.len(), got_down.len()), (UP, DOWN));
+
+    let stats = within(splice).await.unwrap();
+    assert_eq!(stats.end, SpliceEnd::Clean);
+    assert_eq!((stats.to_remote, stats.to_local), (UP as u64, DOWN as u64));
+    assert_eq!(
+        (
+            recorder.to_remote.load(Ordering::Relaxed),
+            recorder.to_local.load(Ordering::Relaxed)
+        ),
+        (stats.to_remote, stats.to_local)
+    );
+}
+
+#[tokio::test]
+async fn the_meter_has_the_bytes_of_a_dropped_splice() {
+    const LEN: usize = 10_000;
+    let (mut r, recorder) = metered_rig().await;
+    r.tcp_a.write_all(&[3; LEN]).await.unwrap();
+    let mut buf = vec![0; LEN];
+    within(r.far_recv.read_exact(&mut buf)).await.unwrap();
+
+    r.splice.abort();
+    assert!(within(r.splice).await.unwrap_err().is_cancelled());
+    assert_eq!(recorder.to_remote.load(Ordering::Relaxed), LEN as u64);
+}
+
+#[tokio::test]
+async fn the_meter_has_the_bytes_a_stalled_local_took() {
+    const LEN: usize = 10_000;
+    // Less than one buffer, taken a few bytes per write: every write is counted as it happens.
+    const TAKEN: usize = 1_000;
+    let recorder = Arc::new(Recorder::default());
+    let opts = SpliceOptions {
+        meter: Some(recorder.clone()),
+        ..SpliceOptions::default()
+    };
+    let (tcp_a, tcp_b) = tcp_pair().await;
+    let (stalled_tx, stalled) = oneshot::channel();
+    let local_b = StallingLocal {
+        tcp: tcp_b,
+        room: TAKEN,
+        per_write: 100,
+        stalled: Some(stalled_tx),
+    };
+    let mut r = rig_from(tcp_a, local_b, Some(opts)).await;
+    within(r.far_send.write_all(&[4; LEN])).await.unwrap();
+    within(stalled).await.unwrap();
+    let mut buf = vec![0; TAKEN];
+    within(r.tcp_a.read_exact(&mut buf)).await.unwrap();
+
+    r.splice.abort();
+    assert!(within(r.splice).await.unwrap_err().is_cancelled());
+    assert_eq!(recorder.to_local.load(Ordering::Relaxed), TAKEN as u64);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_stream_splices_and_sees_remote_reset_as_eof() {
@@ -513,6 +632,7 @@ async fn stalled_local_write_aborts_after_timeout() {
     let local_b = StallingLocal {
         tcp: tcp_b,
         room: ROOM,
+        per_write: usize::MAX,
         stalled: Some(stalled_tx),
     };
     let Rig {

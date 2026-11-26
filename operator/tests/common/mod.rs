@@ -12,7 +12,7 @@ use std::time::Duration;
 use iroh::endpoint::{Connection, ReadError, RecvStream, SendStream};
 use iroh::tls::CaTlsConfig;
 use iroh::{Endpoint, EndpointId, SecretKey};
-use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions};
+use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions, Metrics};
 use iroh_gateway_operator::tunnel::{
     EdgeLink, EdgeState, LinkHandle, LinkOptions, StaticConnector, UdpTarget, UdpTargets,
     bind_endpoint,
@@ -34,6 +34,19 @@ use tokio::time::{sleep, timeout};
 
 /// Upper bound for any single step that should complete promptly on loopback.
 pub const STEP: Duration = Duration::from_secs(10);
+
+/// The value of `series`, a metric name without the `iroh_gateway_operator_` prefix and with its
+/// labels as rendered, in `text`; panics with the whole text if it is absent.
+pub fn metric(text: &str, series: &str) -> f64 {
+    let wanted = format!("iroh_gateway_operator_{series} ");
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(&wanted))
+        .unwrap_or_else(|| panic!("no {series} in\n{text}"));
+    line[wanted.len()..]
+        .parse()
+        .unwrap_or_else(|e| panic!("{line}: {e}"))
+}
 
 /// A runtime directory short enough for Unix socket paths on macOS.
 pub fn short_dir() -> tempfile::TempDir {
@@ -248,6 +261,7 @@ pub fn edge_options(operator: EndpointId, key: SecretKey, iroh_listen: SocketAdd
         max_udp_flows: MAX_UDP_FLOWS,
         udp_flow_idle: UDP_FLOW_IDLE,
         udp_rate_limit: None,
+        metrics: Metrics::new(),
     }
 }
 

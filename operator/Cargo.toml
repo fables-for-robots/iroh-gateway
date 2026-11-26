@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
@@ -19,6 +20,7 @@ iroh.workspace = true
 iroh-gateway-proto = { path = "../proto" }
 k8s-openapi.workspace = true
 kube.workspace = true
+prometheus.workspace = true
 rustls.workspace = true
 schemars.workspace = true
 serde.workspace = true

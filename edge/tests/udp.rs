@@ -8,17 +8,15 @@ use common::*;
 use iroh::SecretKey;
 use iroh::endpoint::Connection;
 use iroh_gateway_edge::{Edge, EdgeHandle, EdgeOptions};
-use iroh_gateway_proto::control::{BindState, ListenerStatus, Protocol, Status};
+use iroh_gateway_proto::control::{BindState, ListenerStatus, Protocol};
 use iroh_gateway_proto::datagram::{
-    HEADER_LEN, Header, Packet, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler,
+    HEADER_LEN, Header, REASSEMBLY_BYTES, REASSEMBLY_WINDOW, Reassembler,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const GRACE: Duration = Duration::from_secs(5);
-/// How long one attempt waits for its answer before sending again.
-const ATTEMPT: Duration = Duration::from_millis(300);
 /// How long a test waits before concluding that nothing arrives.
 const QUIET: Duration = Duration::from_millis(300);
 
@@ -32,10 +30,6 @@ async fn start(customize: impl FnOnce(&mut EdgeOptions)) -> (EdgeHandle, FakeOpe
         .await
         .unwrap();
     (edge, fake, key)
-}
-
-fn bound(st: &Status) -> bool {
-    !st.listeners.is_empty() && st.listeners.iter().all(|l| l.state == BindState::Bound)
 }
 
 /// Sends `payload` from `v` to port `p` until a datagram carrying it arrives on `conn`;
@@ -91,33 +85,6 @@ async fn send_tagged_until_datagram(
     .expect("the visitor's packet did not arrive")
 }
 
-/// Sends `payload` from `v` to port `p` until the whole packet arrives on `conn`; returns it
-/// with the number of datagrams it came in.
-async fn send_until_packet(
-    v: &UdpSocket,
-    p: u16,
-    payload: &[u8],
-    conn: &Connection,
-) -> (Packet, u8) {
-    let mut reassembler = Reassembler::new(REASSEMBLY_BYTES, REASSEMBLY_WINDOW);
-    timeout(STEP, async {
-        loop {
-            v.send_to(payload, ("127.0.0.1", p)).await.unwrap();
-            let deadline = Instant::now() + ATTEMPT;
-            while let Ok((header, got)) = timeout_at(deadline, recv_datagram(conn)).await {
-                let now = Instant::now().into_std();
-                if let Some(packet) = reassembler.push(header, got, now)
-                    && packet.payload == payload
-                {
-                    return (packet, header.count);
-                }
-            }
-        }
-    })
-    .await
-    .expect("the visitor's packet did not arrive")
-}
-
 /// Sends `payload` under `flow_id` on `conn` until `v` receives it; returns where it came from.
 async fn reply_until_received(
     conn: &Connection,
@@ -157,13 +124,6 @@ async fn assert_not_received(v: &UdpSocket, unwanted: &[&[u8]]) {
             String::from_utf8_lossy(&buf[..n])
         );
     }
-}
-
-/// A UDP listener with id 1 on a free port, configured on `fake`.
-async fn udp_port(fake: &mut FakeOperator) -> u16 {
-    let p = free_udp_port();
-    assert!(bound(&fake.push(cfg(1, &[(1, Protocol::Udp, p)])).await));
-    p
 }
 
 #[tokio::test]

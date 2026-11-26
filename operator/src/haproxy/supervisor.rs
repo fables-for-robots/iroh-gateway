@@ -505,7 +505,11 @@ impl Supervisor {
 
     fn remove_sockets(&self) {
         let dir = &self.opts.runtime_dir;
-        let mut paths = vec![dir.join(MASTER_SOCK), dir.join(STATS_SOCK)];
+        let mut paths = vec![
+            dir.join(MASTER_SOCK),
+            dir.join(STATS_SOCK),
+            dir.join(super::METRICS_SOCKET),
+        ];
         if let Ok(entries) = std::fs::read_dir(dir.join(SOCKET_DIR)) {
             paths.extend(
                 entries

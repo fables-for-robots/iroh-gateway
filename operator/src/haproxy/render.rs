@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use iroh_gateway_proto::control::{ListenerKey, Protocol};
 use sha2::{Digest, Sha256};
 
-use crate::haproxy::{CERT_DIR, SecretFile};
+use crate::haproxy::{CERT_DIR, METRICS_SOCKET, SecretFile};
 use crate::model::{
     Backend, GatewayModel, HeaderMods, HostMatch, HttpAction, HttpPort, HttpRule, Model, ObjRef,
     PathMatch, Redirect,
@@ -91,7 +91,14 @@ pub fn render(model: &Model, runtime_dir: &Path) -> Rendered {
          \n\
          frontend idle\n\
          \x20   bind unix@{dir}/s/idle.sock mode 600\n\
-         \x20   tcp-request connection reject\n"
+         \x20   tcp-request connection reject\n\
+         \n\
+         frontend metrics\n\
+         \x20   mode http\n\
+         \x20   bind unix@{dir}/{METRICS_SOCKET} mode 600\n\
+         \x20   acl metrics_path path /metrics\n\
+         \x20   http-request use-service prometheus-exporter if metrics_path\n\
+         \x20   no log\n"
     );
 
     let mut gateways: Vec<&GatewayModel> = model
@@ -1069,6 +1076,7 @@ mod tests {
         cfg.lines()
             .map(str::trim_start)
             .filter(|l| l.starts_with("acl ") || l.starts_with("use_backend "))
+            .filter(|l| !l.starts_with("acl metrics_path "))
             .collect()
     }
 

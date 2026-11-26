@@ -1,0 +1,18 @@
+iroh-gateway installed as release {{ .Release.Name }} in namespace {{ .Release.Namespace }}.
+
+The operator serves the Gateways whose GatewayClass names the controller
+{{ .Values.controllerName }}{{ if .Values.gatewayClass.create }} (the chart created the class {{ .Values.gatewayClass.name }}){{ end }},
+in the namespaces: {{ include "iroh-gateway.gatewayNamespaces" . }}.
+
+On first start it creates its key in the Secret {{ .Values.identity.secretName }} in
+{{ .Release.Namespace }}; back that Secret up, the key is the operator's identity. To enrol an
+edge, create an Edge resource with the edge's id next to a Gateway, then read the operator's
+id from it and start the edge with --operator <that id>:
+
+  kubectl -n <namespace> get edges.gateway.fables-for-robots.ch <edge> \
+    -o jsonpath='{.status.gatewayEndpointId}'
+
+The steps are in the README, section "Enrolling an edge":
+  https://github.com/fables-for-robots/iroh-gateway#enrolling-an-edge
+
+Helm installs the Edge CRD from crds/ on the first install only and never upgrades it.

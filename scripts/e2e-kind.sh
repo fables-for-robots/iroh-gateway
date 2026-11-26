@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end test in a kind cluster: operator, edge, Gateway API objects, real traffic.
+# End-to-end test in a kind cluster: the operator installed from the Helm chart, an edge,
+# Gateway API objects, real traffic, and both binaries' metrics.
 #
-# Expects kubectl pointed at a running kind cluster and the images iroh-gateway-operator:e2e
-# and iroh-gateway-edge:e2e both built locally (docker build --target operator|edge) and
-# loaded into the cluster (kind load docker-image). Takes no arguments. On any failure it
+# Expects kubectl and helm pointed at a running kind cluster and the images
+# iroh-gateway-operator:e2e and iroh-gateway-edge:e2e both built locally (docker build
+# --target operator|edge) and loaded into the cluster (kind load docker-image). Takes no arguments. On any failure it
 # prints the state and logs of what it created and exits non-zero.
 set -euo pipefail
 
@@ -14,7 +15,9 @@ fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ns=iroh-gateway
-operator_image=iroh-gateway-operator:e2e
+# The chart's release; its Deployment and Service are named like it, and its pod has these labels.
+release=iroh-gateway
+operator_labels="app.kubernetes.io/name=iroh-gateway,app.kubernetes.io/instance=$release"
 edge_image=iroh-gateway-edge:e2e
 gateway_api_crds=https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 tmp="$(mktemp -d)"
@@ -30,10 +33,18 @@ diagnostics() {
     k get "$resource" -o wide >&2 || true
     k describe "$resource" >&2 || true
   done
+  # A pod that is not Ready says why only in its events.
+  k describe pods -l "$operator_labels" >&2 || true
   for pod in $(k get pods -o name 2>/dev/null || true); do
     echo "=== logs of $pod ===" >&2
     k logs "$pod" --all-containers --tail=200 >&2 || true
   done
+  kubectl get networkpolicies -A >&2 || true
+  # Only once the cert-manager steps have started does the cluster have these resources.
+  kubectl get certificates,certificaterequests -A >&2 || true
+  kubectl describe certificates,certificaterequests -A >&2 || true
+  kubectl -n cert-manager logs deployment/cert-manager --tail=100 >&2 || true
+  kubectl -n cert-manager logs deployment/cert-manager-webhook --tail=100 >&2 || true
 }
 
 finish() {
@@ -108,6 +119,13 @@ udp_listener_programmed() {
     [ "$got" = True ]
 }
 
+# True when the Programmed condition of the listener named $1 of Gateway public reads True.
+listener_programmed() {
+  got="$(k get gateways.gateway.networking.k8s.io public \
+    -o jsonpath="{.status.listeners[?(@.name==\"$1\")].conditions[?(@.type==\"Programmed\")].status}" 2>&1)" &&
+    [ "$got" = True ]
+}
+
 # True when the Accepted condition of the only parent entry of UDPRoute udp-echo reads True.
 udproute_accepted() {
   got="$(k get udproutes.gateway.networking.k8s.io udp-echo \
@@ -162,7 +180,7 @@ self_signed() {
 # True when the operator's certificate directory holds exactly one certificate file of app-tls
 # and every entry in it has mode 0600 (-rw-------).
 certificate_files_private() {
-  got="$(k exec deploy/iroh-gateway-operator -c operator -- \
+  got="$(k exec "deploy/$release" -c operator -- \
     ls -l /run/iroh-gateway/haproxy/certs 2>&1)" || return 1
   local certificates others
   # grep -c prints 0 when nothing matches, and then fails.
@@ -172,22 +190,66 @@ certificate_files_private() {
   [ "$certificates" = 1 ] && [ "$others" = 0 ]
 }
 
+# Fetches http://$1/metrics from the probe pod; what it printed, its errors included, goes to
+# $got. The status is wget's.
+metrics_of() {
+  got="$(k exec probe -- wget -qO- -T 5 "http://$1/metrics" 2>&1)"
+}
+
+# The lines of $got that match the extended regular expression $1, or, when none does, the
+# first 20 lines of $got: what a metrics check saw, for its failure message.
+seen() {
+  grep -E "$1" <<<"$got" || head -n 20 <<<"$got"
+}
+
+# True when the operator's /metrics, through its Service, has the tunnel to the edge up, the
+# HAProxy exporter answering, and HAProxy's own metrics.
+operator_metrics_complete() {
+  metrics_of "$release.$ns.svc:8080" &&
+    grep -qxF "iroh_gateway_operator_tunnel_up{edge=\"$edge_id\"} 1" <<<"$got" &&
+    grep -qxF 'iroh_gateway_operator_haproxy_exporter_up 1' <<<"$got" &&
+    grep -q '^haproxy_process_' <<<"$got"
+}
+
+# True when the edge's /metrics has a session with a configuration.
+edge_metrics_complete() {
+  metrics_of "edge.$ns.svc:9090" &&
+    grep -qxF 'iroh_gateway_edge_session_up 1' <<<"$got"
+}
+
+# True when the operator's one pod is Ready and its container has the liveness probe on
+# /healthz and the readiness probe on /readyz.
+operator_pod_probed() {
+  got="$(k get pod -l "$operator_labels" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status} {.spec.containers[?(@.name=="operator")].livenessProbe.httpGet.path} {.spec.containers[?(@.name=="operator")].readinessProbe.httpGet.path}{"\n"}{end}' 2>&1)" &&
+    [ "$got" = "True /healthz /readyz" ]
+}
+
+# True when the operator's /metrics counts at least one visitor stream from the edge.
+operator_streams_counted() {
+  metrics_of "$release.$ns.svc:8080" || return 1
+  local streams
+  streams="$(sed -n "s/^iroh_gateway_operator_tunnel_streams_total{edge=\"$edge_id\"} //p" <<<"$got")"
+  [[ "$streams" =~ ^[0-9]+$ ]] && [ "$streams" -ge 1 ]
+}
+
 step "Gateway API CRDs"
 kubectl apply --server-side -f "$gateway_api_crds"
-# deploy/ creates a GatewayClass, so its CRD must be served before that is applied.
+# The chart creates a GatewayClass, so its CRD must be served before the install.
 kubectl wait --for=condition=Established --timeout=60s \
   crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io \
   crd/tcproutes.gateway.networking.k8s.io crd/udproutes.gateway.networking.k8s.io
 
-step "deploy/ and the operator"
-kubectl apply -f "$root/deploy/"
+step "the chart and the operator"
+# The locally built image instead of the unpublished one. --wait returns once the operator's
+# pod is Ready, which its readiness probe (/readyz) reports after the first pass over the
+# cluster's objects.
+helm install "$release" "$root/charts/iroh-gateway" --namespace "$ns" --create-namespace \
+  --set image.repository=iroh-gateway-operator --set image.tag=e2e \
+  --set image.pullPolicy=IfNotPresent --set networkPolicy.enabled=true \
+  --wait --timeout 180s
+# Helm installs crds/ before the templates.
 kubectl wait --for=condition=Established --timeout=60s \
   crd/edges.gateway.fables-for-robots.ch
-# Use the locally built image instead of the unpublished one in the manifest.
-k patch deployment iroh-gateway-operator --type strategic -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"operator","imagePullPolicy":"IfNotPresent"}]}}}}'
-k set image deployment/iroh-gateway-operator "operator=$operator_image"
-k rollout status deployment/iroh-gateway-operator --timeout=180s
 
 step "edge key"
 docker run --rm -v "$tmp:/keys" --user "$(id -u)" "$edge_image" id --key-file /keys/edge.key \
@@ -262,6 +324,7 @@ spec:
             - --operator=$operator_id
             - --iroh-listen=0.0.0.0:7842
             - --public-bind=0.0.0.0
+            - --metrics-listen=0.0.0.0:9090
           volumeMounts:
             - name: key
               mountPath: /keys
@@ -295,6 +358,9 @@ spec:
     - name: udp
       protocol: UDP
       port: 9001
+    - name: metrics
+      protocol: TCP
+      port: 9090
 YAML
 k rollout status deployment/edge --timeout=120s
 
@@ -355,6 +421,30 @@ step "conditions"
 k wait --for=condition=Programmed gateways.gateway.networking.k8s.io/public --timeout=120s
 k wait --for=condition=Connected edges.gateway.fables-for-robots.ch/e2e --timeout=120s
 
+step "metrics: the operator's"
+if ! retry 60 operator_metrics_complete; then
+  echo "expected iroh_gateway_operator_tunnel_up{edge=\"$edge_id\"} 1, iroh_gateway_operator_haproxy_exporter_up 1 and haproxy_process_ lines at http://$release.$ns.svc:8080/metrics, got:" >&2
+  seen '^(iroh_gateway_operator_(tunnel_up|haproxy_exporter_up)|haproxy_process_)' >&2
+  exit 1
+fi
+seen '^iroh_gateway_operator_(tunnel_up|haproxy_exporter_up)'
+echo "and $(grep -c '^haproxy_process_' <<<"$got") haproxy_process_ lines"
+
+step "metrics: the edge's"
+if ! retry 30 edge_metrics_complete; then
+  echo "expected iroh_gateway_edge_session_up 1 at http://edge.$ns.svc:9090/metrics, got:" >&2
+  seen '^iroh_gateway_edge_session_up' >&2
+  exit 1
+fi
+seen '^iroh_gateway_edge_session_up'
+
+step "probes"
+if ! retry 30 operator_pod_probed; then
+  echo "expected the operator pod Ready 'True' with probes on /healthz and /readyz, got '$got'" >&2
+  exit 1
+fi
+echo "ready, liveness and readiness paths: $got"
+
 step "traffic reaches the backend"
 line="hello-$RANDOM-$RANDOM"
 echoed=
@@ -368,6 +458,14 @@ if [ "$echoed" != "$line" ]; then
   exit 1
 fi
 echo "echoed: $echoed"
+
+step "metrics: the operator counted the stream"
+if ! retry 30 operator_streams_counted; then
+  echo "expected iroh_gateway_operator_tunnel_streams_total{edge=\"$edge_id\"} of at least 1, got:" >&2
+  seen '^iroh_gateway_operator_tunnel_streams_total' >&2
+  exit 1
+fi
+seen '^iroh_gateway_operator_tunnel_streams_total'
 
 step "deleting the TCPRoute closes the port"
 k delete tcproutes.gateway.networking.k8s.io echo
@@ -704,9 +802,129 @@ if ! retry 60 udp_stopped; then
   exit 1
 fi
 
+step "cert-manager"
+# The Gateway API CRDs are installed already; without them cert-manager would need a restart.
+helm install cert-manager oci://quay.io/jetstack/charts/cert-manager --version v1.21.3 \
+  --namespace cert-manager --create-namespace --set crds.enabled=true \
+  --set config.gatewayAPI.enabled=true --wait --timeout 300s
+
+step "cert-manager: an issuer and an annotated Gateway"
+# The webhook may need a moment after the install before it accepts an issuer.
+apply_issuer() {
+  got="$(kubectl apply -f - 2>&1 <<'YAML'
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-cluster-issuer
+spec:
+  selfSigned: {}
+YAML
+  )"
+}
+if ! retry 60 apply_issuer; then
+  echo "expected the ClusterIssuer to be applied, got '$got'" >&2
+  exit 1
+fi
+# Every listener Gateway public has by now, plus cm. The https listener gets a hostname here, so
+# cert-manager would pick it up; the ignore-tls-listeners annotation is what keeps cert-manager
+# off app-tls.
+kubectl apply -f - <<YAML
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: $ns
+  annotations:
+    cert-manager.io/cluster-issuer: selfsigned-cluster-issuer
+    cert-manager.io/ignore-tls-listeners: https
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: tcp-8080
+      protocol: TCP
+      port: 8080
+    - name: http
+      protocol: HTTP
+      port: 8081
+    - name: https
+      protocol: HTTPS
+      port: 8443
+      hostname: app.example.test
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-tls
+    - name: cm
+      protocol: HTTPS
+      port: 8443
+      hostname: cm.example.test
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: cm-tls
+    - name: udp
+      protocol: UDP
+      port: 9001
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: cm
+  namespace: $ns
+spec:
+  parentRefs:
+    - name: public
+      sectionName: cm
+  hostnames:
+    - cm.example.test
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080
+YAML
+
+step "cert-manager: the Secret appears and is served"
+# gateway-shim creates the Certificate some time after the Gateway is applied.
+if ! retry 60 k get certificates.cert-manager.io cm-tls; then
+  echo "cert-manager did not create the Certificate cm-tls for the annotated Gateway" >&2
+  exit 1
+fi
+k wait --for=condition=Ready certificates.cert-manager.io/cm-tls --timeout=120s
+k get secret cm-tls -o jsonpath='{.data.tls\.crt}' | base64 -d >"$tmp/cm.crt"
+k exec -i curl -- sh -c 'cat >/tmp/cm.crt' <"$tmp/cm.crt"
+cm=(--connect-to "cm.example.test:8443:edge.$ns.svc:8443" "https://cm.example.test:8443/")
+if ! retry 60 curl_prints "hello from web" --cacert /tmp/cm.crt "${cm[@]}"; then
+  echo "expected 'hello from web' for https://cm.example.test:8443/ with the issued certificate, got '$got'" >&2
+  exit 1
+fi
+echo "got: $got"
+if ! retry 30 listener_programmed cm; then
+  echo "expected the listener cm of Gateway public Programmed 'True', got '$got'" >&2
+  exit 1
+fi
+
+step "cert-manager: app-tls is untouched"
+# The https listener has a hostname, so only the annotation keeps cert-manager off app-tls. It has
+# processed the Gateway by now: cm-tls is Ready.
+# Stdout only: a warning kubectl prints on stderr goes to the script's stderr, not into $got.
+if ! got="$(k get certificates.cert-manager.io -o name)"; then
+  echo "listing the Certificates failed (kubectl's error is above): $got" >&2
+  exit 1
+fi
+if [ "$got" != "certificate.cert-manager.io/cm-tls" ]; then
+  echo "expected exactly certificate.cert-manager.io/cm-tls, got:" >&2
+  echo "$got" >&2
+  exit 1
+fi
+# The script's own certificate, the one of the rotation above, is still the one served.
+if ! retry 30 curl_prints "hello from web" --cacert /tmp/second.crt "${https[@]}"; then
+  echo "expected 'hello from web' for https://app.example.test:8443/ with the certificate of app-tls, got '$got'" >&2
+  exit 1
+fi
+
 step "deleting the operator pod is prompt (the image's stop signal reaches the operator)"
 # Well under the 60 s grace period: a pod that is only killed after the grace period fails here.
-k delete pod -l app.kubernetes.io/name=iroh-gateway-operator --wait=true --timeout=30s
-k wait --for=condition=Available deployment/iroh-gateway-operator --timeout=120s
+k delete pod -l "$operator_labels" --wait=true --timeout=30s
+k wait --for=condition=Available "deployment/$release" --timeout=120s
 
 echo "e2e passed"

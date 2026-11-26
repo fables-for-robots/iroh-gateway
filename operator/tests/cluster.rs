@@ -9,6 +9,8 @@
 mod common;
 
 use std::fmt::Debug;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use common::envtest::Envtest;
@@ -37,7 +39,6 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::api::{DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams};
 use kube::discovery::{Scope, pinned_kind};
 use kube::{Api, Client, Resource, ResourceExt};
-use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -60,6 +61,8 @@ const CONVERGE: Duration = Duration::from_secs(20);
 /// The operator as `run` wires it: identity, engine started with an empty render, stores, loop.
 struct Operator {
     key: SecretKey,
+    /// The loop's readiness, as `/readyz` serves it.
+    ready: Arc<AtomicBool>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
     _dir: TempDir,
@@ -90,6 +93,7 @@ impl Operator {
         let stores = Stores::start(client.clone(), &settings.gateway_namespaces);
         let writer = StatusWriter::new(client.clone(), CONTROLLER.into());
         let opts = ControllerOptions::new(settings, dir.path());
+        let ready = opts.ready.clone();
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let ended = run_loop(stores, &mut engine, writer, opts, async {
@@ -102,6 +106,7 @@ impl Operator {
         });
         Self {
             key,
+            ready,
             shutdown: Some(shutdown),
             task: Some(task),
             _dir: dir,
@@ -358,6 +363,31 @@ async fn programmed(client: &Client, operator: &Operator, port: u16) {
     })
     .await;
     eventually("the public port accepts", || connects(port)).await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn the_operator_becomes_ready_after_its_first_pass() {
+    let env = Envtest::start().await;
+    class(&env.client).await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    eventually("ready", || async {
+        if operator.ready.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("not ready".to_owned())
+        }
+    })
+    .await;
+    // The pass that made it ready goes on to write the class's status.
+    eventually("GatewayClass Accepted", || async {
+        let class: GatewayClass = Api::all(env.client.clone()).get("iroh").await.unwrap();
+        let conditions = class.status.and_then(|s| s.conditions).unwrap_or_default();
+        has(&conditions, &[("Accepted", "True")])
+    })
+    .await;
+    assert!(operator.ready.load(Ordering::SeqCst));
+    operator.stop().await;
 }
 
 #[tokio::test]
@@ -1749,25 +1779,39 @@ async fn status_writer_reports_what_it_could_not_write() {
     assert!(write(&mut writer, &stale).await);
 }
 
-/// Every object in every `deploy/*.yaml`, in file name order, with the file it came from.
-fn deploy_objects() -> Vec<(String, Value)> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
-        .collect();
-    files.sort();
-    assert!(!files.is_empty(), "no manifests in {}", dir.display());
+/// The namespace the chart is rendered for.
+const CHART_NS: &str = "iroh-gateway";
+
+/// Every object the Helm chart renders as release `iroh-gateway` in `CHART_NS`, with its
+/// defaults, the CRD and the NetworkPolicy, in render order, with the file name of the template
+/// it came from (`rbac.yaml`, for example). Needs `helm` on `PATH`.
+fn chart_objects() -> Vec<(String, Value)> {
+    let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/iroh-gateway");
+    let output = std::process::Command::new("helm")
+        .arg("template")
+        .arg("iroh-gateway")
+        .arg(&chart)
+        .args(["--namespace", CHART_NS, "--include-crds"])
+        .args(["--set", "networkPolicy.enabled=true"])
+        .output()
+        .unwrap_or_else(|e| panic!("helm template could not run (is helm on PATH?): {e}"));
+    assert!(
+        output.status.success(),
+        "helm template failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
     let mut objects = Vec::new();
-    for file in files {
-        let name = file.file_name().unwrap().to_string_lossy().into_owned();
-        let text = std::fs::read_to_string(&file).unwrap();
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            let value = Value::deserialize(document).unwrap_or_else(|e| panic!("{name}: {e}"));
-            if !value.is_null() {
-                objects.push((name.clone(), value));
-            }
+    // helm template starts every document with `---` and a `# Source: <chart>/<path>` line.
+    for document in text.split("\n---\n") {
+        let Some(source) = document.lines().find_map(|l| l.strip_prefix("# Source: ")) else {
+            continue;
+        };
+        let name = source.rsplit('/').next().unwrap().to_owned();
+        let value: Value =
+            serde_yaml::from_str(document).unwrap_or_else(|e| panic!("{source}: {e}"));
+        if !value.is_null() {
+            objects.push((name, value));
         }
     }
     objects
@@ -1795,7 +1839,7 @@ async fn apply_object(client: &Client, file: &str, object: &Value, dry_run: bool
         (Scope::Namespaced, None) => panic!("{what}: a namespaced kind without a namespace"),
         (Scope::Cluster, _) => Api::all_with(client.clone(), &resource),
     };
-    let mut params = PatchParams::apply("deploy-manifest-test");
+    let mut params = PatchParams::apply("chart-render-test");
     if dry_run {
         params = params.dry_run();
     }
@@ -1811,24 +1855,30 @@ async fn apply_object(client: &Client, file: &str, object: &Value, dry_run: bool
 
 #[tokio::test]
 #[ignore = "needs KUBEBUILDER_ASSETS"]
-async fn deploy_manifests_apply_cleanly() {
-    let objects = deploy_objects();
+async fn chart_objects_apply_cleanly() {
+    let objects = chart_objects();
     let env = Envtest::start().await;
-    // The namespaces for real, so the namespaced objects have somewhere to go.
+    // The chart creates no namespace; the release namespace for real, so the namespaced
+    // objects have somewhere to go.
+    env.namespace(CHART_NS).await;
     let mut dry_run_count = 0;
-    for (file, object) in objects.iter().filter(|(_, o)| o["kind"] == "Namespace") {
-        apply_object(&env.client, file, object, false).await;
-    }
-    for (file, object) in objects.iter().filter(|(_, o)| o["kind"] != "Namespace") {
+    for (file, object) in &objects {
         apply_object(&env.client, file, object, true).await;
         dry_run_count += 1;
     }
     // The Deployment and the RBAC objects are among what was checked, not skipped.
     assert!(dry_run_count >= 6, "only {dry_run_count} objects checked");
-    for kind in ["Deployment", "ClusterRole", "Role", "GatewayClass"] {
+    for kind in [
+        "Deployment",
+        "ClusterRole",
+        "Role",
+        "GatewayClass",
+        "Service",
+        "NetworkPolicy",
+    ] {
         assert!(
             objects.iter().any(|(_, o)| o["kind"] == kind),
-            "no {kind} in deploy/"
+            "no {kind} in the chart's render"
         );
     }
 
@@ -1855,7 +1905,7 @@ async fn deploy_manifests_apply_cleanly() {
                 .any(|r| matches!(r.as_str(), "*" | "secrets") || r.starts_with("secrets/"));
             if reaches_secrets {
                 assert_eq!(kind, "Role", "{file}: a {kind} rule reaches Secrets");
-                assert_eq!(object["metadata"]["namespace"], "iroh-gateway", "{object}");
+                assert_eq!(object["metadata"]["namespace"], CHART_NS, "{object}");
                 assert_eq!(resources, ["secrets"], "{rule}");
                 match verbs.as_slice() {
                     [v] if v == "get" => assert_eq!(

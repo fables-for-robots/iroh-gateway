@@ -14,7 +14,7 @@ use iroh::{EndpointId, SecretKey};
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use common::{FakeOperator, STEP, free_tcp_port, free_udp_port, tcp_cfg};
@@ -84,6 +84,11 @@ fn spawn_with_nofile(mut cmd: Command, soft: u64, hard: u64) -> (Running, mpsc::
     unsafe {
         cmd.pre_exec(move || Ok(setrlimit(Resource::RLIMIT_NOFILE, soft, hard)?));
     }
+    spawn_with_lines(cmd)
+}
+
+/// Spawns `cmd` with its stderr lines sent to the receiver.
+fn spawn_with_lines(mut cmd: Command) -> (Running, mpsc::Receiver<String>) {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -105,12 +110,25 @@ fn spawn_with_nofile(mut cmd: Command, soft: u64, hard: u64) -> (Running, mpsc::
 
 /// The first stderr line containing `needle` within 10 s; panics with what came instead.
 fn line_with(lines: &mpsc::Receiver<String>, needle: &str) -> String {
+    lines_through(lines, needle)
+        .pop()
+        .expect("the line with the needle")
+}
+
+/// The stderr lines up to and including the first containing `needle` within 10 s; panics
+/// with what came instead.
+fn lines_through(lines: &mpsc::Receiver<String>, needle: &str) -> Vec<String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut seen = Vec::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match lines.recv_timeout(left) {
-            Ok(line) if line.contains(needle) => return line,
-            Ok(line) => seen.push(line),
+            Ok(line) => {
+                let found = line.contains(needle);
+                seen.push(line);
+                if found {
+                    return seen;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -317,4 +335,80 @@ async fn run_serves_the_pinned_operator() {
 
     let status = child.terminate();
     assert!(status.success(), "{status:?}");
+}
+
+/// The whole response to `GET <path>` over HTTP/1.0 from `addr`.
+async fn http_get(addr: &str, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(STEP, stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8(response).unwrap()
+}
+
+#[tokio::test]
+async fn metrics_are_served_when_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = format!("127.0.0.1:{}", free_tcp_port());
+    let cmd = run_command(dir.path(), &["--metrics-listen", &addr]);
+    let (_child, lines) = spawn_with_lines(cmd);
+    line_with(&lines, &format!("metrics on http://{addr}/metrics"));
+
+    let metrics = http_get(&addr, "/metrics").await;
+    assert!(
+        metrics.starts_with("HTTP/1.0 200") || metrics.starts_with("HTTP/1.1 200"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("\niroh_gateway_edge_session_up 0\n"),
+        "{metrics}"
+    );
+    let other = http_get(&addr, "/other").await;
+    assert!(
+        other.starts_with("HTTP/1.0 404") || other.starts_with("HTTP/1.1 404"),
+        "{other}"
+    );
+}
+
+#[test]
+fn no_metrics_listener_without_the_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, lines) = spawn_with_lines(run_command(dir.path(), &[]));
+    let mut seen = lines_through(&lines, "serving");
+    // Its exit status is not checked: SIGTERM can arrive before the handler is installed.
+    child.terminate();
+    // The child has exited, so its stderr ends and the reader thread with it.
+    seen.extend(lines.iter());
+    assert!(!seen.iter().any(|l| l.contains("metrics on")), "{seen:#?}");
+}
+
+#[test]
+fn logs_on_a_pipe_have_no_colour_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = run_command(dir.path(), &[]);
+    // Without it only the destination decides; journald stores a line with ESC as binary.
+    cmd.env_remove("NO_COLOR");
+    let (mut child, lines) = spawn_with_lines(cmd);
+    let mut seen = lines_through(&lines, "serving");
+    // Its exit status is not checked: SIGTERM can arrive before the handler is installed.
+    child.terminate();
+    seen.extend(lines.iter());
+    assert!(!seen.iter().any(|l| l.contains('\x1b')), "{seen:#?}");
+}
+
+#[test]
+fn metrics_listen_on_a_taken_address_fails_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = held.local_addr().unwrap().to_string();
+    let out = output_within_10s(&mut run_command(dir.path(), &["--metrics-listen", &addr]));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&addr), "{stderr}");
 }

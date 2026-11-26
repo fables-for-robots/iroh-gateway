@@ -1,9 +1,11 @@
 //! One tunnel session over one authorized operator connection.
 
+use std::sync::Arc;
+
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh_gateway_proto::control::{Config, Status, StreamHeader};
 use iroh_gateway_proto::frame::{read_frame, write_frame};
-use iroh_gateway_proto::splice::{LocalStream, splice};
+use iroh_gateway_proto::splice::{LocalStream, SpliceOptions, splice_with};
 use iroh_gateway_proto::{CLOSE_CONTROL_ENDED, RESET_ABORTED};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -11,6 +13,7 @@ use tracing::{debug, info};
 
 use crate::listeners::Accepted;
 use crate::log_panic;
+use crate::metrics::Metrics;
 
 /// A `Config` read on a session's control stream, for the supervisor to apply.
 pub(crate) struct ApplyRequest {
@@ -22,19 +25,27 @@ pub(crate) struct ApplyRequest {
 /// One session: the control stream task and the visitors forwarded over this connection.
 ///
 /// Dropping it aborts the control task and every visitor task; an aborted splice resets its
-/// stream and aborts its local socket.
+/// stream and aborts its local socket. A configured session counts in `session_up` until then.
 pub(crate) struct Session {
     pub id: u64,
     /// Whether a `Config` from this session has been applied. Until then the listeners carry
     /// ids from an earlier session, which this one's operator may not have issued.
-    pub configured: bool,
+    configured: bool,
     conn: Connection,
     control: JoinHandle<()>,
     visitors: JoinSet<()>,
+    /// Counts the bytes of every visitor stream in `tcp_bytes_total`.
+    splice: SpliceOptions,
+    metrics: Metrics,
 }
 
 impl Session {
-    pub fn start(id: u64, conn: Connection, apply: mpsc::Sender<ApplyRequest>) -> Self {
+    pub fn start(
+        id: u64,
+        conn: Connection,
+        apply: mpsc::Sender<ApplyRequest>,
+        metrics: Metrics,
+    ) -> Self {
         info!(session = id, operator = %conn.remote_id().fmt_short(), "session started");
         let control = tokio::spawn(control(id, conn.clone(), apply));
         Self {
@@ -43,6 +54,11 @@ impl Session {
             conn,
             control,
             visitors: JoinSet::new(),
+            splice: SpliceOptions {
+                meter: Some(Arc::new(metrics.tcp_bytes.clone())),
+                ..SpliceOptions::default()
+            },
+            metrics,
         }
     }
 
@@ -50,9 +66,20 @@ impl Session {
         &self.conn
     }
 
+    pub fn configured(&self) -> bool {
+        self.configured
+    }
+
+    /// Marks that a `Config` from this session has been applied.
+    pub fn set_configured(&mut self) {
+        self.configured = true;
+        self.metrics.session_up.set(1);
+    }
+
     /// Forwards a visitor over this session's connection as one stream.
     pub fn forward(&mut self, accepted: Accepted) {
-        self.visitors.spawn(forward(self.conn.clone(), accepted));
+        self.visitors
+            .spawn(forward(self.conn.clone(), accepted, self.splice.clone()));
     }
 
     /// Resolves once the control stream has ended; finished visitor tasks are reaped meanwhile.
@@ -87,6 +114,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.control.abort();
+        if self.configured {
+            self.metrics.session_up.set(0);
+        }
     }
 }
 
@@ -119,14 +149,14 @@ async fn control(id: u64, conn: Connection, apply: mpsc::Sender<ApplyRequest>) {
 }
 
 /// Opens a stream for the visitor, writes its header and splices until either side ends or the
-/// connection is lost. The permit is held until this returns.
-async fn forward(conn: Connection, accepted: Accepted) {
+/// connection is lost. The slot is held until this returns, or until the task is dropped.
+async fn forward(conn: Connection, accepted: Accepted, opts: SpliceOptions) {
     let Accepted {
         listener_id,
         stream,
         visitor,
         local,
-        permit,
+        slot,
         ..
     } = accepted;
     let header = StreamHeader {
@@ -141,7 +171,7 @@ async fn forward(conn: Connection, accepted: Accepted) {
     match opened {
         Ok((send, recv)) => {
             tokio::select! {
-                stats = splice(stream, send, recv) => debug!(
+                stats = splice_with(stream, send, recv, opts) => debug!(
                     %visitor, listener_id, end = ?stats.end,
                     to_remote = stats.to_remote, to_local = stats.to_local,
                     "visitor done"
@@ -155,7 +185,7 @@ async fn forward(conn: Connection, accepted: Accepted) {
             stream.abort();
         }
     }
-    drop(permit);
+    drop(slot);
 }
 
 async fn open(

@@ -1,7 +1,7 @@
 # iroh-gateway — Design
 
 Date: 2026-11-23
-Status: approved design; build steps 1 to 4 are built (see "Build order")
+Status: approved design; build steps 1 to 5 are built (see "Build order")
 
 ## Overview
 
@@ -267,7 +267,7 @@ One setting, with the same value on the operator and on its edges:
   `max(rate, 65 535 + 64 × 18)` bytes, so the largest packet can pass even a
   small limit, and starts full. A packet that does not fit is dropped before
   it makes a flow. The reason: QUIC sends datagrams ahead of stream data, so
-  a UDP flood that fills the tunnel slows every TCP and HTTP stream of the
+  a UDP flood that fills the tunnel can stall every TCP and HTTP stream of the
   same edge, and no share of the tunnel is reserved for TCP. Replies from the
   operator are not limited.
 - Does not let a visitor hold a connection slot indefinitely:
@@ -381,9 +381,10 @@ Rules:
   on the same port (closing that needs negated host conditions). Listener
   isolation, an optional feature of the Gateway API, is therefore still not
   provided.
-- Listeners are not kept off the edge's iroh port. A `UDP` listener on it
-  ends as a bind error that the edge reports, as for any port it cannot
-  open.
+- Listeners are not kept off the edge's iroh port. When the edge's iroh
+  address and its public bind address overlap, as they do with the defaults
+  (`0.0.0.0:7842` and `::`), a `UDP` listener on that port ends as a bind
+  error that the edge reports, as for any port it cannot open.
 - A TCP listener carries one `TCPRoute`, and a UDP listener one `UDPRoute`.
   If several attach, the oldest wins and the others are not accepted.
 - An edge opens a `TCP` or `UDP` listener's port only once the listener has
@@ -630,13 +631,16 @@ listener id u32 | flow id u64 | packet id u32 | fragment index u8 | fragment cou
   incomplete packets give way. A datagram that is shorter than the header,
   has a count of 0 or above 64, an index not below its count, or belongs to a
   packet above 65 535 bytes is dropped; none of it ends a session.
-- Nothing waits, retries or blocks for a UDP packet. Sends use
-  `send_datagram`, never a variant that waits, sockets send without
-  blocking, and what does not fit is dropped. Delivery stays unreliable and
-  unordered, which is what UDP promises. Reliable streams were rejected
-  because they add head-of-line blocking.
+- Nothing waits, retries or blocks for a UDP packet. A packet goes into
+  the tunnel only by the full-tunnel rule (see "Observability"): when the
+  datagram send buffer reports room for all of its pieces, each piece queued
+  in the way that never displaces one already queued, polled once so that it
+  never waits; otherwise the packet is dropped and counted (`tunnel_full`).
+  Sockets send without blocking, and what does not fit is dropped. Delivery
+  stays unreliable and unordered, which is what UDP promises. Reliable
+  streams were rejected because they add head-of-line blocking.
 - QUIC sends datagrams ahead of stream data. A UDP flood that fills the
-  tunnel therefore slows TCP and HTTP through the same edge; the edge's
+  tunnel therefore can stall TCP and HTTP through the same edge; the edge's
   optional rate limit (see "What an edge does") bounds it.
 - On an edge with several public addresses of one family, replies leave
   from the address the system's routing picks, not necessarily the one the
@@ -778,13 +782,24 @@ runtime API without reloading; that is later work.
 
 - **Workspace.** Three crates: `proto` (messages, framing, fragmentation),
   `edge`, `operator` (with a `crdgen` binary).
-- **Operator image.** An official HAProxy LTS image as base with the
-  operator binary added, running as non-root. Published to
-  `ghcr.io/fables-for-robots/iroh-gateway-operator`.
-- **Helm chart** under `charts/iroh-gateway`: Deployment, RBAC, the `Edge`
-  CRD, a `GatewayClass`, an optional `NetworkPolicy`, metrics Service.
-  Gateway API CRDs are a prerequisite, not bundled. Until the chart exists
-  (build step 5) the same objects ship as plain manifests in `deploy/`.
+- **Images.** The operator image is an official HAProxy LTS image with the
+  operator binary added, running as non-root, published to
+  `ghcr.io/fables-for-robots/iroh-gateway-operator`. The edge image, a
+  distroless image with the edge binary, is published next to it as
+  `ghcr.io/fables-for-robots/iroh-gateway-edge`. Both are built for amd64
+  and arm64.
+- **Helm chart** under `charts/iroh-gateway`: Deployment with liveness and
+  readiness probes, RBAC (one `Role` per gateway namespace), the `Edge`
+  CRD, a `GatewayClass`, a metrics Service, an optional `ServiceMonitor`
+  and an optional `NetworkPolicy` that lets nothing in but the metrics
+  port. Gateway API CRDs are a prerequisite, not bundled. The chart is the
+  only way to install; the plain manifests of steps 2 to 4 (`deploy/`) are
+  gone, and the CRD that `crdgen` writes lives in the chart's `crds/`.
+- **Releases.** Every push to `main` publishes both images with the tags
+  `edge` and `sha-<commit>`. A `v*` tag, which must equal the crates'
+  version, publishes them under that version, pushes the chart to
+  `oci://ghcr.io/fables-for-robots/charts`, and creates a GitHub release
+  with the static edge binaries, the systemd unit and checksums.
 - **Operator permissions.** In its own namespace the operator may `get` its
   identity Secret, by name, and `create` Secrets. In every gateway
   namespace a `Role` lets it `list` and `watch` Secrets, for certificates;
@@ -792,17 +807,20 @@ runtime API without reloading; that is later work.
   status subresources it may only `patch`.
 - **Operator resources.** Memory request 128 Mi, limit 1 Gi, sized for one
   edge (see the tunnel protocol's memory bound).
-- **Edge.** Static Linux binaries for x86_64 and aarch64, a hardened systemd
-  unit (dynamic user, `CAP_NET_BIND_SERVICE` only), and a NixOS module from
-  the flake. Subcommands: `run`, and `id` to print the EndpointId.
-  Configuration: key file path, operator EndpointId, iroh listen address,
-  connection cap, relay mode.
+- **Edge.** Static Linux binaries (musl) for x86_64 and aarch64, a hardened
+  systemd unit (dynamic user, `CAP_NET_BIND_SERVICE` only), and a NixOS
+  module from the flake (`nixosModules.edge`) with the same hardening. The
+  flake also builds both binaries (`packages.edge`, `packages.operator`).
+  Subcommands: `run`, and `id` to print the EndpointId. Configuration: key
+  file path, operator EndpointId, iroh listen address, connection cap,
+  relay mode, metrics listen address.
 - **Operator relay mode** is a chart value, default `disabled`.
 - **Toolchain.** Rust 1.100 (`rust-version = "1.100"`). nixpkgs 26.05 ships
   1.95 and unstable 1.99, so the flake takes the toolchain from
   `oxalica/rust-overlay`, pinned by a `rust-toolchain.toml`.
 - **Flake** dev shell: that toolchain, `haproxy`, `kind`, `kubectl`, `helm`,
-  and `openssl`, which the HTTPS tests use to make RSA and SEC1 keys.
+  `yq` and `actionlint` for the chart and workflow checks, and `openssl`,
+  which the HTTPS tests use to make RSA and SEC1 keys.
 - **License** AGPL-3.0-or-later, as the sibling projects.
 
 ## Observability
@@ -811,6 +829,38 @@ Both binaries log with `tracing` and serve Prometheus metrics: tunnel state
 per edge, streams and flows open, bytes each way, dropped and fragmented
 datagrams, bind failures, reload count and failures, reconcile durations.
 HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
+
+- **Endpoint.** `--metrics-listen <addr>` on `iroh-gateway-edge run` and on
+  `iroh-gateway-operator run` and `static`. Without the flag nothing
+  listens; the chart always sets it. An address that cannot be bound stops
+  the process at start.
+- **Paths.** `/metrics` on both. The operator also answers `/healthz` (200
+  while the process serves) and `/readyz`: 200 once the first pass over the
+  cluster's objects has been applied, whatever HAProxy said to it, and in
+  `static` mode once every link is started. An operator that cannot list
+  what it watches is therefore never ready.
+- **One scrape.** The operator's `/metrics` is its own metrics followed by
+  HAProxy's exporter output, fetched over a unix socket in the runtime
+  directory within 2 s. If HAProxy does not answer, the operator's own
+  metrics are served alone and `iroh_gateway_operator_haproxy_exporter_up`
+  is 0.
+- **Names.** `iroh_gateway_edge_…` and `iroh_gateway_operator_…`. Counters
+  end in `_total`; units are bytes and seconds. Tunnel metrics of the
+  operator carry the label `edge` (the EndpointId), and the series of an
+  edge go away with its link. `direction` is `in` for traffic from visitors
+  towards backends and `out` for the way back. No label carries a visitor
+  address, a port, a hostname or a route name.
+- **Full tunnel.** A UDP packet is handed to the tunnel only when the
+  connection's datagram send buffer reports room for all of its pieces, and
+  its pieces are queued in the way that never displaces one already queued;
+  otherwise the packet is dropped and counted with the reason
+  `tunnel_full`. The QUIC layer would otherwise discard the oldest queued
+  piece without a trace. Under overload the newest packet is lost, not the
+  oldest. The reported room is slightly generous (the QUIC library counts
+  its per-datagram overhead once, not per queued datagram), so on a nearly
+  full buffer a packet of several pieces can still have a later piece
+  refused after earlier ones were queued; it is then counted once and its
+  remaining pieces are not sent.
 
 ## Testing
 
@@ -827,16 +877,32 @@ HAProxy's built-in Prometheus exporter is exposed on the pod's metrics port.
   `kube-apiserver` and `etcd` (envtest) with the upstream Gateway API CRDs
   installed, so the API server's own validation rules apply to every status
   the operator writes. No nodes, no pods.
-- **End to end.** A kind cluster with the manifests installed (the chart
-  once it exists) and the edge as a pod: TCP, HTTP, an HTTP redirect, HTTPS
+- **Chart.** `scripts/chart-test.sh`, without a cluster: `helm lint`, and
+  `helm template` with several sets of values, the objects read back and
+  checked (names, arguments, RBAC per namespace, the CRD against `crdgen`).
+- **End to end.** A kind cluster with the chart installed (with its
+  `NetworkPolicy`) and the edge as a pod: TCP, HTTP, an HTTP redirect, HTTPS
   with a test certificate and its rotation, UDP (a packet through the edge to a
   backend that answers it, and its end when the `UDPRoute` is deleted),
-  requests through the edge to in-cluster services, and status assertions on `Gateway`,
-  routes and `Edge`.
+  requests through the edge to in-cluster services, status assertions on `Gateway`,
+  routes and `Edge`, both binaries' metrics and the operator's probes. A
+  cert-manager step installs cert-manager v1.21.3 with its Gateway API
+  support: a self-signed `ClusterIssuer` issues a certificate for a listener
+  of an annotated Gateway, which is then served, and
+  `cert-manager.io/ignore-tls-listeners` keeps cert-manager off another
+  listener's Secret. A model test checks that a route of the shape of
+  cert-manager's HTTP-01 solver is served. Let's Encrypt and external-dns are
+  not run.
+- **NixOS VM test** (`nix/edge-test.nix`, x86_64-linux): the module starts
+  the edge as a dynamic user with its key in the state directory, binds the
+  iroh port, opens it in the firewall, serves metrics and keeps its id
+  across a restart. The release workflow starts the tarball's systemd unit
+  on a GitHub runner and checks that it binds the iroh port and logs the id
+  that `systemd-run` printed.
 
 ## Build order
 
-Each step ends in something that runs. Steps 1 to 4 are built.
+Each step ends in something that runs. Steps 1 to 5 are built.
 
 1. Tunnel with static configuration: `proto`, edge, operator-side endpoint,
    TCP forwarding to a fixed target. No Kubernetes. (Built.)
@@ -846,7 +912,7 @@ Each step ends in something that runs. Steps 1 to 4 are built.
    filters. (Built.)
 4. UDP: datagram protocol with fragmentation, `UDPRoute`. (Built.)
 5. Packaging and docs: chart, image, edge releases, NixOS module, README
-   with a walkthrough including cert-manager and external-dns.
+   with a walkthrough including cert-manager and external-dns. (Built.)
 
 ## Phase 2 (not built now, must stay possible)
 
@@ -863,5 +929,4 @@ Each step ends in something that runs. Steps 1 to 4 are built.
 - Header field widths, fragment limits, reassembly window, timeouts, backoff
   values, default caps, coalescing interval.
 - How host and path matching is expressed in HAProxy (ACLs or map files).
-- Metric names.
 - Whether the upstream conformance suite is wired in as a non-gating job.

@@ -43,6 +43,7 @@ jobs:
 
       # The operator's cluster tests run a real kube-apiserver and etcd (Kubernetes 1.37.0),
       # which setup-envtest downloads into target/envtest/, with the Gateway API CRDs.
+      # They need helm (the runner's): chart_objects_apply_cleanly renders the chart.
       - name: Cluster tests
         shell: bash
         run: |
@@ -50,17 +51,11 @@ jobs:
           # The setup-envtest the flake provides: controller-runtime v0.22.3, which has no
           # module tag of its own for tools/setup-envtest, hence the pseudo-version of its commit.
           go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.0.0-20251010212459-3e8b2594ffc4
-          export PATH="$(go env GOPATH)/bin:$PATH"
+          gopath="$(go env GOPATH)"
+          export PATH="$gopath/bin:$PATH"
           assets="$(scripts/envtest-assets)"
           test -n "$assets"
           KUBEBUILDER_ASSETS="$assets" cargo test -p iroh-gateway-operator --test cluster -- --ignored
-
-      - name: CRD manifest is up to date
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo run -q -p iroh-gateway-operator --bin crdgen > "$RUNNER_TEMP/crd.yaml"
-          diff "$RUNNER_TEMP/crd.yaml" deploy/crd.yaml
 
       - name: iroh port mapping stays compiled out
         shell: bash
@@ -78,8 +73,24 @@ jobs:
             exit 1
           fi
 
+  # Lints and renders the Helm chart and checks the objects (helm and yq come with the runner);
+  # its CRD check runs crdgen, hence the toolchain.
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Chart test
+        run: scripts/chart-test.sh
+
   e2e-kind:
-    needs: test
+    needs: [test, chart]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

@@ -1,0 +1,392 @@
+name: Release
+
+# Publishing runs are a push to main and a push of a v* tag. A pull request that touches the
+# release machinery and a manual run build everything and publish nothing.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Dockerfile
+      - dist/**
+      - scripts/check-release-version.sh
+      - charts/**
+      # What breaks a musl build of the edge without touching the files above.
+      - Cargo.lock
+      - rust-toolchain.toml
+  workflow_dispatch:
+
+# One run per ref at a time, in order: an older run on main cannot finish last and move the
+# `edge` tag back. A pull request's newer run cancels its older one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  OPERATOR_IMAGE: ghcr.io/fables-for-robots/iroh-gateway-operator
+  EDGE_IMAGE: ghcr.io/fables-for-robots/iroh-gateway-edge
+  # For steps; a job-level `if` cannot read env and repeats this expression.
+  PUBLISH: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+
+jobs:
+  # A tag that is not the crates' version stops the release before anything is published.
+  version:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+
+      - name: The tag is the crates' version
+        run: scripts/check-release-version.sh "$GITHUB_REF_NAME"
+
+  # Both images per platform in one job: the edge build reuses the build stage the operator
+  # build compiled on the same builder, so each platform compiles once.
+  images:
+    needs: version
+    # `version` runs on tags only; elsewhere it is skipped and this job still runs.
+    if: ${{ !cancelled() && (needs.version.result == 'success' || needs.version.result == 'skipped') }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Sanitize platform for artifact name
+        id: platform
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "pair=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the operator image, pushed by digest when publishing
+        id: operator
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: operator
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.OPERATOR_IMAGE }},push-by-digest=true,name-canonical=true,push=${{ env.PUBLISH }}
+
+      - name: Build the edge image, pushed by digest when publishing
+        id: edge
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: edge
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.EDGE_IMAGE }},push-by-digest=true,name-canonical=true,push=${{ env.PUBLISH }}
+
+      - name: Export digests
+        env:
+          OPERATOR_DIGEST: ${{ steps.operator.outputs.digest }}
+          EDGE_DIGEST: ${{ steps.edge.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests/operator /tmp/digests/edge
+          touch "/tmp/digests/operator/${OPERATOR_DIGEST#sha256:}"
+          touch "/tmp/digests/edge/${EDGE_DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-operator-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/operator/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-edge-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/edge/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Needs the edge binaries too, so a failed musl build or unit check publishes no image, and
+  # with that no chart, on a tag whose GitHub release would then be skipped.
+  manifests:
+    needs: [version, images, edge-binaries]
+    if: ${{ !cancelled() && (needs.version.result == 'success' || needs.version.result == 'skipped') && needs.images.result == 'success' && needs.edge-binaries.result == 'success' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    strategy:
+      matrix:
+        image: [operator, edge]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/fables-for-robots/iroh-gateway-${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      # main → edge + sha-<short>; tag vX.Y.Z → X.Y.Z (+ latest via
+      # flavor's default latest=auto on semver).
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=edge,branch=main
+            type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+            type=semver,pattern={{version}}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          args=()
+          while IFS= read -r tag; do
+            args+=(-t "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for digest in *; do
+            args+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect "$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+
+  # Static (musl) edge binaries in a tarball with the systemd unit, built natively on each
+  # architecture. Publishes nothing itself; the release job attaches the tarballs.
+  edge-binaries:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            check-unit: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            check-unit: false
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+
+      - name: Add the musl target
+        run: rustup target add --toolchain 1.100.0 "$TARGET"
+
+      # ring compiles C and assembly; musl-gcc compiles them against musl's headers.
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build the edge
+        env:
+          # cc-rs reads TARGET_CC for the target when it differs from the host (gnu here).
+          TARGET_CC: musl-gcc
+        run: cargo build --release --locked -p iroh-gateway-edge --target "$TARGET"
+
+      - name: The binary is static and runs
+        run: |
+          bin="target/$TARGET/release/iroh-gateway-edge"
+          file "$bin"
+          if ! file "$bin" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::$bin is not statically linked"
+            exit 1
+          fi
+          "$bin" --version
+
+      - name: Build the tarball
+        id: tarball
+        run: |
+          # The tag on a tag run; elsewhere a name that is never a release's.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            label="$GITHUB_REF_NAME"
+          else
+            label="sha-${GITHUB_SHA::7}"
+          fi
+          name="iroh-gateway-edge-${label}-${TARGET}.tar.gz"
+          dir="$RUNNER_TEMP/tarball"
+          mkdir -p "$dir"
+          install -m 0755 "target/$TARGET/release/iroh-gateway-edge" "$dir/iroh-gateway-edge"
+          install -m 0644 dist/iroh-gateway-edge.service dist/README.md LICENSE "$dir/"
+          # The four files at the top level, no enclosing directory.
+          tar -czf "$RUNNER_TEMP/$name" --owner=0 --group=0 --numeric-owner -C "$dir" \
+            iroh-gateway-edge iroh-gateway-edge.service README.md LICENSE
+          tar -tzvf "$RUNNER_TEMP/$name"
+          echo "path=$RUNNER_TEMP/$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edge-${{ matrix.target }}
+          path: ${{ steps.tarball.outputs.path }}
+          if-no-files-found: error
+          retention-days: 1
+
+      # The unit's checks run on the x86_64 runner only (systemd is PID 1 there), in every run,
+      # since they publish nothing. ExecStart must exist for systemd-analyze verify.
+      - name: Install the binary
+        if: matrix.check-unit
+        run: sudo install -m 0755 "target/$TARGET/release/iroh-gateway-edge" /usr/local/bin/iroh-gateway-edge
+
+      # verify also loads the units this one names and may warn about the runner's own units;
+      # only its exit status and messages about this unit count.
+      - name: systemd-analyze verify
+        if: matrix.check-unit
+        run: |
+          out="$RUNNER_TEMP/verify.txt"
+          status=0
+          systemd-analyze verify dist/iroh-gateway-edge.service >"$out" 2>&1 || status=$?
+          cat "$out"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::systemd-analyze verify exited with $status"
+            exit 1
+          fi
+          if grep -F 'iroh-gateway-edge.service' "$out"; then
+            echo "::error::systemd-analyze verify has messages about iroh-gateway-edge.service"
+            exit 1
+          fi
+
+      # The real thing: the unit as an administrator installs it, with the id read the way its
+      # comment says, starts, binds the iroh port and logs that same id.
+      - name: The unit starts the edge
+        if: matrix.check-unit
+        env:
+          # The ed25519 base point: a valid EndpointId that no operator holds.
+          OPERATOR: '5866666666666666666666666666666666666666666666666666666666666666'
+        run: |
+          sudo install -m 0644 dist/iroh-gateway-edge.service /etc/systemd/system/iroh-gateway-edge.service
+          sudo install -d -m 0755 /etc/iroh-gateway-edge
+          echo "IROH_GATEWAY_EDGE_OPERATOR=$OPERATOR" | sudo tee /etc/iroh-gateway-edge/env >/dev/null
+          sudo systemctl daemon-reload
+
+          id="$(sudo systemd-run --wait --pipe --collect -p DynamicUser=yes -p StateDirectory=iroh-gateway-edge /usr/local/bin/iroh-gateway-edge id)"
+          echo "id: $id"
+          if ! [[ "$id" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::systemd-run ... iroh-gateway-edge id printed no EndpointId"
+            exit 1
+          fi
+
+          sudo systemctl start iroh-gateway-edge
+
+          # The edge colours its log only on a terminal. Should a line carry escape codes anyway,
+          # journald keeps it as binary: -a prints it and sed strips them before the match.
+          started() {
+            local log
+            log="$(sudo journalctl -a -o cat -u iroh-gateway-edge --no-pager | sed 's/\x1b\[[0-9;]*m//g')"
+            grep -F 'edge started' <<< "$log" | grep -F "id=$id" >/dev/null
+          }
+          bound() {
+            [ -n "$(ss -Hlun 'sport = :7842')" ]
+          }
+          up=false
+          for _ in $(seq 30); do
+            if systemctl is-active --quiet iroh-gateway-edge && started && bound; then
+              up=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$up" != true ]; then
+            echo "::error::within 30 s iroh-gateway-edge was not active with id=$id and UDP 7842 bound"
+            systemctl status iroh-gateway-edge --no-pager || true
+            ss -Hlun
+            exit 1
+          fi
+          echo "iroh-gateway-edge is active, logged id=$id and binds UDP 7842"
+
+          # With Restart=always an edge killed a moment after it came up (by the seccomp filter,
+          # say) would have passed the loop: 5 s later it must still be active and never restarted.
+          sleep 5
+          restarts="$(systemctl show -p NRestarts --value iroh-gateway-edge)"
+          if ! systemctl is-active --quiet iroh-gateway-edge || [ "$restarts" != 0 ]; then
+            echo "::error::5 s later iroh-gateway-edge is $(systemctl is-active iroh-gateway-edge) after $restarts restarts"
+            systemctl status iroh-gateway-edge --no-pager || true
+            exit 1
+          fi
+          echo "5 s later iroh-gateway-edge is still active and has not restarted"
+
+      - name: The edge's journal
+        if: failure() && matrix.check-unit
+        run: sudo journalctl -a -u iroh-gateway-edge --no-pager
+
+  chart:
+    needs: [version, manifests]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Package and push chart
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+          helm package charts/iroh-gateway --version "$ver" --app-version "$ver"
+          helm push "iroh-gateway-${ver}.tgz" oci://ghcr.io/fables-for-robots/charts
+
+  # Last, so a GitHub release exists only once its images and chart are published. A re-run
+  # after a release completed fails at `gh release create`, because the release exists; that is
+  # intended, as a re-run must not replace a published release's files.
+  release:
+    needs: [version, edge-binaries, manifests, chart]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/release
+          pattern: edge-*
+          merge-multiple: true
+
+      - name: Create the release
+        working-directory: ${{ runner.temp }}/release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            ./*.tar.gz SHA256SUMS

@@ -6,6 +6,9 @@ pub mod render;
 
 use std::fmt;
 
+/// The unix socket, in the runtime directory, on which HAProxy serves its Prometheus exporter.
+pub const METRICS_SOCKET: &str = "metrics.sock";
+
 pub use supervisor::{
     Applied, ApplyError, CERT_DIR, DEFAULT_RELOAD_TIMEOUT, MAX_RUNTIME_DIR_LEN, Supervisor,
     SupervisorOptions,
