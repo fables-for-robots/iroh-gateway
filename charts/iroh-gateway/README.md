@@ -14,16 +14,16 @@ The Gateway API v1.7.0 standard CRDs must be installed first:
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 ```
 
-A released version, from the OCI registry (Helm 3.8 or later):
+A released version, from the OCI registry (Helm 3.8 or later), with `<X.Y.Z>` a version from
+the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) without its `v`:
 
 ```sh
 helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway --version <X.Y.Z> \
   --namespace iroh-gateway --create-namespace --wait --timeout 180s
 ```
 
-No version has been released yet, so the registry holds no chart. Until then, install from a
-checkout of the repository, with the operator image that every push to `main` publishes under
-the tag `edge`:
+To run what is on `main` instead, install from a checkout of the repository, with the operator
+image that every push to `main` publishes under the tag `edge`:
 
 ```sh
 helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway --create-namespace \

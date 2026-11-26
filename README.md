@@ -8,7 +8,7 @@ In a Kubernetes cluster the operator is a Gateway API controller, installed with
 
 What exists: the edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, UDP, HTTP and HTTPS; Prometheus metrics in both, and health endpoints in the operator; a Helm chart; container images for both; static Linux binaries of the edge with a hardened systemd unit; nix packages of both binaries and a NixOS module for the edge.
 
-No version has been released yet: there is no `v*` tag, so there is no release tarball, no image tagged with a version, and no chart in the OCI registry. On every push to `main`, the release workflow publishes both images built from `main` with the tags `edge` and `sha-<commit>`; until the first release, install the chart from a checkout with those images (see [The chart](#the-chart)). GitHub may create those image packages private at first (see [Known limitations](#known-limitations)).
+Versions are tagged `v<X.Y.Z>`; the first is `v0.1.0`, and the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) lists them. A tag publishes both images with the tags `<X.Y.Z>` and `latest`, the chart to `oci://ghcr.io/fables-for-robots/charts`, and a GitHub release with the edge's tarballs. On every push to `main`, the release workflow also publishes both images built from `main` with the tags `edge` and `sha-<commit>` (see [The chart](#the-chart) for installing those).
 
 ## Install in a cluster
 
@@ -26,14 +26,14 @@ The `UDPRoute` CRD must be installed: the operator applies nothing until every k
 
 The chart installs the `Edge` CRD, the RBAC rules, the `GatewayClass` named `iroh-gateway`, the operator with its probes, and a Service in front of its metrics port. With `--wait`, Helm returns once the operator's pod is ready (see [Readiness](#readiness)).
 
-A released version, from the OCI registry (Helm 3.8 or later):
+A released version, from the OCI registry (Helm 3.8 or later), with `<X.Y.Z>` a version from the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) without its `v`:
 
 ```sh
 helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway --version <X.Y.Z> \
   --namespace iroh-gateway --create-namespace --wait --timeout 180s
 ```
 
-The chart is pushed there only when a version is tagged, so until the first release this command finds nothing. Install from a checkout instead, with the operator image built from `main`:
+The chart is pushed there only when a version is tagged. To run what is on `main` instead, install from a checkout, with the operator image built from `main`:
 
 ```sh
 git clone https://github.com/fables-for-robots/iroh-gateway
@@ -88,7 +88,7 @@ A release attaches, for each of `x86_64-unknown-linux-musl` and `aarch64-unknown
 
 The unit runs the edge as a dynamic user with `CAP_NET_BIND_SERVICE` as its only capability (so it can open ports below 1024), keeps the key in its state directory `/var/lib/iroh-gateway-edge`, reads its settings from `/etc/iroh-gateway-edge/env`, raises the open-file limit to 65536 and restarts the edge 2 s after it exits. The env file holds `IROH_GATEWAY_EDGE_*` variables, one per flag of `iroh-gateway-edge run` (see [`iroh-gateway-edge`](#iroh-gateway-edge)); `IROH_GATEWAY_EDGE_OPERATOR` is required. Steps 3 and 5 of the walkthrough install it.
 
-Until the first release there is no tarball. The release workflow builds the binary with the commands below, on a Linux machine of the target's architecture with [rustup](https://rustup.rs) (the repository's `rust-toolchain.toml` selects Rust 1.100.0, and rustup adds the components it lists on first use) and Debian's or Ubuntu's `musl-tools`; for aarch64 use `aarch64-unknown-linux-musl`:
+To build the binary yourself instead, use the release workflow's commands, on a Linux machine of the target's architecture with [rustup](https://rustup.rs) (the repository's `rust-toolchain.toml` selects Rust 1.100.0, and rustup adds the components it lists on first use) and Debian's or Ubuntu's `musl-tools`; for aarch64 use `aarch64-unknown-linux-musl`:
 
 ```sh
 git clone https://github.com/fables-for-robots/iroh-gateway
@@ -243,20 +243,18 @@ kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/re
 
 ### 2. The chart
 
-Until the first release, from a checkout, with the operator image built from `main`:
+With `<X.Y.Z>` a version from the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases), without its `v`:
 
 ```sh
-git clone https://github.com/fables-for-robots/iroh-gateway
-cd iroh-gateway
-helm install iroh-gateway charts/iroh-gateway --namespace iroh-gateway --create-namespace \
-  --set image.tag=edge --set image.pullPolicy=Always --wait --timeout 180s
+helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway --version <X.Y.Z> \
+  --namespace iroh-gateway --create-namespace --wait --timeout 180s
 ```
 
-For a released version, use `helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway --version <X.Y.Z> --namespace iroh-gateway --create-namespace --wait --timeout 180s` instead. `helm install` returns once the operator is ready; `kubectl -n iroh-gateway get pods` shows it `Running` and `1/1` ready. If the pod stays in `ImagePullBackOff`, the image cannot be pulled (see [Known limitations](#known-limitations)).
+To run what is on `main` instead, install from a checkout as under [The chart](#the-chart). `helm install` returns once the operator is ready; `kubectl -n iroh-gateway get pods` shows it `Running` and `1/1` ready. If the pod stays in `ImagePullBackOff`, the image cannot be pulled (see [Known limitations](#known-limitations)).
 
 ### 3. The edge on the VPS, and its id
 
-On the VPS, as root. Download the tarball of a release and check it (with `aarch64-unknown-linux-musl` on an ARM machine); until the first release, build the binary as described under [From the release tarball](#from-the-release-tarball-with-systemd) and copy it and `dist/iroh-gateway-edge.service` to the VPS instead:
+On the VPS, as root. Download the tarball of a release and check it (with `aarch64-unknown-linux-musl` on an ARM machine):
 
 ```sh
 VERSION=<vX.Y.Z>
@@ -1209,7 +1207,7 @@ A relay learns the home IP, the edge's IP, and the size and timing of the relaye
 
 ## Known limitations
 
-- **Images may be private at first.** A container package that a workflow pushes to GitHub's registry for the first time may come up private, even for a public repository (GitHub's documentation is not consistent about this). Until its owner makes it public once, by hand, in the package's settings (Danger Zone, Change visibility; this cannot be undone), the images and the chart cannot be pulled without credentials, and the operator's pod stays in `ImagePullBackOff`. The chart's `imagePullSecrets` can name a Secret with credentials meanwhile.
+- **A package may be private at first.** A package that a workflow pushes to GitHub's registry for the first time may come up private, even for a public repository (GitHub's documentation is not consistent about this). Both image packages came up public. The chart's package is created by the first release; if `helm install` from the registry is refused for want of credentials, it is still private, until its owner makes it public once, by hand, in the package's settings (Danger Zone, Change visibility; this cannot be undone). Install from a checkout meanwhile. A fork that publishes its own images may meet the same with them: the operator's pod then stays in `ImagePullBackOff`, and the chart's `imagePullSecrets` can name a Secret with credentials.
 - **Addresses exchanged in direct mode.** iroh's QUIC NAT traversal cannot be switched off in iroh 1.5: even with relay mode disabled, each side tells the other its local interface addresses and sends probe packets to the addresses it is told. Port mapping (UPnP/NAT-PMP/PCP) is disabled. Mitigation, for the edge only: start the edge with `--iroh-listen <public-ip>:7842` instead of `0.0.0.0:7842`, since only a wildcard bind advertises every interface. This limits only what the edge advertises: the operator binds wildcard sockets and still advertises its own interface addresses (its LAN addresses, for example) to the edge.
 - **Stalled visitors are cut after 5 minutes.** If a visitor accepts no data for 300 seconds while data is waiting for it, the connection is aborted. Idle connections with nothing pending are not affected.
 - **Half-closed connections are cut after 5 minutes of silence.** Once one side has finished sending, the connection is aborted if the other side sends nothing for 300 seconds.
