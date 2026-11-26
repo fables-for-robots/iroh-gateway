@@ -3,7 +3,7 @@
 Installs the [iroh-gateway operator](../../README.md#kubernetes), a Kubernetes Gateway API
 controller that publishes Gateways through iroh-gateway edges, with its `Edge` CRD, its RBAC
 rules, a `GatewayClass`, a Service for its metrics port, and optionally a ServiceMonitor and a
-NetworkPolicy. The [README of the repository](../../README.md#install-in-a-cluster) explains
+NetworkPolicy. The [README of the repository](../../README.md#install-with-helm) explains
 the install and walks through a complete setup.
 
 ## Install
