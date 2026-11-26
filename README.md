@@ -7,12 +7,12 @@ flowchart LR
     visitors(["Visitors"])
 
     subgraph vm["VM at Hetzner Cloud, public IP"]
-        edge["iroh-gateway-edge<br/>opens the public ports"]
+        edge["edge<br/>opens the<br/>public ports"]
     end
 
     subgraph home["Kubernetes cluster at home, no open port"]
-        operator["iroh-gateway-operator<br/>Gateway API controller<br/>HAProxy ends TLS here"]
-        services["Your Services"]
+        operator["operator<br/>Gateway API<br/>controller,<br/>TLS ends here"]
+        services["your<br/>Services"]
     end
 
     visitors -- "HTTP, HTTPS,<br/>TCP, UDP" --> edge
