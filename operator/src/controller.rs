@@ -14,6 +14,7 @@ use crate::engine::{Engine, EngineEvent};
 use crate::haproxy::render::{Rendered, render};
 use crate::metrics::Metrics;
 use crate::model::{self, Settings};
+use crate::status::listing::{Listing, views};
 use crate::status::{self, Facts};
 
 /// Default for [`ControllerOptions::debounce`].
@@ -22,6 +23,8 @@ pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
 pub const DEFAULT_STATUS_RETRY_MIN: Duration = Duration::from_secs(5);
 /// Default for [`ControllerOptions::status_retry_max`].
 pub const DEFAULT_STATUS_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Default for [`ControllerOptions::address_grace`].
+pub const DEFAULT_ADDRESS_GRACE: Duration = Duration::from_secs(30);
 
 pub struct ControllerOptions {
     pub settings: Settings,
@@ -33,6 +36,9 @@ pub struct ControllerOptions {
     /// changed. Doubles after each consecutive failing pass, up to `status_retry_max`.
     pub status_retry_min: Duration,
     pub status_retry_max: Duration,
+    /// How long a Gateway keeps listing the addresses of an edge whose link has dropped, so that
+    /// a link that reconnects does not change the Gateway's addresses. Zero withdraws at once.
+    pub address_grace: Duration,
     /// Where the loop counts and times its passes and counts failed status writes.
     pub metrics: Metrics,
     /// Set once the first pass's apply has returned, whatever HAProxy made of it; never unset.
@@ -41,7 +47,8 @@ pub struct ControllerOptions {
 
 impl ControllerOptions {
     /// Options with [`DEFAULT_DEBOUNCE`], [`DEFAULT_STATUS_RETRY_MIN`],
-    /// [`DEFAULT_STATUS_RETRY_MAX`], metrics of their own, and not ready.
+    /// [`DEFAULT_STATUS_RETRY_MAX`], [`DEFAULT_ADDRESS_GRACE`], metrics of their own, and not
+    /// ready.
     pub fn new(settings: Settings, runtime_dir: impl Into<PathBuf>) -> Self {
         Self {
             settings,
@@ -49,6 +56,7 @@ impl ControllerOptions {
             debounce: DEFAULT_DEBOUNCE,
             status_retry_min: DEFAULT_STATUS_RETRY_MIN,
             status_retry_max: DEFAULT_STATUS_RETRY_MAX,
+            address_grace: DEFAULT_ADDRESS_GRACE,
             metrics: Metrics::new(),
             ready: Arc::new(AtomicBool::new(false)),
         }
@@ -95,9 +103,10 @@ impl<A: Applier> Applier for &mut A {
 /// Runs until `shutdown` resolves (Ok) or HAProxy dies (Err).
 ///
 /// Nothing is applied before every store has finished its first list. Then one pass runs, and
-/// another after each change in the stores or in the applier, or once the status retry delay
-/// has passed after a pass whose status write failed; changes that arrive within `debounce` of
-/// the first trigger are taken in the same pass. A pass's apply is never interrupted; its
+/// another after each change in the stores or in the applier, once the status retry delay has
+/// passed after a pass whose status write failed, or when the address grace of a disconnected
+/// edge ends (see [`Listing`]); changes that arrive within `debounce` of the first trigger are
+/// taken in the same pass. A pass's apply is never interrupted; its
 /// status write is cut short by `shutdown`, which is otherwise noticed between passes.
 ///
 /// Each pass that completes is counted and timed, from taking the snapshot to the end of its
@@ -124,6 +133,7 @@ pub async fn run_loop(
     // The delay before the next pass while status writes keep failing.
     let mut status_retry: Option<Duration> = None;
     let control = opts.metrics.control();
+    let mut listing = Listing::new(opts.address_grace);
     loop {
         let started = Instant::now();
         let snapshot = source.snapshot();
@@ -131,8 +141,7 @@ pub async fn run_loop(
         applier.apply(render(&model, &opts.runtime_dir)).await;
         opts.ready.store(true, Ordering::Release);
         let facts = applier.facts();
-        // Every accepted edge, until the listing decides (the next commit).
-        let listed = model.edges.iter().map(|e| e.key.clone()).collect();
+        let listed = listing.update(Instant::now(), &views(&model, &facts, &snapshot));
         let desired = status::compute(&model, &facts, &listed);
         // Each status request has a timeout, but the write is still raced against shutdown: a
         // pass with many slow writes would otherwise hold up SIGTERM.
@@ -157,6 +166,8 @@ pub async fn run_loop(
             () = source.changed() => {}
             event = applier.next_event() => check(event)?,
             () = sleep_until_some(retry_at) => {}
+            // A held edge's grace ends: the next pass withdraws its addresses.
+            () = sleep_until_some(listing.next_expiry()) => {}
             () = &mut shutdown => return Ok(()),
         }
         let deadline = Instant::now() + opts.debounce;
@@ -201,9 +212,10 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
-    use crate::model::Snapshot;
     use crate::model::fixtures::{edge, settings};
+    use crate::model::{ObjRef, Snapshot};
     use crate::status::DesiredStatus;
+    use crate::tunnel::EdgeState;
 
     fn id(seed: u8) -> iroh::EndpointId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -313,6 +325,19 @@ mod tests {
 
         /// [`Rig::start`] with the sink answering `results` first, and changed options.
         fn start_with(results: &[bool], customize: impl FnOnce(&mut ControllerOptions)) -> Self {
+            let snapshot = Snapshot {
+                edges: vec![edge("gw", "e1", 7)],
+                ..Snapshot::default()
+            };
+            Self::start_from(snapshot, results, customize)
+        }
+
+        /// A loop over `snapshot`, which never changes.
+        fn start_from(
+            snapshot: Snapshot,
+            results: &[bool],
+            customize: impl FnOnce(&mut ControllerOptions),
+        ) -> Self {
             let (sync, synced) = watch::channel(false);
             let (changes, changes_rx) = mpsc::unbounded_channel();
             let (events, events_rx) = mpsc::unbounded_channel();
@@ -326,10 +351,7 @@ mod tests {
             let source = FakeSource {
                 synced,
                 changes: changes_rx,
-                snapshot: Snapshot {
-                    edges: vec![edge("gw", "e1", 7)],
-                    ..Snapshot::default()
-                },
+                snapshot,
             };
             let applier = FakeApplier {
                 applies: applies.clone(),
@@ -383,6 +405,27 @@ mod tests {
             self.writes.lock().unwrap().len()
         }
 
+        /// The addresses of the only Gateway in write number `n`, counted from 0.
+        fn addresses(&self, n: usize) -> Vec<String> {
+            self.writes.lock().unwrap()[n].gateways[0]
+                .addresses
+                .iter()
+                .map(|a| a.value.clone())
+                .collect()
+        }
+
+        /// Sets whether the link of edge `gw/e1` is connected, and tells the loop.
+        fn set_connected(&self, connected: bool) {
+            self.facts.lock().unwrap().edges.insert(
+                ObjRef::new("gw", "e1"),
+                EdgeState {
+                    connected,
+                    ..Default::default()
+                },
+            );
+            self.events.send(EngineEvent::Changed).unwrap();
+        }
+
         /// The time between consecutive writes, in milliseconds.
         fn gaps_ms(&self) -> Vec<u128> {
             let times = self.times.lock().unwrap();
@@ -432,6 +475,95 @@ mod tests {
         }
         sleep(Duration::from_secs(1)).await;
         assert_eq!((rig.applies(), rig.writes()), (2, 2));
+        rig.stop().await.unwrap();
+    }
+
+    /// Gateway `gw/public` with one listener, served by the accepted edge `gw/e1` at
+    /// 203.0.113.7, whose link starts connected.
+    fn rig_with_a_gateway(customize: impl FnOnce(&mut ControllerOptions)) -> Rig {
+        use crate::model::fixtures::{GatewayExt, class, gateway};
+        let snapshot = Snapshot {
+            gateway_classes: vec![class("ours")],
+            gateways: vec![gateway("gw", "public").listener("web", 80, "HTTP")],
+            edges: vec![edge("gw", "e1", 7)],
+            ..Snapshot::default()
+        };
+        let rig = Rig::start_from(snapshot, &[], customize);
+        rig.facts.lock().unwrap().edges.insert(
+            ObjRef::new("gw", "e1"),
+            EdgeState {
+                connected: true,
+                ..Default::default()
+            },
+        );
+        rig
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_that_ends_triggers_a_pass() {
+        let rig = rig_with_a_gateway(|_| {});
+        rig.synced().await;
+        assert_eq!(rig.addresses(0), ["203.0.113.7"]);
+
+        // The link drops: the next pass still lists the address.
+        rig.set_connected(false);
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(rig.writes(), 2);
+        assert_eq!(rig.addresses(1), ["203.0.113.7"]);
+
+        // Nothing else happens. When the grace ends, one more pass withdraws it.
+        sleep(DEFAULT_ADDRESS_GRACE - Duration::from_secs(2)).await;
+        assert_eq!(rig.writes(), 2);
+        sleep(Duration::from_secs(3)).await;
+        assert_eq!(rig.writes(), 3);
+        assert!(rig.addresses(2).is_empty(), "{:?}", rig.addresses(2));
+        let since_the_drop = rig.gaps_ms()[1];
+        let grace = DEFAULT_ADDRESS_GRACE.as_millis();
+        assert!(
+            (grace..grace + 500).contains(&since_the_drop),
+            "{since_the_drop} ms"
+        );
+
+        // And no pass after that.
+        sleep(DEFAULT_ADDRESS_GRACE * 10).await;
+        assert_eq!(rig.writes(), 3);
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_within_the_grace_cancels_the_withdrawal() {
+        let rig = rig_with_a_gateway(|o| o.address_grace = Duration::from_secs(10));
+        rig.synced().await;
+        rig.set_connected(false);
+        sleep(Duration::from_secs(5)).await;
+        rig.set_connected(true);
+        sleep(Duration::from_secs(60)).await;
+        // The drop, the reconnect, and nothing when the cancelled grace would have ended.
+        assert_eq!(rig.writes(), 3);
+        for n in 0..3 {
+            assert_eq!(rig.addresses(n), ["203.0.113.7"], "write {n}");
+        }
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_pass_is_scheduled_without_a_held_edge() {
+        let rig = rig_with_a_gateway(|_| {});
+        rig.synced().await;
+        sleep(DEFAULT_ADDRESS_GRACE * 20).await;
+        assert_eq!((rig.applies(), rig.writes()), (1, 1));
+        rig.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_edge_that_never_connected_is_not_listed() {
+        let rig = rig_with_a_gateway(|_| {});
+        rig.facts.lock().unwrap().edges.clear();
+        rig.synced().await;
+        assert!(rig.addresses(0).is_empty(), "{:?}", rig.addresses(0));
+        rig.set_connected(true);
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(rig.addresses(1), ["203.0.113.7"]);
         rig.stop().await.unwrap();
     }
 

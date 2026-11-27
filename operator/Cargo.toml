@@ -16,6 +16,7 @@ fastrand.workspace = true
 futures.workspace = true
 gateway-api.workspace = true
 hex.workspace = true
+humantime.workspace = true
 iroh.workspace = true
 iroh-gateway-proto = { path = "../proto" }
 k8s-openapi.workspace = true

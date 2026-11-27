@@ -351,6 +351,37 @@ fn run_refuses_an_empty_gateway_namespace_list() {
 }
 
 #[test]
+fn run_refuses_a_bad_address_grace() {
+    for bad in ["soon", "-5s", ""] {
+        let grace = format!("--address-grace={bad}");
+        let out = run_without_cluster(&["--namespace", "ns", &grace]);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("invalid value '{bad}' for '--address-grace")),
+            "stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Kubernetes configuration"),
+            "stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn run_takes_an_address_grace() {
+    // Accepted, zero included: the run gets as far as looking for a cluster.
+    for grace in ["5s", "0s", "2m"] {
+        let out = run_without_cluster(&["--namespace", "ns", "--address-grace", grace]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no Kubernetes configuration"),
+            "stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn run_needs_a_namespace() {
     let out = run_without_cluster(&[]);
     assert!(!out.status.success());

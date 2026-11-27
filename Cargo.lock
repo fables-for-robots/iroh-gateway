@@ -1889,6 +1889,7 @@ dependencies = [
  "futures",
  "gateway-api",
  "hex",
+ "humantime",
  "iroh",
  "iroh-gateway-edge",
  "iroh-gateway-proto",

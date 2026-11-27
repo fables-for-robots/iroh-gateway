@@ -233,6 +233,14 @@ step_switches() {
   expect_arg "$f" --relay=n0
   ok "relay=n0 puts --relay=n0 on the container"
 
+  expect_arg "$f" --address-grace=30s
+  ok "the default addressGrace puts --address-grace=30s on the container"
+
+  local a="$tmp/grace.yaml"
+  render iroh-gateway "$a" --namespace "$ns" --set addressGrace=5s
+  expect_arg "$a" --address-grace=5s
+  ok "addressGrace=5s puts --address-grace=5s on the container"
+
   local b="$tmp/bind.yaml"
   render iroh-gateway "$b" --namespace "$ns" --set 'metrics.bindAddress=[::]'
   expect_arg "$b" '--metrics-listen=[::]:8080'
