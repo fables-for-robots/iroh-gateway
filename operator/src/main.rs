@@ -99,7 +99,7 @@ struct RunArgs {
     #[arg(long, env = "IROH_GATEWAY_METRICS_LISTEN", value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
     /// How long a Gateway keeps listing the addresses of an edge whose connection has dropped,
-    /// for example `30s`; `0s` withdraws them at once.
+    /// for example `30s`; `0s` withdraws them at once, also at every start of the operator.
     #[arg(
         long,
         env = "IROH_GATEWAY_ADDRESS_GRACE",

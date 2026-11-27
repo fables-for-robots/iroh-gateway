@@ -14,10 +14,21 @@ use tracing::info;
 use super::Facts;
 use crate::model::{GatewayAddress, Model, ObjRef, Snapshot};
 
+/// What makes an `Edge` object the same edge from one pass to the next: the Gateway it serves,
+/// the machine it names and the addresses it publishes. An `Edge` edited in one of these is,
+/// for the listing, an edge never seen before.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Identity {
+    pub gateway: Option<ObjRef>,
+    pub endpoint_id: Option<iroh::EndpointId>,
+    pub public_addresses: Vec<GatewayAddress>,
+}
+
 /// One accepted edge bound to a Gateway, as a pass sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeView {
     pub key: ObjRef,
+    pub identity: Identity,
     /// The edge's link is connected.
     pub connected: bool,
     /// The Gateway's status, as last read, lists one of the edge's public addresses.
@@ -54,6 +65,11 @@ pub fn views(model: &Model, facts: &Facts, snapshot: &Snapshot) -> Vec<EdgeView>
         {
             views.push(EdgeView {
                 key: edge.key.clone(),
+                identity: Identity {
+                    gateway: edge.gateway.clone(),
+                    endpoint_id: edge.endpoint_id,
+                    public_addresses: edge.public_addresses.clone(),
+                },
                 connected: facts.edges.get(&edge.key).is_some_and(|s| s.connected),
                 in_status: edge.public_addresses.iter().any(|a| in_status.contains(a)),
             });
@@ -66,7 +82,7 @@ pub fn views(model: &Model, facts: &Facts, snapshot: &Snapshot) -> Vec<EdgeView>
 #[derive(Debug)]
 pub struct Listing {
     grace: Duration,
-    edges: BTreeMap<ObjRef, Seen>,
+    edges: BTreeMap<ObjRef, (Identity, Seen)>,
 }
 
 impl Listing {
@@ -82,12 +98,18 @@ impl Listing {
     /// A connected edge is listed. An edge that was listed and is no longer connected stays
     /// listed for the grace, counted from the first pass that saw it disconnected. An edge that
     /// is not connected when first seen is held for one grace if `in_status`, and is not listed
-    /// otherwise. Edges absent from `edges` are forgotten.
+    /// otherwise. An edge whose [`Identity`] changed counts as first seen. Edges absent from
+    /// `edges` are forgotten.
     pub fn update(&mut self, now: Instant, edges: &[EdgeView]) -> BTreeSet<ObjRef> {
         let mut seen = BTreeMap::new();
         let mut listed = BTreeSet::new();
         for edge in edges {
-            let before = self.edges.get(&edge.key).copied();
+            // An `Edge` edited since the last pass is an edge never seen.
+            let before = self
+                .edges
+                .get(&edge.key)
+                .filter(|(identity, _)| *identity == edge.identity)
+                .map(|(_, seen)| *seen);
             let after = self.step(now, edge, before);
             if Some(after) != before {
                 log_change(&edge.key, before, after, self.grace);
@@ -95,7 +117,7 @@ impl Listing {
             if after != Seen::Withdrawn {
                 listed.insert(edge.key.clone());
             }
-            seen.insert(edge.key.clone(), after);
+            seen.insert(edge.key.clone(), (edge.identity.clone(), after));
         }
         self.edges = seen;
         listed
@@ -124,7 +146,7 @@ impl Listing {
     pub fn next_expiry(&self) -> Option<Instant> {
         self.edges
             .values()
-            .filter_map(|seen| match seen {
+            .filter_map(|(_, seen)| match seen {
                 Seen::Held { until } => Some(*until),
                 Seen::Listed | Seen::Withdrawn => None,
             })
@@ -161,9 +183,65 @@ mod tests {
     fn view(name: &str, connected: bool, in_status: bool) -> EdgeView {
         EdgeView {
             key: key(name),
+            identity: Identity::default(),
             connected,
             in_status,
         }
+    }
+
+    /// `view` of an `Edge` edited to publish `address`.
+    fn edited(name: &str, address: &str, connected: bool, in_status: bool) -> EdgeView {
+        EdgeView {
+            identity: Identity {
+                public_addresses: vec![GatewayAddress::parse(address).unwrap()],
+                ..Identity::default()
+            },
+            ..view(name, connected, in_status)
+        }
+    }
+
+    #[test]
+    fn a_held_edge_that_is_edited_is_seen_anew() {
+        let t0 = Instant::now();
+        let mut listing = Listing::new(GRACE);
+        listing.update(t0, &[up("a")]);
+        assert_eq!(listing.update(t0 + secs(1), &[down("a")]), set(&["a"]));
+        // Edited to another machine, whose address the status does not list: not held.
+        assert_eq!(
+            listing.update(t0 + secs(2), &[edited("a", "203.0.113.50", false, false)]),
+            set(&[])
+        );
+        assert_eq!(listing.next_expiry(), None);
+        // Listed once that machine connects.
+        assert_eq!(
+            listing.update(t0 + secs(3), &[edited("a", "203.0.113.50", true, false)]),
+            set(&["a"])
+        );
+    }
+
+    #[test]
+    fn an_edited_edge_whose_address_the_status_lists_gets_a_grace_of_its_own() {
+        // The machine was replaced behind the same address.
+        let t0 = Instant::now();
+        let mut listing = Listing::new(GRACE);
+        listing.update(t0, &[up("a")]);
+        listing.update(t0 + secs(1), &[down("a")]);
+        assert_eq!(
+            listing.update(t0 + secs(20), &[edited("a", "203.0.113.7", false, true)]),
+            set(&["a"])
+        );
+        assert_eq!(listing.next_expiry(), Some(t0 + secs(20) + GRACE));
+    }
+
+    #[test]
+    fn a_connected_edge_that_is_edited_stays_listed() {
+        let t0 = Instant::now();
+        let mut listing = Listing::new(GRACE);
+        listing.update(t0, &[up("a")]);
+        assert_eq!(
+            listing.update(t0 + secs(1), &[edited("a", "203.0.113.50", true, false)]),
+            set(&["a"])
+        );
     }
 
     fn up(name: &str) -> EdgeView {
@@ -236,15 +314,32 @@ mod tests {
         };
         let mut got = views(&model, &facts, &snapshot);
         got.sort_by(|x, y| x.key.cmp(&y.key));
+        let seen: Vec<(&str, bool, bool)> = got
+            .iter()
+            .map(|v| (v.key.name.as_str(), v.connected, v.in_status))
+            .collect();
         assert_eq!(
-            got,
+            seen,
             [
-                view("a", false, true),
-                view("b", true, false),
-                view("c", false, true),
-                view("d", false, false),
+                ("a", false, true),
+                ("b", true, false),
+                ("c", false, true),
+                ("d", false, false),
             ]
         );
+        // The identity is the Gateway, the machine and the published addresses.
+        let id = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]).public();
+        let address = |a: &str| GatewayAddress::parse(a).unwrap();
+        assert_eq!(
+            got[2].identity,
+            Identity {
+                gateway: Some(ObjRef::new("gw", "public")),
+                endpoint_id: Some(id(3)),
+                public_addresses: vec![address("198.51.100.1"), address("edge-c.example.com")],
+            }
+        );
+        assert_eq!(got[3].identity.gateway, Some(ObjRef::new("gw", "other")));
+        assert_eq!(got[3].identity.endpoint_id, Some(id(4)));
     }
 
     fn secs(n: u64) -> Duration {

@@ -466,6 +466,10 @@ status:
     edges had the grace to reconnect, a dead edge's address does not come
     back with a restart, and a new `Edge` is listed only once it connects.
     The Gateway's status is the only remembered state.
+  - An `Edge` edited to serve another Gateway, to name another
+    `endpointId` or to publish other addresses is, for this rule, an edge
+    first seen: the address of a machine that has never connected is not
+    listed because the `Edge` object was listed before the edit.
   - An address shared by several edges is listed while any of them is
     listed. The limit of 16 applies to the listed addresses.
 - A Gateway with no `Edge` is `Programmed=False`, reason

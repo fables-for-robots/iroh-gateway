@@ -853,10 +853,10 @@ The two sides pin each other's key, so enrolling an edge is an exchange of two i
 Any number of `Edge` objects may name the same `Gateway`. Every one of their edges opens all of the Gateway's ports, and a visitor who reaches any of them reaches the same backends. What makes this failover is the Gateway's list of addresses, which external-dns (or you) turns into DNS records:
 
 - An edge's addresses are listed while its edge is connected: `Connected` is `True` on the `Edge`.
-- An edge that disconnects keeps its addresses for the address grace: `--address-grace` on the operator, `addressGrace` in the chart, 30 s by default. A tunnel that drops and comes back within it changes nothing. `0s` withdraws at once.
+- An edge that disconnects keeps its addresses for the address grace: `--address-grace` on the operator, `addressGrace` in the chart, 30 s by default. A tunnel that drops and comes back within it changes nothing. `0s` withdraws at once, and holds nothing when the operator restarts either: every address then leaves until the edges have reconnected.
 - After the grace its addresses are withdrawn, and listed again when it reconnects. This holds for the last edge too: a Gateway with no connected edge lists no address.
-- An `Edge` that has never connected is not listed.
-- When the operator restarts, the addresses already in the Gateway's status stay for one grace, so a restart withdraws nothing before the edges have had the time to reconnect, and an address withdrawn earlier does not come back.
+- An `Edge` that has never connected is not listed. An `Edge` edited to serve another Gateway, to name another `endpointId` or to publish other addresses counts as a new one: it is listed once its edge connects, or held for one grace if the Gateway already lists one of its addresses.
+- When the operator restarts, the addresses already in the Gateway's status stay for one grace, so a restart withdraws nothing before the edges have had the time to reconnect, and an address withdrawn earlier does not come back (unless another listed edge publishes one of the same edge's addresses: then its other addresses return for one grace).
 - An address that several edges share (a load balancer's name in `publicAddresses`, say) stays while one of them is listed.
 
 The conditions do not wait for the grace: the `Edge` shows `Connected` `False` as soon as its link is down, and a Gateway with no ready edge shows `Programmed` `False` with the reason for each edge.
@@ -865,7 +865,7 @@ How long a failover takes: the operator notices an edge that died without a word
 
 With a single edge, an outage longer than the grace empties the Gateway's addresses. What external-dns then does depends on its `--policy`: with `sync` it deletes the record, and resolvers may remember that the name does not exist for as long as the zone's negative-caching time; with `upsert-only`, as in the [walkthrough](#7-dns), it never deletes a record, so the last address stays in DNS, while a record with several targets is still updated when one of them goes. A longer `addressGrace` rides out longer outages.
 
-Whether an edge is listed follows only its tunnel: an edge whose tunnel is up while visitors cannot reach it (a provider's firewall, say) stays listed.
+Whether an edge is listed follows only its tunnel: an edge whose tunnel is up while visitors cannot reach it (a provider's firewall, say) stays listed, and so does one that cannot open one of the Gateway's ports, which the `Edge`'s status shows.
 
 What the tests run: with a real API server and two edges in one process, an edge that never connected is not listed, a stopped edge's address leaves after the grace while the Gateway stays `Programmed`, the last edge's leaves too, and an operator restart keeps a listed address and does not bring a withdrawn one back. `scripts/e2e-kind.sh` runs two edges as pods, stops one, checks that its address leaves the Gateway and that HTTPS through the other still answers, and that the address returns with the edge. No test runs external-dns or DNS; what is said about them here is from the documentation and the source of external-dns v0.24.0.
 
@@ -1120,7 +1120,7 @@ What to know:
 | `--metrics-listen <addr>` | `IROH_GATEWAY_METRICS_LISTEN` | not served; `/metrics`, `/healthz` and `/readyz` (see [Metrics and health](#metrics-and-health)) |
 | `--address-grace <duration>` | `IROH_GATEWAY_ADDRESS_GRACE` | `30s`; how long a Gateway keeps listing the addresses of an edge whose connection has dropped (see [Several edges and failover](#several-edges-and-failover)) |
 
-`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. The HAProxy that `--haproxy-bin` names must be built with its Prometheus exporter, as the official image's and nixpkgs' are, because every configuration the operator renders uses it. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit. The chart sets `--gateway-namespaces` (when `gatewayNamespaces` is not empty), `--controller-name`, `--identity-secret`, `--relay` and `--metrics-listen`, and `POD_NAMESPACE` from the pod's namespace.
+`--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. The HAProxy that `--haproxy-bin` names must be built with its Prometheus exporter, as the official image's and nixpkgs' are, because every configuration the operator renders uses it. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit. The chart sets `--gateway-namespaces` (when `gatewayNamespaces` is not empty), `--controller-name`, `--identity-secret`, `--relay`, `--address-grace` and `--metrics-listen`, and `POD_NAMESPACE` from the pod's namespace.
 
 ### Status conditions
 

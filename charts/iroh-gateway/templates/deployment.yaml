@@ -53,7 +53,11 @@ spec:
             - {{ printf "--controller-name=%s" .Values.controllerName | quote }}
             - {{ printf "--identity-secret=%s" .Values.identity.secretName | quote }}
             - {{ printf "--relay=%s" .Values.relay | quote }}
-            - {{ printf "--address-grace=%s" .Values.addressGrace | quote }}
+            {{- /* Unset when an upgrade reuses the values of a release from before this value
+                   existed: then the operator's own default applies. */}}
+            {{- if not (kindIs "invalid" .Values.addressGrace) }}
+            - {{ printf "--address-grace=%v" .Values.addressGrace | quote }}
+            {{- end }}
             - {{ printf "--metrics-listen=%s:%v" .Values.metrics.bindAddress .Values.metrics.port | quote }}
           env:
             # --namespace: where the identity Secret lives, and the Gateways when

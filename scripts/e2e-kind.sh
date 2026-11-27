@@ -1018,10 +1018,11 @@ fi
 
 step "failover: a dead edge's address is withdrawn and the other edge keeps serving"
 k scale deployment/edge2 --replicas=0
-# The edge closes its tunnel as it stops, and the chart's addressGrace is 5 s here: the default
-# of 30 s would not be over within this wait.
-if ! retry 24 gateway_lists "edge.$ns.svc"; then
-  echo "expected Gateway public to list only edge.$ns.svc within 24 s of the second edge going, got '$got'" >&2
+# The edge closes its tunnel as it stops, and the chart's addressGrace is 5 s here. Should the
+# close be lost, the operator notices after 20 s without an answer, and 5 s later the address
+# goes. The default grace of 30 s would not be over within this wait.
+if ! retry 28 gateway_lists "edge.$ns.svc"; then
+  echo "expected Gateway public to list only edge.$ns.svc within 28 s of the second edge going, got '$got'" >&2
   exit 1
 fi
 if ! retry 30 curl_prints "hello from web" --cacert /tmp/second.crt "${https[@]}"; then
