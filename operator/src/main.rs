@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
@@ -97,6 +98,17 @@ struct RunArgs {
     /// Address to serve /healthz, /readyz and /metrics on; not served when unset.
     #[arg(long, env = "IROH_GATEWAY_METRICS_LISTEN", value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
+    /// How long a Gateway keeps listing the addresses of an edge whose connection has dropped,
+    /// for example `30s`; `0s` withdraws them at once, also at every start of the operator.
+    #[arg(
+        long,
+        env = "IROH_GATEWAY_ADDRESS_GRACE",
+        value_name = "DURATION",
+        // `controller::DEFAULT_ADDRESS_GRACE`, as text for the help.
+        default_value = "30s",
+        value_parser = humantime::parse_duration
+    )]
+    address_grace: Duration,
 }
 
 #[tokio::main]
@@ -307,6 +319,7 @@ async fn run_controller(args: RunArgs) -> anyhow::Result<()> {
     let mut opts = ControllerOptions::new(settings, &haproxy_dir);
     opts.metrics = metrics;
     opts.ready = ready;
+    opts.address_grace = args.address_grace;
     // A signal that came since the engine started ends the loop at once.
     let ended = run_loop(stores, &mut engine, writer, opts, shutdown).await;
     info!("shutting down");

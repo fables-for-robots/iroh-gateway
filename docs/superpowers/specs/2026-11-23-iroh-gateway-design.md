@@ -58,8 +58,9 @@ with one.
 ### Non-goals (phase 1)
 
 - Creating machines at providers. The owner deploys edges.
-- Multi-edge failover behaviour: health-driven DNS, address debouncing,
-  draining. Several edges may connect, but only one is tested and promised.
+- Draining an edge, and health checks of an edge beyond its tunnel. (Phase
+  1 first shipped without failover between edges; addresses that follow the
+  tunnel were added after step 5, see "Edge enrolment".)
 - More than one operator replica.
 - HTTP/3, `GRPCRoute`, `TLSRoute` (SNI passthrough), `BackendTLSPolicy`,
   `ReferenceGrant`, backendRef-level filters, `URLRewrite`, request
@@ -442,18 +443,39 @@ status:
 - An edge serves exactly one Gateway. A Gateway is served by any number of
   edges, and every edge of a Gateway opens all of that Gateway's ports.
   Edges are never shared, so two Gateways can never fight over a port.
-- `Gateway.status.addresses` lists the public addresses of every `Edge`
-  attached to the Gateway, taken from the `Edge` spec, whether or not the
-  edge is connected right now. An address leaves only when its `Edge` is
-  deleted or re-pointed. This is deliberate: with one edge, withdrawing the
-  address on a tunnel blip would make external-dns delete the record and
-  turn seconds of outage into minutes, with no other edge to send visitors
-  to. It also needs no remembered state, since addresses come from spec. An
-  IP is published as `IPAddress`, a DNS name as `Hostname`.
-- Connectivity shows in conditions, not addresses. A Gateway with no `Edge`
-  is `Programmed=False`, reason `AddressNotAssigned`. A Gateway whose edges
-  are all disconnected or unbound is `Programmed=False` with a reason
-  saying so, and keeps its addresses.
+- `Gateway.status.addresses` lists the public addresses of the edges that
+  are connected, so that DNS follows the tunnels and a second edge gives
+  failover. An IP is published as `IPAddress`, a DNS name as `Hostname`.
+  (Until v0.1.0 the addresses of every accepted `Edge` were listed, connected
+  or not.) The rules:
+  - An edge's addresses are listed while its link is connected: a
+    connection is up and the edge has answered a config on it.
+  - An edge that disconnects keeps its addresses for the address grace
+    (`--address-grace`, default 30 s; `0s` withdraws at once), so a tunnel
+    that reconnects does not make external-dns delete and re-create a
+    record. If it has not reconnected by then, its addresses are withdrawn.
+  - This holds for the last edge too: a Gateway with no connected edge
+    lists no address once the grace has passed. With a single edge an
+    outage longer than the grace therefore removes the DNS record, and
+    resolvers may cache its absence. This was chosen over keeping the last
+    address: an address should mean a working edge.
+  - An edge that is not connected when the operator first sees it (at the
+    operator's start, or a new `Edge`) is treated as just disconnected if
+    its Gateway's status already lists one of its addresses, and as
+    withdrawn otherwise. So an operator restart withdraws nothing before the
+    edges had the grace to reconnect, a dead edge's address does not come
+    back with a restart, and a new `Edge` is listed only once it connects.
+    The Gateway's status is the only remembered state.
+  - An `Edge` edited to serve another Gateway, to name another
+    `endpointId` or to publish other addresses is, for this rule, an edge
+    first seen: the address of a machine that has never connected is not
+    listed because the `Edge` object was listed before the edit.
+  - An address shared by several edges is listed while any of them is
+    listed. The limit of 16 applies to the listed addresses.
+- A Gateway with no `Edge` is `Programmed=False`, reason
+  `AddressNotAssigned`. A Gateway whose edges are all disconnected or
+  unbound is `Programmed=False` with a reason saying so; conditions do not
+  wait for the grace.
 - A listener is `Programmed=True` once HAProxy serves it (or the UDP
   forwarder for UDP) and at least one accepted, connected edge has bound its
   port. This is decided per listener: one port that fails to bind does not
@@ -916,8 +938,9 @@ Each step ends in something that runs. Steps 1 to 5 are built.
 
 ## Phase 2 (not built now, must stay possible)
 
-- Several edges per Gateway with tested failover: addresses leave
-  `Gateway.status` when an edge is unhealthy, with debouncing.
+- Draining an edge before it is taken away, and health checks of an edge
+  beyond its tunnel (a connected edge whose provider drops visitor traffic
+  stays listed).
 - Several operator replicas.
 - `ReferenceGrant`, `TLSRoute`, per-pod balancing, opt-in PROXY protocol
   towards TCP backends.

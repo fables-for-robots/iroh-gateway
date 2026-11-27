@@ -901,7 +901,7 @@ mod tests {
             haproxy: Ok(()),
             edges: BTreeMap::new(),
         };
-        let desired = compute(&model, &facts);
+        let desired = compute(&model, &facts, &Default::default());
         let targets: Vec<Target> = patches(&desired, &snapshot, CONTROLLER, &at(100))
             .into_iter()
             .map(|p| p.target)
@@ -952,7 +952,11 @@ mod tests {
             haproxy: Ok(()),
             edges: BTreeMap::new(),
         };
-        let desired = compute(&build(&snapshot, &settings(&["gw"])), &facts);
+        let desired = compute(
+            &build(&snapshot, &settings(&["gw"])),
+            &facts,
+            &Default::default(),
+        );
         (snapshot, desired)
     }
 

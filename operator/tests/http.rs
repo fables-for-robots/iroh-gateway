@@ -327,8 +327,6 @@ fn gateway(ports: Vec<HttpPort>, listeners: Vec<ListenerModel>) -> GatewayModel 
         accepted: Ok(()),
         listeners,
         edges: Vec::new(),
-        addresses: Vec::new(),
-        addresses_dropped: 0,
         http_ports: ports,
     }
 }

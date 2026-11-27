@@ -126,8 +126,6 @@ impl World {
                         .filter(|e| e.gateway == name)
                         .map(|e| key(e.name))
                         .collect(),
-                    addresses: vec![],
-                    addresses_dropped: 0,
                     http_ports: Vec::new(),
                 })
                 .collect(),

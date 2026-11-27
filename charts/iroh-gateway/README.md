@@ -68,6 +68,7 @@ kubectl apply --server-side -f iroh-gateway/crds/edges.yaml
 | `gatewayClass.name` | `iroh-gateway` | The `GatewayClass`'s name |
 | `gatewayNamespaces` | `[]` | `--gateway-namespaces`, the namespaces whose `Gateway` and `Edge` objects are served; `[]` is the release namespace. Each gets a Role to list and watch its Secrets, which lets the operator read every Secret there. The chart creates no namespace: they must exist |
 | `relay` | `disabled` | `--relay`: `disabled`, `n0` or a relay URL; must match the edges |
+| `addressGrace` | `30s` | `--address-grace`: how long a Gateway keeps listing the addresses of an edge whose connection has dropped, before it withdraws them; `0s` withdraws at once |
 | `identity.secretName` | `iroh-gateway-identity` | `--identity-secret`, in the release namespace; created by the operator on first start, and the only Secret its Role may `get`. Back it up: every edge pins the key in it |
 | `metrics.port` | `8080` | `--metrics-listen=<bindAddress>:<port>`: `/metrics`, `/healthz` and `/readyz`, where the probes go |
 | `metrics.bindAddress` | `0.0.0.0` | The address of `--metrics-listen`; `0.0.0.0` is IPv4 only, `[::]` an IPv6 or dual-stack listener, for a cluster whose pod IPs are IPv6 |

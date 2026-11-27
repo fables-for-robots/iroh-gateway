@@ -64,6 +64,11 @@ expect_arg() {
   args "$1" | grep -qxF -- "$2" || fail "expected the argument $2 in $1" "$(args "$1")"
 }
 
+# Fails if one of the operator's arguments in file $1 starts with $2.
+expect_no_arg() {
+  ! args "$1" | grep -qF -- "$2" || fail "expected no argument $2 in $1" "$(args "$1")"
+}
+
 # "kind namespace/name" of every Role and RoleBinding in file $1, sorted.
 roles() {
   q "$1" 'select(.kind == "Role" or .kind == "RoleBinding") | .kind + " " + .metadata.namespace + "/" + .metadata.name' | sort
@@ -232,6 +237,26 @@ step_switches() {
   render iroh-gateway "$f" --namespace "$ns" --set relay=n0
   expect_arg "$f" --relay=n0
   ok "relay=n0 puts --relay=n0 on the container"
+
+  expect_arg "$f" --address-grace=30s
+  ok "the default addressGrace puts --address-grace=30s on the container"
+
+  local a="$tmp/grace.yaml"
+  render iroh-gateway "$a" --namespace "$ns" --set addressGrace=5s
+  expect_arg "$a" --address-grace=5s
+  ok "addressGrace=5s puts --address-grace=5s on the container"
+
+  # `helm upgrade --reuse-values` from a release whose values have no addressGrace: no flag,
+  # so the operator's own default applies.
+  local u="$tmp/nograce.yaml"
+  render iroh-gateway "$u" --namespace "$ns" --set addressGrace=null
+  expect_no_arg "$u" --address-grace
+  ok "no addressGrace (values reused from an older release) puts no --address-grace on the container"
+
+  local n="$tmp/zerograce.yaml"
+  render iroh-gateway "$n" --namespace "$ns" --set addressGrace=0
+  expect_arg "$n" --address-grace=0
+  ok "a number as addressGrace is passed as written"
 
   local b="$tmp/bind.yaml"
   render iroh-gateway "$b" --namespace "$ns" --set 'metrics.bindAddress=[::]'

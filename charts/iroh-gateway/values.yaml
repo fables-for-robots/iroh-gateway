@@ -28,6 +28,13 @@ gatewayNamespaces: []
 # --relay: disabled | n0 | https://… (a relay URL). Must match the edges' --relay.
 relay: disabled
 
+# --address-grace: how long a Gateway keeps listing the addresses of an edge whose connection
+# has dropped, so that a reconnecting edge does not change the Gateway's addresses (and, with
+# external-dns, its DNS records). After it, the addresses are withdrawn, the last ones too. A
+# duration such as 30s or 2m; 0s withdraws at once, also at every start of the operator, until
+# the edges have reconnected.
+addressGrace: 30s
+
 identity:
   # --identity-secret: the Secret in the release namespace that holds the operator's key. The
   # operator creates it on first start and reuses it afterwards; the Role may get only this

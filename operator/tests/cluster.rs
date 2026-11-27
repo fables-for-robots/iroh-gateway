@@ -23,7 +23,7 @@ use gateway_api::udproutes::v1::UdpRoute;
 use iroh::SecretKey;
 use iroh_gateway_edge::{Edge as EdgeProcess, EdgeHandle};
 use iroh_gateway_operator::cluster::{StatusSink, StatusWriter, Stores, identity};
-use iroh_gateway_operator::controller::{ControllerOptions, run_loop};
+use iroh_gateway_operator::controller::{ControllerOptions, DEFAULT_ADDRESS_GRACE, run_loop};
 use iroh_gateway_operator::crd::Edge;
 use iroh_gateway_operator::engine::{Engine, EngineOptions};
 use iroh_gateway_operator::haproxy::SupervisorOptions;
@@ -70,6 +70,11 @@ struct Operator {
 
 impl Operator {
     async fn start(client: &Client, namespaces: &[&str]) -> Self {
+        Self::start_with_grace(client, namespaces, DEFAULT_ADDRESS_GRACE).await
+    }
+
+    /// The operator with `grace` as its address grace.
+    async fn start_with_grace(client: &Client, namespaces: &[&str], grace: Duration) -> Self {
         let key = identity::load_or_create(client, IDENTITY_NS, IDENTITY)
             .await
             .unwrap();
@@ -92,7 +97,8 @@ impl Operator {
         .unwrap();
         let stores = Stores::start(client.clone(), &settings.gateway_namespaces);
         let writer = StatusWriter::new(client.clone(), CONTROLLER.into());
-        let opts = ControllerOptions::new(settings, dir.path());
+        let mut opts = ControllerOptions::new(settings, dir.path());
+        opts.address_grace = grace;
         let ready = opts.ready.clone();
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -732,22 +738,65 @@ async fn gateway_addresses(client: &Client) -> Result<Vec<(String, String)>, Str
         .collect())
 }
 
+/// An Edge object `name` in `NS` for the running `edge`, with these `publicAddresses`.
+async fn edge_object_at(client: &Client, name: &str, edge: &EdgeHandle, public: &[&str]) {
+    create::<Edge>(
+        &api(client, NS),
+        json!({
+            "apiVersion": "gateway.fables-for-robots.ch/v1alpha1",
+            "kind": "Edge",
+            "metadata": { "name": name, "namespace": NS },
+            "spec": {
+                "endpointId": edge.endpoint_id().to_string(),
+                "address": edge.iroh_addr().to_string(),
+                "publicAddresses": public,
+                "gatewayRef": { "name": "public" },
+            },
+        }),
+    )
+    .await;
+}
+
+/// Waits until the Gateway lists exactly these IP addresses.
+async fn lists(client: &Client, want: &[&str]) {
+    let want: Vec<(String, String)> = want
+        .iter()
+        .map(|a| ("IPAddress".to_owned(), (*a).to_owned()))
+        .collect();
+    eventually(&format!("the Gateway listing {want:?}"), || async {
+        match gateway_addresses(client).await? {
+            a if a == want => Ok(()),
+            a => Err(format!("addresses {a:?}")),
+        }
+    })
+    .await;
+}
+
+/// The Edge's condition `type_`, once it has one.
+async fn edge_condition(client: &Client, name: &str, type_: &str) -> Result<Condition, String> {
+    let edge: Edge = get(client, NS, name).await;
+    let conditions = edge.status.map(|s| s.conditions).unwrap_or_default();
+    condition(&conditions, type_)
+        .cloned()
+        .ok_or_else(|| format!("no {type_} in {conditions:?}"))
+}
+
+async fn gateway_programmed(client: &Client) -> String {
+    let gw: Gateway = get(client, NS, "public").await;
+    let conditions = gw.status.and_then(|s| s.conditions).unwrap_or_default();
+    condition(&conditions, "Programmed").unwrap().status.clone()
+}
+
 #[tokio::test]
 #[ignore = "needs KUBEBUILDER_ASSETS"]
 async fn mixed_case_and_trailing_dot_addresses_do_not_break_status() {
     let env = Envtest::start().await;
     let operator = Operator::start(&env.client, &[NS]).await;
+    let edge = operator.edge().await;
     env.namespace(NS).await;
     class(&env.client).await;
     gateway(&env.client, NS, free_tcp_port()).await;
-    // Nothing listens there: the link only fails to connect, on loopback.
-    let nowhere = free_tcp_port();
-    edge_with(
-        &env.client,
-        "e1",
-        json!({ "address": format!("Edge.Example.COM.:{nowhere}") }),
-    )
-    .await;
+    edge_object_at(&env.client, "e1", &edge, &["Edge.Example.COM."]).await;
     let addresses = eventually("the Gateway's addresses", || async {
         match gateway_addresses(&env.client).await? {
             a if a.is_empty() => Err("no addresses yet".to_owned()),
@@ -760,29 +809,21 @@ async fn mixed_case_and_trailing_dot_addresses_do_not_break_status() {
         [("Hostname".to_owned(), "edge.example.com".to_owned())]
     );
     operator.stop().await;
+    edge.shutdown().await;
 }
 
 #[tokio::test]
 #[ignore = "needs KUBEBUILDER_ASSETS"]
-async fn seventeen_edges_give_sixteen_addresses() {
+async fn seventeen_addresses_give_sixteen() {
     let env = Envtest::start().await;
     let operator = Operator::start(&env.client, &[NS]).await;
+    let edge = operator.edge().await;
     env.namespace(NS).await;
     class(&env.client).await;
     gateway(&env.client, NS, free_tcp_port()).await;
-    let nowhere = free_tcp_port();
-    for n in 1..=17 {
-        // Published only, never dialled; the links dial loopback, where nothing answers.
-        edge_with(
-            &env.client,
-            &format!("e{n:02}"),
-            json!({
-                "address": format!("127.0.0.1:{nowhere}"),
-                "publicAddresses": [format!("198.51.100.{n}")],
-            }),
-        )
-        .await;
-    }
+    let public: Vec<String> = (1..=17).map(|n| format!("198.51.100.{n}")).collect();
+    let public: Vec<&str> = public.iter().map(String::as_str).collect();
+    edge_object_at(&env.client, "e1", &edge, &public).await;
     let addresses = eventually("16 addresses", || async {
         match gateway_addresses(&env.client).await? {
             a if a.len() == 16 => Ok(a),
@@ -793,16 +834,155 @@ async fn seventeen_edges_give_sixteen_addresses() {
     assert!(addresses.iter().all(|(t, _)| t == "IPAddress"));
     // The first 16 after sorting: "198.51.100.9" sorts last.
     assert!(!addresses.iter().any(|(_, v)| v == "198.51.100.9"));
+    // The note is in `Programmed` when that is True, otherwise in `Accepted`.
     let gw: Gateway = get(&env.client, NS, "public").await;
     let conditions = gw.status.unwrap().conditions.unwrap();
-    let accepted = condition(&conditions, "Accepted").unwrap();
-    assert!(
-        accepted
-            .message
-            .contains("1 of the edges' addresses is not listed"),
-        "{accepted:?}"
-    );
+    let notes: Vec<&Condition> = ["Accepted", "Programmed"]
+        .iter()
+        .filter_map(|t| condition(&conditions, t))
+        .filter(|c| {
+            c.message
+                .contains("1 of the edges' addresses is not listed")
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{conditions:?}");
     operator.stop().await;
+    edge.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn an_edge_that_never_connected_gives_no_address() {
+    let env = Envtest::start().await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    env.namespace(NS).await;
+    class(&env.client).await;
+    gateway(&env.client, NS, free_tcp_port()).await;
+    // Nothing listens there: the link only fails to connect, on loopback.
+    let nowhere = free_tcp_port();
+    edge_with(
+        &env.client,
+        "e1",
+        json!({ "address": format!("127.0.0.1:{nowhere}"), "publicAddresses": ["198.51.100.1"] }),
+    )
+    .await;
+    // The operator has seen the Edge, and has written the Gateway's status.
+    eventually("the Edge not connected", || async {
+        match edge_condition(&env.client, "e1", "Connected").await? {
+            c if c.status == "False" => Ok(()),
+            c => Err(format!("{c:?}")),
+        }
+    })
+    .await;
+    let addresses = eventually("the Gateway's status", || async {
+        gateway_addresses(&env.client).await
+    })
+    .await;
+    assert_eq!(addresses, []);
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(gateway_addresses(&env.client).await.unwrap(), []);
+    assert_eq!(gateway_programmed(&env.client).await, "False");
+    operator.stop().await;
+}
+
+/// The address grace of the tests that wait for it to end.
+const SHORT_GRACE: Duration = Duration::from_secs(2);
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn a_dead_edge_loses_its_address_and_the_other_keeps_serving() {
+    let env = Envtest::start().await;
+    let operator = Operator::start_with_grace(&env.client, &[NS], SHORT_GRACE).await;
+    let (a, b) = (operator.edge().await, operator.edge().await);
+    env.namespace(NS).await;
+    class(&env.client).await;
+    // No route: both edges run on this host and could not both open the Gateway's port.
+    gateway(&env.client, NS, free_tcp_port()).await;
+    edge_object_at(&env.client, "a", &a, &["198.51.100.1"]).await;
+    edge_object_at(&env.client, "b", &b, &["198.51.100.2"]).await;
+    lists(&env.client, &["198.51.100.1", "198.51.100.2"]).await;
+    assert_eq!(gateway_programmed(&env.client).await, "True");
+
+    let died = Instant::now();
+    b.shutdown().await;
+    lists(&env.client, &["198.51.100.1"]).await;
+    // Not before the grace was over.
+    assert!(died.elapsed() >= SHORT_GRACE, "{:?}", died.elapsed());
+    assert_eq!(gateway_programmed(&env.client).await, "True");
+    let connected = edge_condition(&env.client, "b", "Connected").await.unwrap();
+    assert_eq!(connected.status, "False");
+
+    operator.stop().await;
+    a.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn the_last_edge_gone_leaves_no_address() {
+    let env = Envtest::start().await;
+    let operator = Operator::start_with_grace(&env.client, &[NS], SHORT_GRACE).await;
+    let edge = operator.edge().await;
+    env.namespace(NS).await;
+    class(&env.client).await;
+    gateway(&env.client, NS, free_tcp_port()).await;
+    edge_object_at(&env.client, "e1", &edge, &["198.51.100.1"]).await;
+    lists(&env.client, &["198.51.100.1"]).await;
+
+    edge.shutdown().await;
+    lists(&env.client, &[]).await;
+    assert_eq!(gateway_programmed(&env.client).await, "False");
+    operator.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn a_restart_withdraws_nothing_within_the_grace() {
+    let env = Envtest::start().await;
+    let first = Operator::start(&env.client, &[NS]).await;
+    let edge = first.edge().await;
+    env.namespace(NS).await;
+    class(&env.client).await;
+    gateway(&env.client, NS, free_tcp_port()).await;
+    edge_object_at(&env.client, "e1", &edge, &["198.51.100.1"]).await;
+    lists(&env.client, &["198.51.100.1"]).await;
+
+    // The operator goes, and the edge with it, so the next operator cannot reconnect: what it
+    // lists, it lists from the Gateway's status.
+    first.stop().await;
+    edge.shutdown().await;
+    let second = Operator::start(&env.client, &[NS]).await;
+    eventually("the second operator's word on the Edge", || async {
+        match edge_condition(&env.client, "e1", "Connected").await? {
+            c if c.status == "False" => Ok(()),
+            c => Err(format!("{c:?}")),
+        }
+    })
+    .await;
+    // Whichever of the two statuses that pass wrote first, it has written both by now.
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        gateway_addresses(&env.client).await.unwrap(),
+        [("IPAddress".to_owned(), "198.51.100.1".to_owned())]
+    );
+    second.stop().await;
+
+    // A third one with a short grace withdraws it once that is over, and a fourth, which finds
+    // no address in the status, does not bring it back.
+    let third = Operator::start_with_grace(&env.client, &[NS], SHORT_GRACE).await;
+    lists(&env.client, &[]).await;
+    third.stop().await;
+    let fourth = Operator::start(&env.client, &[NS]).await;
+    eventually("the fourth operator ready", || async {
+        fourth
+            .ready
+            .load(Ordering::SeqCst)
+            .then_some(())
+            .ok_or_else(|| "not ready".to_owned())
+    })
+    .await;
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(gateway_addresses(&env.client).await.unwrap(), []);
+    fourth.stop().await;
 }
 
 /// Gateway `public` in `NS` of class `iroh` with `listeners`.
@@ -1734,7 +1914,7 @@ async fn write(writer: &mut StatusWriter, snapshot: &Snapshot) -> bool {
         haproxy: Ok(()),
         edges: Default::default(),
     };
-    let desired = compute(&build(snapshot, &settings()), &facts);
+    let desired = compute(&build(snapshot, &settings()), &facts, &Default::default());
     writer.write(&desired, snapshot).await
 }
 

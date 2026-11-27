@@ -133,6 +133,14 @@ udproute_accepted() {
     [ "$got" = True ]
 }
 
+# True when the addresses in the status of Gateway public are exactly $1, space separated and in
+# the order the operator lists them (sorted).
+gateway_lists() {
+  got="$(k get gateways.gateway.networking.k8s.io public \
+    -o jsonpath='{.status.addresses[*].value}' 2>&1)" &&
+    [ "$got" = "$1" ]
+}
+
 # The cluster IP of the edge's Service, where the UDP probes send to; set by the UDP steps.
 udp_edge_ip=
 # The last token sent by udp_dial.
@@ -246,7 +254,7 @@ step "the chart and the operator"
 helm install "$release" "$root/charts/iroh-gateway" --namespace "$ns" --create-namespace \
   --set image.repository=iroh-gateway-operator --set image.tag=e2e \
   --set image.pullPolicy=IfNotPresent --set networkPolicy.enabled=true \
-  --wait --timeout 180s
+  --set addressGrace=5s --wait --timeout 180s
 # Helm installs crds/ before the templates.
 kubectl wait --for=condition=Established --timeout=60s \
   crd/edges.gateway.fables-for-robots.ch
@@ -919,6 +927,122 @@ fi
 # The script's own certificate, the one of the rotation above, is still the one served.
 if ! retry 30 curl_prints "hello from web" --cacert /tmp/second.crt "${https[@]}"; then
   echo "expected 'hello from web' for https://app.example.test:8443/ with the certificate of app-tls, got '$got'" >&2
+  exit 1
+fi
+
+step "failover: a second edge is listed next to the first"
+if ! retry 30 gateway_lists "edge.$ns.svc"; then
+  echo "expected Gateway public to list only edge.$ns.svc before the second edge, got '$got'" >&2
+  exit 1
+fi
+docker run --rm -v "$tmp:/keys" --user "$(id -u)" "$edge_image" id --key-file /keys/edge2.key \
+  >"$tmp/edge2.id"
+edge2_id="$(tr -d '[:space:]' <"$tmp/edge2.id")"
+echo "second edge id: $edge2_id"
+[[ "$edge2_id" =~ ^[0-9a-f]{64}$ ]]
+k create secret generic edge2-key --from-file=edge.key="$tmp/edge2.key"
+rm -f "$tmp/edge2.key"
+kubectl apply -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge2
+  namespace: $ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge2
+  template:
+    metadata:
+      labels:
+        app: edge2
+    spec:
+      containers:
+        - name: edge
+          image: $edge_image
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - --key-file=/keys/edge.key
+            - --operator=$operator_id
+            - --iroh-listen=0.0.0.0:7842
+            - --public-bind=0.0.0.0
+          volumeMounts:
+            - name: key
+              mountPath: /keys
+              readOnly: true
+      volumes:
+        - name: key
+          secret:
+            secretName: edge2-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge2
+  namespace: $ns
+spec:
+  selector:
+    app: edge2
+  ports:
+    - name: iroh
+      protocol: UDP
+      port: 7842
+    - name: https
+      protocol: TCP
+      port: 8443
+---
+apiVersion: gateway.fables-for-robots.ch/v1alpha1
+kind: Edge
+metadata:
+  name: e2e-2
+  namespace: $ns
+spec:
+  endpointId: $edge2_id
+  address: edge2.$ns.svc:7842
+  gatewayRef:
+    name: public
+YAML
+k rollout status deployment/edge2 --timeout=120s
+# The address of an Edge appears only once its edge has connected.
+if ! retry 60 gateway_lists "edge.$ns.svc edge2.$ns.svc"; then
+  echo "expected Gateway public to list both edges once the second connected, got '$got'" >&2
+  exit 1
+fi
+https2=(--connect-to "app.example.test:8443:edge2.$ns.svc:8443" "https://app.example.test:8443/")
+if ! retry 60 curl_prints "hello from web" --cacert /tmp/second.crt "${https2[@]}"; then
+  echo "expected 'hello from web' through the second edge, got '$got'" >&2
+  exit 1
+fi
+
+step "failover: a dead edge's address is withdrawn and the other edge keeps serving"
+k scale deployment/edge2 --replicas=0
+# The edge closes its tunnel as it stops, and the chart's addressGrace is 5 s here. Should the
+# close be lost, the operator notices after 20 s without an answer, and 5 s later the address
+# goes. The default grace of 30 s would not be over within this wait.
+if ! retry 28 gateway_lists "edge.$ns.svc"; then
+  echo "expected Gateway public to list only edge.$ns.svc within 28 s of the second edge going, got '$got'" >&2
+  exit 1
+fi
+if ! retry 30 curl_prints "hello from web" --cacert /tmp/second.crt "${https[@]}"; then
+  echo "expected 'hello from web' through the first edge after the second went, got '$got'" >&2
+  exit 1
+fi
+if ! retry 30 listener_programmed https; then
+  echo "expected the listener https of Gateway public still Programmed 'True', got '$got'" >&2
+  exit 1
+fi
+
+step "failover: the edge that returns is listed again"
+k scale deployment/edge2 --replicas=1
+k rollout status deployment/edge2 --timeout=120s
+if ! retry 60 gateway_lists "edge.$ns.svc edge2.$ns.svc"; then
+  echo "expected Gateway public to list both edges again, got '$got'" >&2
+  exit 1
+fi
+if ! retry 60 curl_prints "hello from web" --cacert /tmp/second.crt "${https2[@]}"; then
+  echo "expected 'hello from web' through the second edge after it returned, got '$got'" >&2
   exit 1
 fi
 
