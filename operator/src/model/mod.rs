@@ -305,10 +305,6 @@ pub struct GatewayModel {
     pub listeners: Vec<ListenerModel>,
     /// Accepted edges bound to this gateway.
     pub edges: Vec<ObjRef>,
-    /// The first [`MAX_GATEWAY_ADDRESSES`] of the edges' public addresses, sorted.
-    pub addresses: Vec<GatewayAddress>,
-    /// How many more addresses the edges have than `addresses` lists.
-    pub addresses_dropped: usize,
     /// The ports that serve HTTP or HTTPS, ascending: one per port with a serving HTTP or HTTPS
     /// listener.
     pub http_ports: Vec<HttpPort>,
@@ -328,6 +324,24 @@ pub struct GatewayAddress {
 
 /// The most addresses a Gateway's status may list.
 pub const MAX_GATEWAY_ADDRESSES: usize = 16;
+
+/// The public addresses of `edges` as a Gateway lists them: sorted, each once, and at most
+/// [`MAX_GATEWAY_ADDRESSES`] of them; with how many more there are.
+pub fn addresses_of<'a>(
+    edges: impl IntoIterator<Item = &'a EdgeModel>,
+) -> (Vec<GatewayAddress>, usize) {
+    let all: BTreeSet<&GatewayAddress> = edges
+        .into_iter()
+        .flat_map(|e| e.public_addresses.iter())
+        .collect();
+    let dropped = all.len().saturating_sub(MAX_GATEWAY_ADDRESSES);
+    let listed = all
+        .into_iter()
+        .take(MAX_GATEWAY_ADDRESSES)
+        .cloned()
+        .collect();
+    (listed, dropped)
+}
 
 impl GatewayAddress {
     /// An IP address in its canonical text form, or a host name in lower case with one trailing

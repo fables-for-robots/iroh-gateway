@@ -1224,7 +1224,7 @@ mod tests {
         // The edge is bound and gives the gateway its address.
         assert_eq!(g.edges, [ObjRef::new("gw", "e")]);
         assert_eq!(
-            g.addresses,
+            m.edges[0].public_addresses,
             [GatewayAddress {
                 kind: AddressKind::IpAddress,
                 value: "203.0.113.7".into()

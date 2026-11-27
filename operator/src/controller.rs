@@ -130,7 +130,10 @@ pub async fn run_loop(
         let model = model::build(&snapshot, &opts.settings);
         applier.apply(render(&model, &opts.runtime_dir)).await;
         opts.ready.store(true, Ordering::Release);
-        let desired = status::compute(&model, &applier.facts());
+        let facts = applier.facts();
+        // Every accepted edge, until the listing decides (the next commit).
+        let listed = model.edges.iter().map(|e| e.key.clone()).collect();
+        let desired = status::compute(&model, &facts, &listed);
         // Each status request has a timeout, but the write is still raced against shutdown: a
         // pass with many slow writes would otherwise hold up SIGTERM.
         let written = tokio::select! {

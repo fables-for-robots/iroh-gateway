@@ -4,15 +4,16 @@
 //! desired conditions into those an object already has.
 
 pub mod conditions;
+pub mod listing;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iroh_gateway_proto::control::{ListenerKey, Protocol};
 
 use crate::crd::EdgeListenerStatus;
 use crate::model::{
     EdgeModel, GatewayAddress, GatewayModel, ListenerModel, MAX_GATEWAY_ADDRESSES, Model, ObjRef,
-    ParentKey, Reject, RouteKind,
+    ParentKey, Reject, RouteKind, addresses_of,
 };
 use crate::tunnel::{EdgeState, ListenerState};
 
@@ -101,8 +102,10 @@ fn from_result(type_: &str, r: &Result<(), Reject>, ok_reason: &str) -> Cond {
     }
 }
 
-/// The status every resource in the model should carry, given what the engine reports.
-pub fn compute(model: &Model, facts: &Facts) -> DesiredStatus {
+/// The status every resource in the model should carry, given what the engine reports and
+/// which edges are `listed`: a Gateway's addresses are those of its listed edges (see
+/// [`listing::Listing`]).
+pub fn compute(model: &Model, facts: &Facts, listed: &BTreeSet<ObjRef>) -> DesiredStatus {
     let mut classes: Vec<ClassStatus> = model
         .classes
         .iter()
@@ -117,7 +120,7 @@ pub fn compute(model: &Model, facts: &Facts) -> DesiredStatus {
     let mut gateways: Vec<GatewayStatusOut> = model
         .gateways
         .iter()
-        .map(|g| gateway_status(g, facts))
+        .map(|g| gateway_status(model, g, facts, listed))
         .collect();
     gateways.sort_by(|a, b| a.key.cmp(&b.key));
 
@@ -229,7 +232,12 @@ fn not_ready(state: Option<&EdgeState>, ports: &[ListenerKey]) -> Option<String>
     })
 }
 
-fn gateway_status(g: &GatewayModel, facts: &Facts) -> GatewayStatusOut {
+fn gateway_status(
+    model: &Model,
+    g: &GatewayModel,
+    facts: &Facts,
+    listed: &BTreeSet<ObjRef>,
+) -> GatewayStatusOut {
     let ports = serving_ports(g);
     let mut edge_keys = g.edges.clone();
     edge_keys.sort();
@@ -282,7 +290,13 @@ fn gateway_status(g: &GatewayModel, facts: &Facts) -> GatewayStatusOut {
     } else {
         cond("Programmed", true, "Programmed", "")
     };
-    let (accepted, programmed) = note_dropped_addresses(g.addresses_dropped, accepted, programmed);
+    let (addresses, dropped) = addresses_of(
+        model
+            .edges
+            .iter()
+            .filter(|e| g.edges.contains(&e.key) && listed.contains(&e.key)),
+    );
+    let (accepted, programmed) = note_dropped_addresses(dropped, accepted, programmed);
 
     let mut listeners: Vec<ListenerStatusOut> = g
         .listeners
@@ -295,7 +309,7 @@ fn gateway_status(g: &GatewayModel, facts: &Facts) -> GatewayStatusOut {
         key: g.key.clone(),
         generation: g.generation,
         conditions: vec![accepted, programmed],
-        addresses: g.addresses.clone(),
+        addresses,
         listeners,
     }
 }
@@ -553,8 +567,6 @@ mod tests {
             accepted: Ok(()),
             listeners,
             edges: edges.iter().map(|e| ObjRef::new("ns", *e)).collect(),
-            addresses: vec![],
-            addresses_dropped: 0,
             http_ports: Vec::new(),
         }
     }
@@ -638,6 +650,33 @@ mod tests {
         }
     }
 
+    /// `super::compute` with the edges listed that a steady state lists: the connected ones.
+    fn compute(model: &Model, facts: &Facts) -> DesiredStatus {
+        let listed = facts
+            .edges
+            .iter()
+            .filter(|(_, state)| state.connected)
+            .map(|(key, _)| key.clone())
+            .collect();
+        super::compute(model, facts, &listed)
+    }
+
+    fn listed(edges: &[&str]) -> BTreeSet<ObjRef> {
+        edges.iter().map(|e| ObjRef::new("ns", *e)).collect()
+    }
+
+    fn addr(value: &str) -> GatewayAddress {
+        GatewayAddress::parse(value).unwrap()
+    }
+
+    /// An accepted edge with these public addresses.
+    fn edge_at(name: &str, addresses: &[&str]) -> EdgeModel {
+        EdgeModel {
+            public_addresses: addresses.iter().map(|a| addr(a)).collect(),
+            ..edge(name, Ok(()))
+        }
+    }
+
     fn get<'a>(conds: &'a [Cond], type_: &str) -> &'a Cond {
         conds.iter().find(|c| c.type_ == type_).unwrap()
     }
@@ -700,24 +739,128 @@ mod tests {
     }
 
     #[test]
-    fn dropped_addresses_are_counted_in_programmed_or_accepted() {
-        let mut gw = gateway(vec![listener("a", 80, true)], &["e"]);
-        gw.addresses_dropped = 3;
-        let m = model(gw, vec![edge("e", Ok(()))]);
-        // Programmed is True: its message says it.
-        let d = compute(&m, &facts(vec![("e", up(vec![bound(80, Ok(()))]))]));
+    fn only_listed_edges_give_addresses() {
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e", "f"]),
+            vec![
+                edge_at("e", &["203.0.113.7"]),
+                edge_at("f", &["203.0.113.8", "edge-f.example.com"]),
+            ],
+        );
+        let f = facts(vec![
+            ("e", up(vec![bound(80, Ok(()))])),
+            ("f", down(Some("dial timed out"))),
+        ]);
+        let d = super::compute(&m, &f, &listed(&["e"]));
+        assert_eq!(d.gateways[0].addresses, [addr("203.0.113.7")]);
+        check(
+            get(&d.gateways[0].conditions, "Programmed"),
+            true,
+            "Programmed",
+        );
+        let d = super::compute(&m, &f, &listed(&["e", "f"]));
+        assert_eq!(
+            d.gateways[0].addresses,
+            [
+                addr("203.0.113.7"),
+                addr("203.0.113.8"),
+                addr("edge-f.example.com")
+            ]
+        );
+    }
+
+    #[test]
+    fn no_listed_edge_gives_no_address() {
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e"]),
+            vec![edge_at("e", &["203.0.113.7"])],
+        );
+        let d = super::compute(
+            &m,
+            &facts(vec![("e", down(Some("boom")))]),
+            &BTreeSet::new(),
+        );
         let g = &d.gateways[0];
+        assert!(g.addresses.is_empty(), "{:?}", g.addresses);
+        check(get(&g.conditions, "Programmed"), false, "Pending");
+    }
+
+    #[test]
+    fn an_edge_of_another_gateway_gives_no_address() {
+        // Listed, but not bound to this gateway.
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e"]),
+            vec![
+                edge_at("e", &["203.0.113.7"]),
+                edge_at("other", &["203.0.113.99"]),
+            ],
+        );
+        let f = facts(vec![("e", up(vec![bound(80, Ok(()))]))]);
+        let d = super::compute(&m, &f, &listed(&["e", "other"]));
+        assert_eq!(d.gateways[0].addresses, [addr("203.0.113.7")]);
+    }
+
+    #[test]
+    fn an_address_shared_by_two_edges_stays_while_one_is_listed() {
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e", "f"]),
+            vec![
+                edge_at("e", &["lb.example.com"]),
+                edge_at("f", &["lb.example.com"]),
+            ],
+        );
+        let f = facts(vec![("e", down(None)), ("f", up(vec![bound(80, Ok(()))]))]);
+        let d = super::compute(&m, &f, &listed(&["f"]));
+        assert_eq!(d.gateways[0].addresses, [addr("lb.example.com")]);
+        let d = super::compute(&m, &f, &BTreeSet::new());
+        assert!(d.gateways[0].addresses.is_empty());
+    }
+
+    /// Seventeen accepted edges `e01`..`e17`, each with one address, all connected.
+    fn seventeen() -> (Model, Facts) {
+        let names: Vec<String> = (1..=17).map(|n| format!("e{n:02}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &name_refs),
+            (1..=17)
+                .map(|n| edge_at(&names[n - 1], &[&format!("203.0.113.{n}")]))
+                .collect(),
+        );
+        let f = facts(
+            name_refs
+                .iter()
+                .map(|n| (*n, up(vec![bound(80, Ok(()))])))
+                .collect(),
+        );
+        (m, f)
+    }
+
+    #[test]
+    fn dropped_addresses_are_counted_in_programmed_or_accepted() {
+        let (m, f) = seventeen();
+        // Programmed is True: its message says it.
+        let d = compute(&m, &f);
+        let g = &d.gateways[0];
+        assert_eq!(g.addresses.len(), 16);
         let p = get(&g.conditions, "Programmed");
         check(p, true, "Programmed");
         assert!(
             p.message
-                .contains("3 of the edges' addresses are not listed"),
+                .contains("1 of the edges' addresses is not listed"),
             "{}",
             p.message
         );
         assert_eq!(get(&g.conditions, "Accepted").message, "");
-        // Programmed is False: the Accepted message says it.
-        let d = compute(&m, &facts(vec![("e", down(Some("boom")))]));
+        // Programmed is False: the Accepted message says it. The edges are disconnected and
+        // still listed, as within the address grace.
+        let all: BTreeSet<ObjRef> = m.edges.iter().map(|e| e.key.clone()).collect();
+        let down_facts = facts(
+            m.edges
+                .iter()
+                .map(|e| (e.key.name.as_str(), down(Some("boom"))))
+                .collect(),
+        );
+        let d = super::compute(&m, &down_facts, &all);
         let g = &d.gateways[0];
         let p = get(&g.conditions, "Programmed");
         check(p, false, "Pending");
@@ -726,7 +869,7 @@ mod tests {
         check(a, true, "Accepted");
         assert!(
             a.message
-                .contains("3 of the edges' addresses are not listed"),
+                .contains("1 of the edges' addresses is not listed"),
             "{}",
             a.message
         );
@@ -740,20 +883,34 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_edge_keeps_addresses_and_is_pending() {
-        let mut gw = gateway(vec![listener("a", 80, true)], &["e"]);
-        gw.addresses = vec![GatewayAddress::parse("203.0.113.7").unwrap()];
-        let m = model(gw, vec![edge("e", Ok(()))]);
-        let d = compute(&m, &facts(vec![("e", down(Some("dial timed out")))]));
+    fn unlisted_edges_do_not_count_as_dropped() {
+        let (m, f) = seventeen();
+        // Sixteen listed: the seventeenth edge's address is neither listed nor "not listed".
+        let sixteen: BTreeSet<ObjRef> = m.edges.iter().take(16).map(|e| e.key.clone()).collect();
+        let d = super::compute(&m, &f, &sixteen);
+        let g = &d.gateways[0];
+        assert_eq!(g.addresses.len(), 16);
+        assert_eq!(get(&g.conditions, "Programmed").message, "");
+        assert_eq!(get(&g.conditions, "Accepted").message, "");
+    }
+
+    #[test]
+    fn a_disconnected_edge_still_listed_keeps_its_address_and_is_pending() {
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e"]),
+            vec![edge_at("e", &["203.0.113.7"])],
+        );
+        let d = super::compute(
+            &m,
+            &facts(vec![("e", down(Some("dial timed out")))]),
+            &listed(&["e"]),
+        );
         let g = &d.gateways[0];
         let p = get(&g.conditions, "Programmed");
         check(p, false, "Pending");
         assert!(p.message.contains("ns/e"), "{}", p.message);
         assert!(p.message.contains("dial timed out"), "{}", p.message);
-        assert_eq!(
-            g.addresses,
-            vec![GatewayAddress::parse("203.0.113.7").unwrap()]
-        );
+        assert_eq!(g.addresses, vec![addr("203.0.113.7")]);
         let e = &d.edges[0];
         let c = get(&e.conditions, "Connected");
         check(c, false, "NotConnected");

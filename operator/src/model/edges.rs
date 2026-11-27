@@ -1,15 +1,12 @@
 //! Edges and the gateways they serve.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use iroh::EndpointId;
 use kube::ResourceExt;
 
 use super::generation;
-use super::{
-    EdgeModel, GatewayAddress, GatewayModel, MAX_GATEWAY_ADDRESSES, ObjRef, Reject, Settings,
-    Snapshot,
-};
+use super::{EdgeModel, GatewayAddress, GatewayModel, ObjRef, Reject, Settings, Snapshot};
 use crate::crd::Edge;
 use crate::staticcfg::check_address;
 use iroh_gateway_proto::transport::Relay;
@@ -181,29 +178,22 @@ fn address_host(address: &str) -> Option<GatewayAddress> {
     GatewayAddress::parse(host)
 }
 
-/// Record on each gateway the accepted edges that serve it and their public addresses, at most
-/// [`MAX_GATEWAY_ADDRESSES`] of them.
+/// Record on each gateway the accepted edges that serve it.
 pub(super) fn bind(gateways: &mut [GatewayModel], edges: &[EdgeModel]) {
     for gw in gateways {
-        let mine: Vec<&EdgeModel> = edges
+        gw.edges = edges
             .iter()
             .filter(|e| e.accepted.is_ok() && e.gateway.as_ref() == Some(&gw.key))
+            .map(|e| e.key.clone())
             .collect();
-        gw.edges = mine.iter().map(|e| e.key.clone()).collect();
-        let addresses: BTreeSet<GatewayAddress> = mine
-            .iter()
-            .flat_map(|e| e.public_addresses.iter().cloned())
-            .collect();
-        gw.addresses_dropped = addresses.len().saturating_sub(MAX_GATEWAY_ADDRESSES);
-        gw.addresses = addresses.into_iter().take(MAX_GATEWAY_ADDRESSES).collect();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::build;
     use super::super::fixtures::*;
     use super::super::{AddressKind, EdgeModel, GatewayAddress, Model, ObjRef, Settings, Snapshot};
+    use super::super::{addresses_of, build};
     use iroh_gateway_proto::transport::Relay;
 
     fn snap(edges: Vec<crate::crd::Edge>) -> Snapshot {
@@ -217,6 +207,17 @@ mod tests {
 
     fn run(edges: Vec<crate::crd::Edge>) -> Model {
         build(&snap(edges), &settings(&["infra"]))
+    }
+
+    /// The addresses the first gateway lists when all its edges are listed, and how many more
+    /// its edges have.
+    fn listed(m: &Model) -> (Vec<GatewayAddress>, usize) {
+        let gw = &m.gateways[0];
+        addresses_of(m.edges.iter().filter(|e| gw.edges.contains(&e.key)))
+    }
+
+    fn addresses(m: &Model) -> Vec<GatewayAddress> {
+        listed(m).0
     }
 
     fn reason(m: &EdgeModel) -> &str {
@@ -244,7 +245,7 @@ mod tests {
         let m = run(vec![good("fsn1", 1)]);
         assert_eq!(reason(&m.edges[0]), "Ok");
         assert_eq!(m.gateways[0].edges, [ObjRef::new("infra", "fsn1")]);
-        assert_eq!(m.gateways[0].addresses, [ip("203.0.113.7")]);
+        assert_eq!(addresses(&m), [ip("203.0.113.7")]);
         assert_eq!(m.edges[0].gateway, Some(ObjRef::new("infra", "public")));
         assert_eq!(m.edges[0].address.as_deref(), Some("203.0.113.7:7842"));
         assert!(m.edges[0].endpoint_id.is_some());
@@ -405,7 +406,7 @@ mod tests {
         assert!(e.endpoint_id.is_some());
         assert_eq!(e.gateway, Some(ObjRef::new("infra", "absent")));
         assert!(m.gateways[0].edges.is_empty());
-        assert!(m.gateways[0].addresses.is_empty());
+        assert!(addresses(&m).is_empty());
     }
 
     #[test]
@@ -421,7 +422,7 @@ mod tests {
     fn hostname_address_is_published_as_hostname() {
         let m = run(vec![good("e", 1).address("edge.example.com:7842")]);
         assert_eq!(
-            m.gateways[0].addresses,
+            addresses(&m),
             [GatewayAddress {
                 kind: AddressKind::Hostname,
                 value: "edge.example.com".into()
@@ -438,7 +439,7 @@ mod tests {
         ]);
         assert_eq!(reason(&m.edges[0]), "Ok");
         assert_eq!(
-            m.gateways[0].addresses,
+            addresses(&m),
             [
                 ip("198.51.100.1"),
                 GatewayAddress {
@@ -458,7 +459,7 @@ mod tests {
         let m = build(&snap(vec![e]), &relay_settings());
         assert_eq!(reason(&m.edges[0]), "Ok");
         assert_eq!(m.edges[0].address, None);
-        assert_eq!(m.gateways[0].addresses, [ip("198.51.100.1")]);
+        assert_eq!(addresses(&m), [ip("198.51.100.1")]);
     }
 
     #[test]
@@ -468,17 +469,14 @@ mod tests {
             good("b", 2).address("203.0.113.7:7842"),
             good("c", 3).address("203.0.113.7:7843"),
         ]);
-        assert_eq!(
-            m.gateways[0].addresses,
-            [ip("203.0.113.7"), ip("203.0.113.9")]
-        );
+        assert_eq!(addresses(&m), [ip("203.0.113.7"), ip("203.0.113.9")]);
         assert_eq!(m.gateways[0].edges.len(), 3);
     }
 
     #[test]
     fn ipv6_address_host_has_no_brackets() {
         let m = run(vec![good("e", 1).address("[2001:db8::1]:7842")]);
-        assert_eq!(m.gateways[0].addresses, [ip("2001:db8::1")]);
+        assert_eq!(addresses(&m), [ip("2001:db8::1")]);
     }
 
     fn host(v: &str) -> GatewayAddress {
@@ -500,7 +498,7 @@ mod tests {
         ]);
         assert_eq!(reason(&m.edges[0]), "Ok");
         assert_eq!(
-            m.gateways[0].addresses,
+            addresses(&m),
             [
                 ip("198.51.100.1"),
                 ip("2001:db8::1"),
@@ -536,7 +534,7 @@ mod tests {
         ] {
             let m = run(vec![good("e", 1).public("198.51.100.1").public(bad)]);
             assert_eq!(reason(&m.edges[0]), "InvalidPublicAddress", "{bad:?}");
-            assert!(m.gateways[0].addresses.is_empty(), "{bad:?}");
+            assert!(addresses(&m).is_empty(), "{bad:?}");
             assert!(m.gateways[0].edges.is_empty(), "{bad:?}");
         }
     }
@@ -554,7 +552,7 @@ mod tests {
         assert_eq!(name.len(), 253);
         let m = run(vec![good("e", 1).public(&format!("{name}."))]);
         assert_eq!(reason(&m.edges[0]), "Ok");
-        assert_eq!(m.gateways[0].addresses, [host(&name)]);
+        assert_eq!(addresses(&m), [host(&name)]);
 
         let m = run(vec![good("e", 1).public(&format!("{name}x"))]);
         assert_eq!(reason(&m.edges[0]), "InvalidPublicAddress");
@@ -564,7 +562,7 @@ mod tests {
     fn address_host_is_normalised() {
         let m = run(vec![good("e", 1).address("Edge.Example.COM.:7842")]);
         assert_eq!(reason(&m.edges[0]), "Ok");
-        assert_eq!(m.gateways[0].addresses, [host("edge.example.com")]);
+        assert_eq!(addresses(&m), [host("edge.example.com")]);
         // The address is dialled as written.
         assert_eq!(
             m.edges[0].address.as_deref(),
@@ -572,7 +570,7 @@ mod tests {
         );
 
         let m = run(vec![good("e", 1).address("[2001:DB8::0:1]:7842")]);
-        assert_eq!(m.gateways[0].addresses, [ip("2001:db8::1")]);
+        assert_eq!(addresses(&m), [ip("2001:db8::1")]);
     }
 
     #[test]
@@ -619,25 +617,24 @@ mod tests {
             .map(|n| good(&format!("e{n:02}"), n).address(&format!("203.0.113.{n}:7842")))
             .collect();
         let m = run(edges);
-        let gw = &m.gateways[0];
-        assert_eq!(gw.edges.len(), 17);
-        assert_eq!(gw.addresses.len(), 16);
-        assert_eq!(gw.addresses_dropped, 1);
+        assert_eq!(m.gateways[0].edges.len(), 17);
+        let (listed_addresses, dropped) = listed(&m);
+        assert_eq!(listed_addresses.len(), 16);
+        assert_eq!(dropped, 1);
         // The first 16 after sorting: "203.0.113.9" sorts last and is left out.
         assert!(
-            !gw.addresses.contains(&ip("203.0.113.9")),
-            "{:?}",
-            gw.addresses
+            !listed_addresses.contains(&ip("203.0.113.9")),
+            "{listed_addresses:?}"
         );
-        let mut sorted = gw.addresses.clone();
+        let mut sorted = listed_addresses.clone();
         sorted.sort();
-        assert_eq!(sorted, gw.addresses);
+        assert_eq!(sorted, listed_addresses);
 
         let m = run((1..=16u8)
             .map(|n| good(&format!("e{n:02}"), n).address(&format!("203.0.113.{n}:7842")))
             .collect());
-        assert_eq!(m.gateways[0].addresses.len(), 16);
-        assert_eq!(m.gateways[0].addresses_dropped, 0);
+        assert_eq!(listed(&m), (addresses(&m), 0));
+        assert_eq!(addresses(&m).len(), 16);
     }
 
     #[test]

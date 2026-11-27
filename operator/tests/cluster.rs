@@ -1734,7 +1734,7 @@ async fn write(writer: &mut StatusWriter, snapshot: &Snapshot) -> bool {
         haproxy: Ok(()),
         edges: Default::default(),
     };
-    let desired = compute(&build(snapshot, &settings()), &facts);
+    let desired = compute(&build(snapshot, &settings()), &facts, &Default::default());
     writer.write(&desired, snapshot).await
 }
 
