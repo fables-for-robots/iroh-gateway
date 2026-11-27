@@ -9,7 +9,7 @@ mod udp;
 pub use connector::{Connector, StaticConnector};
 pub use haproxy_connector::HaproxyConnector;
 pub use link::{
-    EdgeLink, EdgeState, LinkHandle, LinkOptions, ListenerState, MAX_STATUS_TEXT, bind_endpoint,
-    truncate_status_text,
+    EdgeLink, EdgeState, LinkHandle, LinkOptions, ListenerState, MAX_STATUS_TEXT, PathKind,
+    bind_endpoint, truncate_status_text,
 };
 pub use udp::{UdpTarget, UdpTargets, pick};

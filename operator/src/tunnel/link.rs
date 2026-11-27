@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
+use futures::StreamExt;
 use iroh::endpoint::{
     ConnectError, ConnectingError, Connection, ConnectionError, RecvStream, SendStream, VarInt,
 };
@@ -47,10 +48,32 @@ const WAITING_FOR_STATUS: &str = "connected; waiting for the edge to answer the 
 /// [`LinkOptions::first_status_timeout`].
 const NO_STATUS: &str = "the edge accepted the connection but did not answer the config";
 
+/// How the tunnel's traffic reaches the edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PathKind {
+    /// Straight to the edge's address.
+    Direct,
+    /// Through a relay server.
+    Relay,
+}
+
+impl PathKind {
+    /// `direct` or `relay`, as the `Edge` status and the metrics spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EdgeState {
     /// A connection is up and the edge has answered a `Config` on it.
     pub connected: bool,
+    /// The path the connection sends on at the moment; None without a connection, and for the
+    /// moment in which a connection has no selected path.
+    pub path: Option<PathKind>,
     pub edge_version: Option<String>,
     /// The last generation the edge acknowledged.
     pub generation: u64,
@@ -292,8 +315,16 @@ impl Drop for Served {
     }
 }
 
-/// Sets `tunnel_up` and `tunnel_listeners` to what `state` says.
+/// Sets `tunnel_up`, `tunnel_path` and `tunnel_listeners` to what `state` says.
 fn show(metrics: &LinkMetrics, state: &EdgeState) {
+    metrics
+        .path
+        .direct
+        .set(i64::from(state.path == Some(PathKind::Direct)));
+    metrics
+        .path
+        .relay
+        .set(i64::from(state.path == Some(PathKind::Relay)));
     let failed = state.listeners.iter().filter(|l| l.bound.is_err()).count();
     let bound = state.listeners.len() - failed;
     metrics.up.set(i64::from(state.connected));
@@ -312,6 +343,21 @@ struct Session {
     /// The session's UDP forwarder.
     udp: JoinHandle<()>,
     got_status: bool,
+    /// The path the connection sends on, as last seen; in the state once the edge has answered.
+    path: Option<PathKind>,
+}
+
+/// The kind of the path `conn` sends on at the moment, if it has selected one.
+fn selected_path(conn: &Connection) -> Option<PathKind> {
+    let paths = conn.paths();
+    let selected = paths.iter().find(|p| p.is_selected())?;
+    if selected.is_relay() {
+        Some(PathKind::Relay)
+    } else if selected.is_ip() {
+        Some(PathKind::Direct)
+    } else {
+        None
+    }
 }
 
 enum SessionError {
@@ -472,7 +518,12 @@ impl<C: Connector> Link<C> {
             streams: JoinSet::new(),
             udp,
             got_status: false,
+            path: selected_path(&conn),
         };
+        self.count_path(s.path);
+        if let Some(path) = s.path {
+            info!(path = path.as_str(), "the tunnel's first path");
+        }
         let waiting = Some(WAITING_FOR_STATUS.to_owned());
         self.state.send_if_modified(|st| {
             let changed = st.last_error != waiting;
@@ -506,9 +557,10 @@ impl<C: Connector> Link<C> {
         }
         show(&self.metrics, &EdgeState::default());
         self.state.send_if_modified(|st| {
-            let mut changed = st.connected || !st.listeners.is_empty();
+            let mut changed = st.connected || !st.listeners.is_empty() || st.path.is_some();
             st.connected = false;
             st.listeners.clear();
+            st.path = None;
             if why.is_some() && st.last_error != why {
                 st.last_error = why;
                 changed = true;
@@ -520,6 +572,38 @@ impl<C: Connector> Link<C> {
             Some(_) => Ended::Lost {
                 got_status: s.got_status,
             },
+        }
+    }
+
+    /// Counts a path the connection selected.
+    fn count_path(&self, path: Option<PathKind>) {
+        match path {
+            Some(PathKind::Direct) => self.metrics.path_selected.direct.inc(),
+            Some(PathKind::Relay) => self.metrics.path_selected.relay.inc(),
+            None => {}
+        }
+    }
+
+    /// Takes the connection's selected path: logs a change, and once the edge has answered a
+    /// config puts it into the state and the metrics.
+    fn on_path(&mut self, s: &mut Session) {
+        let path = selected_path(&s.conn);
+        if path == s.path {
+            return;
+        }
+        s.path = path;
+        self.count_path(path);
+        match path {
+            Some(path) => info!(path = path.as_str(), "the tunnel's path changed"),
+            None => debug!("the tunnel has no selected path"),
+        }
+        if s.got_status {
+            self.state.send_if_modified(|st| {
+                let changed = st.path != path;
+                st.path = path;
+                changed
+            });
+            show(&self.metrics, &self.state.borrow());
         }
     }
 
@@ -580,9 +664,20 @@ impl<C: Connector> Link<C> {
         let mut retry_armed = false;
         // Ends the session unless the edge answers a config in time.
         let mut first_status = pin!(sleep(self.opts.first_status_timeout));
+        // Ends when the connection closes, which `conn.closed()` reports.
+        let mut path_events = conn.path_events();
+        let mut path_events_open = true;
+        // A change between the session's first look at the paths and this subscription sent
+        // its event to nobody: look again now that later ones will be seen.
+        self.on_path(s);
         loop {
             tokio::select! {
                 e = conn.closed() => return SessionError::Lost(e),
+                event = path_events.next(), if path_events_open => {
+                    // Whatever the event, the connection has the answer; a missed event too.
+                    path_events_open = event.is_some();
+                    self.on_path(s);
+                }
                 () = &mut first_status, if !s.got_status => return SessionError::NoStatus,
                 (send, written) = &mut writing, if idle_send.is_none() => {
                     if let Err(e) = written {
@@ -751,6 +846,7 @@ impl<C: Connector> Link<C> {
         let failed = listeners.iter().any(|l| l.bound.is_err());
         let next = EdgeState {
             connected: true,
+            path: s.path,
             edge_version: Some(truncate_status_text(&status.version)),
             generation: status.generation,
             listeners,

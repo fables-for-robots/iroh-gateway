@@ -19,6 +19,9 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="Connected")].status
       name: Connected
       type: string
+    - jsonPath: .status.path
+      name: Path
+      type: string
     - jsonPath: .status.conditions[?(@.type=="Programmed")].status
       name: Programmed
       type: string
@@ -118,6 +121,12 @@ spec:
                   - protocol
                   type: object
                 type: array
+              path:
+                description: |-
+                  The kind of path the operator sends to the edge on at the moment: `direct` or `relay`.
+                  Unset while the edge is not connected.
+                nullable: true
+                type: string
             type: object
         required:
         - spec

@@ -10,7 +10,7 @@ use iroh::SecretKey;
 use iroh::endpoint::{ConnectionError, VarInt};
 use iroh_gateway_edge::Edge;
 use iroh_gateway_operator::tunnel::{
-    Connector, LinkOptions, ListenerState, MAX_STATUS_TEXT, StaticConnector,
+    Connector, LinkOptions, ListenerState, MAX_STATUS_TEXT, PathKind, StaticConnector,
 };
 use iroh_gateway_proto::control::{BindState, ListenerKey, ListenerStatus, Status, StreamHeader};
 use iroh_gateway_proto::datagram::{MAX_UDP_FLOWS, UDP_FLOW_IDLE};
@@ -300,6 +300,21 @@ async fn unresolvable_address_keeps_retrying() {
         .expect("shutdown took longer than 1 s");
     assert!(started.elapsed() < Duration::from_secs(1));
     rig.edge.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_path_of_a_dialled_address_is_direct() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    let rig = rig(&[(p, echo)]).await;
+    wait_state(&rig.link, |s| {
+        s.connected && s.path == Some(PathKind::Direct)
+    })
+    .await;
+    // Gone with the connection.
+    rig.edge.shutdown().await;
+    wait_state(&rig.link, |s| !s.connected && s.path.is_none()).await;
+    rig.link.shutdown().await;
 }
 
 #[tokio::test]

@@ -13,7 +13,7 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gateway_operator::metrics::Metrics;
 use iroh_gateway_operator::tunnel::{
-    LinkHandle, LinkOptions, UdpTarget, UdpTargets, bind_endpoint,
+    LinkHandle, LinkOptions, PathKind, UdpTarget, UdpTargets, bind_endpoint,
 };
 use iroh_gateway_proto::control::{Config, ListenerKey};
 use iroh_gateway_proto::datagram::MAX_PACKET;
@@ -236,6 +236,40 @@ async fn a_link_reports_its_edge_up_and_its_listeners() {
     drop(held);
 }
 
+/// A tunnel that can only start through a relay starts on the relay path. On one machine iroh
+/// then finds a direct path and moves to it, with no new session and no new status from the
+/// edge: only by following the connection's path events does the operator see it.
+#[tokio::test]
+async fn a_tunnel_that_moves_from_the_relay_to_a_direct_path_is_followed() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    // The only address the operator has is one where nothing answers.
+    let nothing = format!("127.0.0.1:{}", free_udp_port()).parse().unwrap();
+    let m = Metrics::new();
+    let (rig, _relay) = relay_rig_with(&[(p, echo)], Some(nothing), |opts| {
+        opts.metrics = m.clone();
+    })
+    .await;
+    let e = rig.edge.endpoint_id().to_string();
+    let selected = |path| series("tunnel_path_selected_total", &e, &[("path", path)]);
+    let gauge = |path| series("tunnel_path", &e, &[("path", path)]);
+    wait_state(&rig.link, |s| s.connected && s.path.is_some()).await;
+    wait_until(&m, &selected("relay"), |v| v >= 1.0).await;
+
+    // The move to the direct path, in the state, the gauge and the count.
+    wait_state(&rig.link, |s| {
+        s.connected && s.path == Some(PathKind::Direct)
+    })
+    .await;
+    wait_for(&m, &gauge("direct"), 1.0).await;
+    wait_for(&m, &gauge("relay"), 0.0).await;
+    assert!(value(&m, &selected("direct")) >= 1.0, "{}", m.render());
+    // One session throughout.
+    assert_eq!(value(&m, &series("tunnel_sessions_total", &e, &[])), 1.0);
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_lost_edge_reads_down() {
     let echo = echo_server().await;
@@ -246,10 +280,23 @@ async fn a_lost_edge_reads_down() {
     .await;
     wait_state(&rig.link, |s| s.connected && s.listeners.len() == 1).await;
     assert_eq!(value(&m, &series("tunnel_up", &e, &[])), 1.0);
+    // The path of a dialled address is direct, selected once.
+    wait_for(&m, &series("tunnel_path", &e, &[("path", "direct")]), 1.0).await;
+    let selected = |path| series("tunnel_path_selected_total", &e, &[("path", path)]);
+    assert_eq!(value(&m, &selected("direct")), 1.0);
+    assert_eq!(value(&m, &selected("relay")), 0.0);
+    assert_eq!(
+        value(&m, &series("tunnel_path", &e, &[("path", "relay")])),
+        0.0
+    );
 
     rig.edge.shutdown().await;
     wait_for(&m, &series("tunnel_up", &e, &[]), 0.0).await;
     let text = m.render();
+    for path in ["direct", "relay"] {
+        let series = series("tunnel_path", &e, &[("path", path)]);
+        assert_eq!(metric(&text, &series), 0.0, "{text}");
+    }
     for state in ["bound", "failed"] {
         let listeners = series("tunnel_listeners", &e, &[("state", state)]);
         assert_eq!(metric(&text, &listeners), 0.0, "{text}");
