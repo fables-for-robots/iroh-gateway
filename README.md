@@ -1,16 +1,126 @@
 # iroh-gateway
 
-iroh-gateway is a TCP and UDP tunnel between a small public machine (the edge) and a private machine (the operator, for example a home cluster). The operator dials out to the edge over iroh (QUIC, peers identified by ed25519 key), so the private side needs no open port and no public address. Visitors connect to the edge, and their connections and packets are carried through the tunnel to a target next to the operator. The design is in [the spec](docs/superpowers/specs/2026-11-23-iroh-gateway-design.md).
+Put the services of a private Kubernetes cluster on the internet through a small public VM. The cluster opens no port, and visitors only ever see the VM's address.
 
-In a Kubernetes cluster the operator is a Gateway API controller, installed with the Helm chart in `charts/iroh-gateway`, and the edge is a static binary on a VPS. To put a site online, read [Install in a cluster](#install-in-a-cluster) and follow the [walkthrough](#walkthrough-from-an-empty-vps-to-an-https-site). Without a cluster, the [quickstart](#quickstart) runs both sides on one machine.
+```mermaid
+flowchart LR
+    visitors(["Visitors"])
 
-## Status
+    subgraph vm["VM at Hetzner Cloud, public IP"]
+        edge["edge<br/>opens the<br/>public ports"]
+    end
 
-What exists: the edge binary, and the operator binary with a static configuration file or as a Kubernetes Gateway API controller for raw TCP, UDP, HTTP and HTTPS; Prometheus metrics in both, and health endpoints in the operator; a Helm chart; container images for both; static Linux binaries of the edge with a hardened systemd unit; nix packages of both binaries and a NixOS module for the edge.
+    subgraph home["Kubernetes cluster at home, no open port"]
+        operator["operator<br/>Gateway API<br/>controller,<br/>TLS ends here"]
+        services["your<br/>Services"]
+    end
 
-Versions are tagged `v<X.Y.Z>`; the first is `v0.1.0`, and the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) lists them. A tag publishes both images with the tags `<X.Y.Z>` and `latest`, the chart to `oci://ghcr.io/fables-for-robots/charts`, and a GitHub release with the edge's tarballs. On every push to `main`, the release workflow also publishes both images built from `main` with the tags `edge` and `sha-<commit>` (see [The chart](#the-chart) for installing those).
+    visitors -- "HTTP, HTTPS,<br/>TCP, UDP" --> edge
+    edge <== "iroh tunnel (QUIC),<br/>dialed from home" ==> operator
+    operator --> services
+```
 
-## Install in a cluster
+iroh-gateway has two parts:
+
+- **The edge** (`iroh-gateway-edge`) is one static binary on a machine with a public address, for example a small VM at Hetzner Cloud. It opens the public ports and keeps nothing but its own key and the operator's id: no certificate, no routes, no credentials for the cluster.
+- **The operator** (`iroh-gateway-operator`) runs in the cluster as a [Gateway API](https://gateway-api.sigs.k8s.io/) controller. It dials out to the edge over [iroh](https://www.iroh.computer/) (QUIC, each side pinned to the other's ed25519 key), tells it which ports to open, and routes what arrives to your Services; HAProxy in its own pod terminates TLS.
+
+What that gives you:
+
+- **Nothing points at your home.** DNS names resolve to the VM. The cluster only dials out, over UDP; the router forwards no port and needs no static address. Only the VM sees where the tunnel comes from (and a relay, if you turn [relay mode](#relay-mode) on).
+- **TLS ends in the cluster.** Certificates and their keys stay in Kubernetes Secrets, and the VM carries HTTPS it cannot read.
+- **Plain Gateway API.** `Gateway`, `HTTPRoute`, `TCPRoute` and `UDPRoute` objects of the class `iroh-gateway`; the [walkthrough](#walkthrough-from-an-empty-vps-to-an-https-site) adds cert-manager and external-dns.
+- **HTTP, HTTPS, raw TCP and UDP**, with Prometheus metrics on both sides.
+
+## Install with Helm
+
+You need a Kubernetes cluster with `kubectl` and Helm 3.8 or later, and a Linux VM with a public address. The cluster needs outbound UDP to the VM's port 7842 and no inbound port.
+
+**1. In the cluster**, install the Gateway API v1.7.0 CRDs, then the chart:
+
+```sh
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
+
+helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway \
+  --namespace iroh-gateway --create-namespace --wait --timeout 180s
+```
+
+This installs the newest released chart: the operator, the `Edge` CRD and a `GatewayClass` named `iroh-gateway`. Add `--version <X.Y.Z>` to pin a version from the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases). [More about the chart](#more-about-the-chart) has its values, its RBAC rules and how to run what is on `main`.
+
+**2. On the VM**, install the edge from the release's tarball (a static binary and a hardened systemd unit) and read its id. Steps [3](#3-the-edge-on-the-vps-and-its-id) to [5](#5-the-operators-id-and-the-edge-started) of the walkthrough have the commands; [The edge on a machine of its own](#the-edge-on-a-machine-of-its-own) also covers NixOS and a container.
+
+**3. Connect the two.** A `Gateway` of the class `iroh-gateway` says which ports to open, and an `Edge` binds the edge to it by its id and address:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: iroh-gateway
+spec:
+  gatewayClassName: iroh-gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.fables-for-robots.ch/v1alpha1
+kind: Edge
+metadata:
+  name: vps
+  namespace: iroh-gateway
+spec:
+  endpointId: <the edge's id>
+  address: 203.0.113.10:7842 # the VM's public address and the edge's iroh port
+  gatewayRef:
+    name: public
+```
+
+The edge is then started with the operator's id, which the `Edge`'s status shows. From there the edge serves only that operator, and the operator dials only the edges it lists.
+
+**4. Route something.** A route attached to a listener makes the edge open that listener's port. This one sends `app.example.com` on port 80 to the Service `web`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app
+  namespace: iroh-gateway
+spec:
+  parentRefs:
+    - name: public
+      sectionName: http
+  hostnames:
+    - app.example.com
+  rules:
+    - backendRefs:
+        - name: web
+          port: 8080
+```
+
+The [walkthrough](#walkthrough-from-an-empty-vps-to-an-https-site) does all of this in nine steps, from an empty VM to `https://app.example.com/` with a Let's Encrypt certificate. [Kubernetes](#kubernetes) describes raw TCP, HTTPS and UDP.
+
+Without a cluster, the [quickstart](#quickstart-without-a-cluster) runs both sides on one machine from a configuration file. The design is in [the spec](docs/superpowers/specs/2026-11-23-iroh-gateway-design.md).
+
+## Contents
+
+- [Install with Helm](#install-with-helm)
+- [More about the chart](#more-about-the-chart)
+- [The edge on a machine of its own](#the-edge-on-a-machine-of-its-own): systemd, NixOS, container
+- [Walkthrough: from an empty VPS to an HTTPS site](#walkthrough-from-an-empty-vps-to-an-https-site)
+- [Metrics and health](#metrics-and-health)
+- [Kubernetes](#kubernetes): the objects, raw TCP, HTTP and HTTPS, UDP, status conditions
+- [Releases](#releases)
+- [Upgrading from the manifests in `deploy/`](#upgrading-from-the-manifests-in-deploy)
+- [Build](#build)
+- [Quickstart without a cluster](#quickstart-without-a-cluster)
+- [`iroh-gateway-edge`](#iroh-gateway-edge) and [`iroh-gateway-operator`](#iroh-gateway-operator): the flags
+- [Running in production](#running-in-production)
+- [Trust](#trust)
+- [Relay mode](#relay-mode)
+- [Known limitations](#known-limitations)
+
+## More about the chart
 
 ### Prerequisites: the Gateway API CRDs
 
@@ -26,7 +136,7 @@ The `UDPRoute` CRD must be installed: the operator applies nothing until every k
 
 The chart installs the `Edge` CRD, the RBAC rules, the `GatewayClass` named `iroh-gateway`, the operator with its probes, and a Service in front of its metrics port. With `--wait`, Helm returns once the operator's pod is ready (see [Readiness](#readiness)).
 
-A released version, from the OCI registry (Helm 3.8 or later), with `<X.Y.Z>` a version from the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) without its `v`:
+A released version, from the OCI registry (Helm 3.8 or later), with `<X.Y.Z>` a version from the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) without its `v`; without `--version`, Helm takes the newest:
 
 ```sh
 helm install iroh-gateway oci://ghcr.io/fables-for-robots/charts/iroh-gateway --version <X.Y.Z> \
@@ -1024,6 +1134,10 @@ Every condition below is also visible with `kubectl describe`. A False condition
 - A `Gateway` cannot ask for addresses; they come from the edges' `publicAddresses`, or from the host in their `address`. A DNS name is published in lower case without a trailing dot. A `Gateway` lists at most 16 addresses, the first 16 in sorted order; when there are more, its `Programmed` message (when True) or its `Accepted` message says how many are not listed.
 - A `UDP` listener on the edge's iroh port fails to bind when the edge's iroh address and its public bind address overlap, as they do with the defaults (`0.0.0.0:7842` and `::`); the edge reports it as a bind error.
 
+## Releases
+
+Versions are tagged `v<X.Y.Z>`; the first is `v0.1.0`, and the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) lists them. A tag publishes both images with the tags `<X.Y.Z>` and `latest`, the chart to `oci://ghcr.io/fables-for-robots/charts`, and a GitHub release with the edge's tarballs. On every push to `main`, the release workflow also publishes both images built from `main` with the tags `edge` and `sha-<commit>` (see [The chart](#the-chart) for installing those).
+
 ## Upgrading from the manifests in `deploy/`
 
 Earlier versions were installed from plain manifests in `deploy/`, which the chart replaces. Their objects: the Namespace `iroh-gateway`; the `Edge` CRD `edges.gateway.fables-for-robots.ch`; the `GatewayClass` `iroh-gateway`; and, all named `iroh-gateway-operator`, a Deployment, a ServiceAccount, a Role and a RoleBinding in `iroh-gateway`, and a ClusterRole and a ClusterRoleBinding. The operator itself created the Secret `iroh-gateway-identity` in `iroh-gateway`, which holds its key.
@@ -1070,7 +1184,7 @@ cargo test
 
 The binaries are `target/release/iroh-gateway-edge` and `target/release/iroh-gateway-operator`. With nix, `nix build .#edge` and `nix build .#operator` build them as packages.
 
-## Quickstart
+## Quickstart without a cluster
 
 Everything on one machine, over loopback, without Kubernetes: the operator with a static configuration file. Run every command below in the same terminal, from the repository root, one block after another.
 
