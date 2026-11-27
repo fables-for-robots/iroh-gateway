@@ -31,6 +31,7 @@ What that gives you:
 - **TLS ends in the cluster.** Certificates and their keys stay in Kubernetes Secrets, and the VM carries HTTPS it cannot read.
 - **Plain Gateway API.** `Gateway`, `HTTPRoute`, `TCPRoute` and `UDPRoute` objects of the class `iroh-gateway`; the [walkthrough](#walkthrough-from-an-empty-vps-to-an-https-site) adds cert-manager and external-dns.
 - **HTTP, HTTPS, raw TCP and UDP**, with Prometheus metrics on both sides.
+- **Several edges for failover.** A Gateway lists only the addresses of the edges that are connected, so DNS follows the tunnels (see [Several edges and failover](#several-edges-and-failover)).
 
 ## Install with Helm
 
@@ -109,7 +110,7 @@ Without a cluster, the [quickstart](#quickstart-without-a-cluster) runs both sid
 - [The edge on a machine of its own](#the-edge-on-a-machine-of-its-own): systemd, NixOS, container
 - [Walkthrough: from an empty VPS to an HTTPS site](#walkthrough-from-an-empty-vps-to-an-https-site)
 - [Metrics and health](#metrics-and-health)
-- [Kubernetes](#kubernetes): the objects, raw TCP, HTTP and HTTPS, UDP, status conditions
+- [Kubernetes](#kubernetes): the objects, several edges and failover, raw TCP, HTTP and HTTPS, UDP, status conditions
 - [Releases](#releases)
 - [Upgrading from the manifests in `deploy/`](#upgrading-from-the-manifests-in-deploy)
 - [Build](#build)
@@ -173,6 +174,7 @@ The chart's README lists [every value](charts/iroh-gateway/README.md#values). Th
 
 - `gatewayNamespaces`: the namespaces whose `Gateway` and `Edge` objects the operator serves; by default only the release namespace. Each listed namespace must exist before the install and gets a Role that lets the operator read its Secrets (see [Secrets](#secrets)). For example `--set 'gatewayNamespaces={iroh-gateway,apps}'`.
 - `relay`: `disabled` (the default), `n0` or a relay URL; it must match the edges' `--relay` (see [Relay mode](#relay-mode)).
+- `addressGrace` (default `30s`): how long a Gateway keeps listing the addresses of an edge whose connection has dropped (see [Several edges and failover](#several-edges-and-failover)).
 - `metrics.port` (default 8080), where the operator serves `/metrics`, `/healthz` and `/readyz`; `metrics.service.enabled` (default `true`) puts a ClusterIP Service in front of it, and `metrics.serviceMonitor.enabled=true` adds a ServiceMonitor for the Prometheus Operator (see [Metrics and health](#metrics-and-health)). The port is bound on `metrics.bindAddress`, by default `0.0.0.0`, which is IPv4 only: on a cluster whose pod IPs are IPv6, pass `--set 'metrics.bindAddress=[::]'`, or the kubelet's probes cannot reach the operator and `helm install --wait` times out.
 - `networkPolicy.enabled=true` adds a NetworkPolicy that admits ingress to the operator pod only on the metrics port, from the peers in `networkPolicy.metricsFrom` (any source when empty), and leaves egress open: the operator must be able to send UDP to the edges, and TCP and UDP to the backend Services.
 
@@ -441,7 +443,7 @@ spec:
 
 Save it as `gateway.yaml` and apply it with `kubectl apply -f gateway.yaml`. Until the Secret `app-tls` exists, the `https` listener shows `ResolvedRefs` `False` with `InvalidCertificateRef` and serves nothing, and the Gateway is `Accepted` `True` with reason `ListenersNotValid`; the `http` listener is not affected.
 
-The Gateway's address comes from the `Edge`: `kubectl -n iroh-gateway get gateway public` shows `203.0.113.10` under `ADDRESS`. The operator lists in `Gateway.status.addresses` the `spec.publicAddresses` of every accepted `Edge` bound to the Gateway, or, for an `Edge` without them, the host of its `address`; an IP address as type `IPAddress`, a DNS name as `Hostname`. An address stays while its `Edge` exists, whether or not the edge is connected. Set `publicAddresses` when visitors use other addresses than the one the operator dials, for example to add the VPS's IPv6 address: `publicAddresses: [203.0.113.10, "2001:db8::10"]`.
+The Gateway's address comes from the `Edge`, once its edge is connected: after step 5, `kubectl -n iroh-gateway get gateway public` shows `203.0.113.10` under `ADDRESS`; until then it shows none. The operator lists in `Gateway.status.addresses` the `spec.publicAddresses` of every connected `Edge` bound to the Gateway, or, for an `Edge` without them, the host of its `address`; an IP address as type `IPAddress`, a DNS name as `Hostname`. The address of an edge that stays disconnected for longer than the address grace (30 s by default) is withdrawn, the last one too (see [Several edges and failover](#several-edges-and-failover)). Set `publicAddresses` when visitors use other addresses than the one the operator dials, for example to add the VPS's IPv6 address: `publicAddresses: [203.0.113.10, "2001:db8::10"]`.
 
 ### 5. The operator's id, and the edge started
 
@@ -832,7 +834,7 @@ What this step does and does not do:
 
 - `TCP`, `UDP`, `HTTP` and `HTTPS` listeners, `TCPRoute`, `UDPRoute` and `HTTPRoute` (see [UDP](#udp) and [HTTP and HTTPS](#http-and-https) for what a `UDPRoute` and an `HTTPRoute` may use). There is no TLS passthrough and no `TLSRoute` or `GRPCRoute` yet; a listener with any other protocol is not accepted.
 - One operator replica. The chart runs one replica with the `Recreate` strategy; running two would make both dial the edges and write the same status.
-- Several edges may serve one Gateway, but only one is tested; there is no failover between them (see the design's phase 2).
+- Several edges may serve one Gateway, and the Gateway lists the addresses of those that are connected (see [Several edges and failover](#several-edges-and-failover)). There is one operator pod; several replicas are the design's phase 2.
 - The chart puts the operator, its ServiceAccount, its Service and its Roles in the release namespace (`iroh-gateway` here), and a Role and RoleBinding in each further namespace of `gatewayNamespaces`.
 - Long-lived connections. A configuration change anywhere (any serving listener's routes, backends or certificates, in any namespace) reloads HAProxy. Connections that are still open 30 minutes after a reload, or after 50 further reloads, are closed, and a connection idle for an hour is closed. This is a known limit of this step for long-lived TCP such as SSH or database sessions.
 - Memory. The operator accepts at most 4096 streams from one edge and buffers at most 64 MiB of unread data per edge, so in the worst case one edge can make it hold about 4096 × 192 KiB + 64 MiB ≈ 830 MiB. The chart's default limit of 1 GiB (`resources`) fits one edge; raise it by about that much for each further edge. UDP adds about 5.3 MiB per edge to the worst case (a 4 MiB budget for reassembling large packets, 1 MiB of received datagrams and 256 KiB queued to send), which the 1 GiB limit still covers; the kernel's buffers for the flow sockets (one per UDP flow, up to 4096 per edge) are not counted.
@@ -845,6 +847,27 @@ The two sides pin each other's key, so enrolling an edge is an exchange of two i
 2. Create the `Edge` resource with that id and the address where the operator can reach the edge's iroh UDP port, and the `Gateway` it serves.
 3. Read the operator's id from the `Edge`: `kubectl -n <namespace> get edge <name> -o jsonpath='{.status.gatewayEndpointId}'`. It is filled in as soon as the operator has seen the `Edge`, whether or not the `Edge` is accepted.
 4. Start the edge with `--operator <that id>` (`IROH_GATEWAY_EDGE_OPERATOR`). It then serves only that operator, and the `Edge` turns `Connected`.
+
+### Several edges and failover
+
+Any number of `Edge` objects may name the same `Gateway`. Every one of their edges opens all of the Gateway's ports, and a visitor who reaches any of them reaches the same backends. What makes this failover is the Gateway's list of addresses, which external-dns (or you) turns into DNS records:
+
+- An edge's addresses are listed while its edge is connected: `Connected` is `True` on the `Edge`.
+- An edge that disconnects keeps its addresses for the address grace: `--address-grace` on the operator, `addressGrace` in the chart, 30 s by default. A tunnel that drops and comes back within it changes nothing. `0s` withdraws at once.
+- After the grace its addresses are withdrawn, and listed again when it reconnects. This holds for the last edge too: a Gateway with no connected edge lists no address.
+- An `Edge` that has never connected is not listed.
+- When the operator restarts, the addresses already in the Gateway's status stay for one grace, so a restart withdraws nothing before the edges have had the time to reconnect, and an address withdrawn earlier does not come back.
+- An address that several edges share (a load balancer's name in `publicAddresses`, say) stays while one of them is listed.
+
+The conditions do not wait for the grace: the `Edge` shows `Connected` `False` as soon as its link is down, and a Gateway with no ready edge shows `Programmed` `False` with the reason for each edge.
+
+How long a failover takes: the operator notices an edge that died without a word within about 20 s (an edge that is stopped closes its tunnel, and is noticed at once); then the grace passes; then external-dns has to run (every minute by default) and the old record has to expire in resolvers, which is the record's TTL. With the defaults that is a few minutes, most of it the TTL, so a short TTL on the records matters more than a short grace. Browsers and most clients try the next address when one does not answer, which covers part of that time.
+
+With a single edge, an outage longer than the grace empties the Gateway's addresses. What external-dns then does depends on its `--policy`: with `sync` it deletes the record, and resolvers may remember that the name does not exist for as long as the zone's negative-caching time; with `upsert-only`, as in the [walkthrough](#7-dns), it never deletes a record, so the last address stays in DNS, while a record with several targets is still updated when one of them goes. A longer `addressGrace` rides out longer outages.
+
+Whether an edge is listed follows only its tunnel: an edge whose tunnel is up while visitors cannot reach it (a provider's firewall, say) stays listed.
+
+What the tests run: with a real API server and two edges in one process, an edge that never connected is not listed, a stopped edge's address leaves after the grace while the Gateway stays `Programmed`, the last edge's leaves too, and an operator restart keeps a listed address and does not bring a withdrawn one back. `scripts/e2e-kind.sh` runs two edges as pods, stops one, checks that its address leaves the Gateway and that HTTPS through the other still answers, and that the address returns with the edge. No test runs external-dns or DNS; what is said about them here is from the documentation and the source of external-dns v0.24.0.
 
 ### Raw TCP
 
@@ -1095,6 +1118,7 @@ What to know:
 | `--runtime-dir <dir>` | `IROH_GATEWAY_RUNTIME_DIR` | `/run/iroh-gateway`; the operator creates a private directory `haproxy` inside it for HAProxy's configuration and sockets |
 | `--haproxy-bin <path>` | `IROH_GATEWAY_HAPROXY_BIN` | `haproxy` (from `PATH`; the nix package puts its own first on `PATH`) |
 | `--metrics-listen <addr>` | `IROH_GATEWAY_METRICS_LISTEN` | not served; `/metrics`, `/healthz` and `/readyz` (see [Metrics and health](#metrics-and-health)) |
+| `--address-grace <duration>` | `IROH_GATEWAY_ADDRESS_GRACE` | `30s`; how long a Gateway keeps listing the addresses of an edge whose connection has dropped (see [Several edges and failover](#several-edges-and-failover)) |
 
 `--gateway-namespaces` lists the namespaces whose `Gateway` and `Edge` objects are served; an empty entry is an error. The HAProxy that `--haproxy-bin` names must be built with its Prometheus exporter, as the official image's and nixpkgs' are, because every configuration the operator renders uses it. `--relay` must match the edges' `--relay`. The path of that `haproxy` directory may be at most 60 bytes long, so that HAProxy's socket paths fit the operating system's limit. The chart sets `--gateway-namespaces` (when `gatewayNamespaces` is not empty), `--controller-name`, `--identity-secret`, `--relay` and `--metrics-listen`, and `POD_NAMESPACE` from the pod's namespace.
 
@@ -1131,12 +1155,14 @@ Every condition below is also visible with `kubectl describe`. A False condition
 - Each `TCP` listener has at most one `TCPRoute`, and each `UDP` listener at most one `UDPRoute`, with at most one rule. If several routes name a listener, the oldest wins and the others are not accepted. An `HTTP` or `HTTPS` listener takes any number of `HTTPRoute`s.
 - A port opens on the edges only when a listener is accepted and has no conflict, and: for `TCP` or `UDP`, has a `TCPRoute` or `UDPRoute` attached whose backend resolved; for `HTTP`, has an `HTTPRoute` attached; for `HTTPS`, has an `HTTPRoute` attached and usable certificates. A `Gateway` with no route opens nothing (it is `Programmed` once an edge is connected); deleting the last route closes the port.
 - A certificate Secret must be in the Gateway's namespace, and that namespace needs the Secret rules of [Secrets](#secrets).
-- A `Gateway` cannot ask for addresses; they come from the edges' `publicAddresses`, or from the host in their `address`. A DNS name is published in lower case without a trailing dot. A `Gateway` lists at most 16 addresses, the first 16 in sorted order; when there are more, its `Programmed` message (when True) or its `Accepted` message says how many are not listed.
+- A `Gateway` cannot ask for addresses; they come from the connected edges' `publicAddresses`, or from the host in their `address` (see [Several edges and failover](#several-edges-and-failover)). A DNS name is published in lower case without a trailing dot. A `Gateway` lists at most 16 addresses, the first 16 in sorted order; when there are more, its `Programmed` message (when True) or its `Accepted` message says how many are not listed.
 - A `UDP` listener on the edge's iroh port fails to bind when the edge's iroh address and its public bind address overlap, as they do with the defaults (`0.0.0.0:7842` and `::`); the edge reports it as a bind error.
 
 ## Releases
 
 Versions are tagged `v<X.Y.Z>`; the first is `v0.1.0`, and the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) lists them. A tag publishes both images with the tags `<X.Y.Z>` and `latest`, the chart to `oci://ghcr.io/fables-for-robots/charts`, and a GitHub release with the edge's tarballs. On every push to `main`, the release workflow also publishes both images built from `main` with the tags `edge` and `sha-<commit>` (see [The chart](#the-chart) for installing those).
+
+Changed after v0.1.0: a Gateway lists only the addresses of connected edges, where v0.1.0 listed those of every accepted `Edge`, connected or not. An edge that stays disconnected for longer than the address grace (30 s by default) now loses its address in the Gateway's status, and with external-dns's `--policy=sync` its DNS record; see [Several edges and failover](#several-edges-and-failover). The edges need no update for this.
 
 ## Upgrading from the manifests in `deploy/`
 
