@@ -442,16 +442,17 @@ if ! retry 30 edge_path_is direct; then
   echo "expected status.path 'direct' on Edge e2e, got '$got'" >&2
   exit 1
 fi
-k get edges.gateway.fables-for-robots.ch e2e
-if ! k get edges.gateway.fables-for-robots.ch e2e | grep -Eq '^NAME +GATEWAY +CONNECTED +PATH +PROGRAMMED'; then
+got="$(k get edges.gateway.fables-for-robots.ch e2e)"
+echo "$got"
+if ! grep -Eq '^NAME +GATEWAY +CONNECTED +PATH +PROGRAMMED' <<<"$got"; then
   echo "expected the columns NAME GATEWAY CONNECTED PATH PROGRAMMED from kubectl get edges" >&2
   exit 1
 fi
 
 step "metrics: the operator's"
 if ! retry 60 operator_metrics_complete; then
-  echo "expected iroh_gateway_operator_tunnel_up{edge=\"$edge_id\"} 1, iroh_gateway_operator_haproxy_exporter_up 1 and haproxy_process_ lines at http://$release.$ns.svc:8080/metrics, got:" >&2
-  seen '^(iroh_gateway_operator_(tunnel_up|haproxy_exporter_up)|haproxy_process_)' >&2
+  echo "expected iroh_gateway_operator_tunnel_up{edge=\"$edge_id\"} 1, iroh_gateway_operator_tunnel_path{edge=\"$edge_id\",path=\"direct\"} 1, iroh_gateway_operator_haproxy_exporter_up 1 and haproxy_process_ lines at http://$release.$ns.svc:8080/metrics, got:" >&2
+  seen '^(iroh_gateway_operator_(tunnel_up|tunnel_path|haproxy_exporter_up)|haproxy_process_)' >&2
   exit 1
 fi
 seen '^iroh_gateway_operator_(tunnel_up|haproxy_exporter_up)'

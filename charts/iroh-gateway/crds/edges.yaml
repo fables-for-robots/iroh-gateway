@@ -123,8 +123,8 @@ spec:
                 type: array
               path:
                 description: |-
-                  How the tunnel's traffic reaches the edge at the moment: `direct` or `relay`. Unset
-                  while the edge is not connected.
+                  The kind of path the operator sends to the edge on at the moment: `direct` or `relay`.
+                  Unset while the edge is not connected.
                 nullable: true
                 type: string
             type: object

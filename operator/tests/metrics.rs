@@ -13,7 +13,7 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gateway_operator::metrics::Metrics;
 use iroh_gateway_operator::tunnel::{
-    LinkHandle, LinkOptions, UdpTarget, UdpTargets, bind_endpoint,
+    LinkHandle, LinkOptions, PathKind, UdpTarget, UdpTargets, bind_endpoint,
 };
 use iroh_gateway_proto::control::{Config, ListenerKey};
 use iroh_gateway_proto::datagram::MAX_PACKET;
@@ -236,12 +236,11 @@ async fn a_link_reports_its_edge_up_and_its_listeners() {
     drop(held);
 }
 
-/// The first path of a tunnel that can only start through a relay is the relay. On one machine
-/// iroh soon finds a direct path as well, so which of the two the tunnel sends on a moment
-/// later is not fixed: the count of selections is what is certain, and the gauge and the state
-/// must agree on whichever it is.
+/// A tunnel that can only start through a relay starts on the relay path. On one machine iroh
+/// then finds a direct path and moves to it, with no new session and no new status from the
+/// edge: only by following the connection's path events does the operator see it.
 #[tokio::test]
-async fn a_tunnel_that_starts_through_a_relay_counts_its_relay_path() {
+async fn a_tunnel_that_moves_from_the_relay_to_a_direct_path_is_followed() {
     let echo = echo_server().await;
     let p = free_tcp_port();
     // The only address the operator has is one where nothing answers.
@@ -252,24 +251,21 @@ async fn a_tunnel_that_starts_through_a_relay_counts_its_relay_path() {
     })
     .await;
     let e = rig.edge.endpoint_id().to_string();
-    let state = wait_state(&rig.link, |s| s.connected && s.path.is_some()).await;
     let selected = |path| series("tunnel_path_selected_total", &e, &[("path", path)]);
+    let gauge = |path| series("tunnel_path", &e, &[("path", path)]);
+    wait_state(&rig.link, |s| s.connected && s.path.is_some()).await;
     wait_until(&m, &selected("relay"), |v| v >= 1.0).await;
 
-    // The gauge follows the state.
-    let now = rig.link.state().borrow().path.or(state.path).unwrap();
-    wait_for(
-        &m,
-        &series("tunnel_path", &e, &[("path", now.as_str())]),
-        1.0,
-    )
+    // The move to the direct path, in the state, the gauge and the count.
+    wait_state(&rig.link, |s| {
+        s.connected && s.path == Some(PathKind::Direct)
+    })
     .await;
-    let text = m.render();
-    let gauges: f64 = ["direct", "relay"]
-        .iter()
-        .map(|path| metric(&text, &series("tunnel_path", &e, &[("path", path)])))
-        .sum();
-    assert_eq!(gauges, 1.0, "{text}");
+    wait_for(&m, &gauge("direct"), 1.0).await;
+    wait_for(&m, &gauge("relay"), 0.0).await;
+    assert!(value(&m, &selected("direct")) >= 1.0, "{}", m.render());
+    // One session throughout.
+    assert_eq!(value(&m, &series("tunnel_sessions_total", &e, &[])), 1.0);
     rig.link.shutdown().await;
     rig.edge.shutdown().await;
 }

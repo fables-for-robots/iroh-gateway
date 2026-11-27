@@ -940,8 +940,13 @@ async fn with_the_crd_of_v0_2_0_the_status_is_written_and_the_path_dropped() {
     })
     .await;
     lists(&env.client, &["198.51.100.1"]).await;
+    let before: Edge = get(&env.client, NS, "e1").await;
     sleep(Duration::from_secs(1)).await;
-    assert_eq!(edge_path(&env.client, "e1").await.unwrap(), None);
+    let after: Edge = get(&env.client, NS, "e1").await;
+    assert_eq!(after.status.as_ref().unwrap().path, None);
+    // The operator still wants the field and may send it again, but a patch that changes
+    // nothing writes nothing: the object does not move.
+    assert_eq!(after.resource_version(), before.resource_version());
     operator.stop().await;
     edge.shutdown().await;
 }

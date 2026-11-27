@@ -286,15 +286,15 @@ impl Metrics {
             path: gauge_vec(
                 &r,
                 "tunnel_path",
-                "1 for the path the tunnel to the edge sends on, direct or relay, 0 for the \
-                 other; both 0 while not connected.",
+                "1 for the kind of path the operator sends to the edge on, direct or relay, 0 for \
+                 the other; both 0 while not connected or without a selected path.",
                 &["edge", "path"],
             ),
             path_selected: counter_vec(
                 &r,
                 "tunnel_path_selected_total",
-                "Times a connection to the edge selected a direct or a relay path to send on, \
-                 its first path included.",
+                "Times the kind of path the operator sends to the edge on became direct or \
+                 relay, the first path of each connection included.",
                 &["edge", "path"],
             ),
             sessions: counter_vec(

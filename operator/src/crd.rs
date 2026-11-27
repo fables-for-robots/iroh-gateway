@@ -45,8 +45,8 @@ pub struct EdgeGatewayRef {
 pub struct EdgeStatus {
     /// The operator's public key, which the edge must trust.
     pub gateway_endpoint_id: Option<String>,
-    /// How the tunnel's traffic reaches the edge at the moment: `direct` or `relay`. Unset
-    /// while the edge is not connected.
+    /// The kind of path the operator sends to the edge on at the moment: `direct` or `relay`.
+    /// Unset while the edge is not connected.
     pub path: Option<String>,
     #[serde(default)]
     pub conditions: Vec<Condition>,

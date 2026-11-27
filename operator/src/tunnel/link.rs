@@ -521,6 +521,9 @@ impl<C: Connector> Link<C> {
             path: selected_path(&conn),
         };
         self.count_path(s.path);
+        if let Some(path) = s.path {
+            info!(path = path.as_str(), "the tunnel's first path");
+        }
         let waiting = Some(WAITING_FOR_STATUS.to_owned());
         self.state.send_if_modified(|st| {
             let changed = st.last_error != waiting;
@@ -664,6 +667,9 @@ impl<C: Connector> Link<C> {
         // Ends when the connection closes, which `conn.closed()` reports.
         let mut path_events = conn.path_events();
         let mut path_events_open = true;
+        // A change between the session's first look at the paths and this subscription sent
+        // its event to nobody: look again now that later ones will be seen.
+        self.on_path(s);
         loop {
             tokio::select! {
                 e = conn.closed() => return SessionError::Lost(e),

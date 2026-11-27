@@ -234,7 +234,8 @@ One setting, with the same value on the operator and on its edges:
   An `Edge` without an `address` is found through the relay alone.
 - Key pinning is unchanged, and traffic stays encrypted end to end between
   the two pinned keys. A relay cannot read or alter it.
-- The operator reports which path a tunnel sends on, `direct` or `relay`:
+- The operator reports which kind of path it sends to an edge on, `direct`
+  or `relay`:
   in `Edge.status.path` (a column of `kubectl get edge`), in the metric
   `tunnel_path` per edge, with `tunnel_path_selected_total` counting the
   changes, and in a log line at each change. It follows iroh's path events,
