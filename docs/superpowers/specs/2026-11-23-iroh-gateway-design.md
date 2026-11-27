@@ -234,6 +234,12 @@ One setting, with the same value on the operator and on its edges:
   An `Edge` without an `address` is found through the relay alone.
 - Key pinning is unchanged, and traffic stays encrypted end to end between
   the two pinned keys. A relay cannot read or alter it.
+- The operator reports which path a tunnel sends on, `direct` or `relay`:
+  in `Edge.status.path` (a column of `kubectl get edge`), in the metric
+  `tunnel_path` per edge, with `tunnel_path_selected_total` counting the
+  changes, and in a log line at each change. It follows iroh's path events,
+  so a move from the relay to the direct path shows as it happens. The edge
+  reports nothing of its own. (Added after v0.2.0.)
 - What a relay does learn: the home IP (the operator connects to it), the
   edge's IP, and the size and timing of relayed traffic. With `n0`, n0's
   lookup service also sees lookups coming from home. This is the trade the
@@ -422,6 +428,7 @@ spec:
                                    # required when `address` is absent
 status:
   gatewayEndpointId: <operator public key>
+  path: direct                     # or relay; absent while not connected
   conditions:                      # Connected, Programmed
   listeners:
     - {protocol: TCP, port: 443, bound: true}

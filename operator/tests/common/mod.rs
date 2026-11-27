@@ -348,6 +348,15 @@ pub async fn relay_rig(
     targets: &[(u16, SocketAddr)],
     direct: Option<SocketAddr>,
 ) -> (Rig, impl Sized + use<>) {
+    relay_rig_with(targets, direct, |_| {}).await
+}
+
+/// [`relay_rig`] with the link's options changed by `customize`.
+pub async fn relay_rig_with<F: FnOnce(&mut LinkOptions)>(
+    targets: &[(u16, SocketAddr)],
+    direct: Option<SocketAddr>,
+    customize: F,
+) -> (Rig, impl Sized + use<F>) {
     let (_map, relay_url, server) = iroh::test_utils::run_relay_server().await.unwrap();
     let relay = Relay::Custom(relay_url);
     let operator_key = SecretKey::generate();
@@ -381,6 +390,7 @@ pub async fn relay_rig(
         LinkOptions::new(edge.endpoint_id(), direct.map(|a| a.to_string()), relay).unwrap();
     opts.backoff_min = Duration::from_millis(50);
     opts.backoff_max = Duration::from_millis(200);
+    customize(&mut opts);
     let ports: Vec<u16> = targets.iter().map(|&(p, _)| p).collect();
     let (desired, udp, link) = spawn_link(endpoint.clone(), opts, targets, &ports, &[], &[]);
     let rig = Rig {

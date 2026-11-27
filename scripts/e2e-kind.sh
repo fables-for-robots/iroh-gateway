@@ -133,6 +133,12 @@ udproute_accepted() {
     [ "$got" = True ]
 }
 
+# True when status.path of Edge e2e reads $1.
+edge_path_is() {
+  got="$(k get edges.gateway.fables-for-robots.ch e2e -o jsonpath='{.status.path}' 2>&1)" &&
+    [ "$got" = "$1" ]
+}
+
 # True when the addresses in the status of Gateway public are exactly $1, space separated and in
 # the order the operator lists them (sorted).
 gateway_lists() {
@@ -215,6 +221,7 @@ seen() {
 operator_metrics_complete() {
   metrics_of "$release.$ns.svc:8080" &&
     grep -qxF "iroh_gateway_operator_tunnel_up{edge=\"$edge_id\"} 1" <<<"$got" &&
+    grep -qxF "iroh_gateway_operator_tunnel_path{edge=\"$edge_id\",path=\"direct\"} 1" <<<"$got" &&
     grep -qxF 'iroh_gateway_operator_haproxy_exporter_up 1' <<<"$got" &&
     grep -q '^haproxy_process_' <<<"$got"
 }
@@ -428,6 +435,18 @@ k wait --for=condition=Ready pod/probe --timeout=120s
 step "conditions"
 k wait --for=condition=Programmed gateways.gateway.networking.k8s.io/public --timeout=120s
 k wait --for=condition=Connected edges.gateway.fables-for-robots.ch/e2e --timeout=120s
+
+step "the Edge shows a direct path"
+# No relay here, so the path can only be direct; kubectl shows it in the column PATH.
+if ! retry 30 edge_path_is direct; then
+  echo "expected status.path 'direct' on Edge e2e, got '$got'" >&2
+  exit 1
+fi
+k get edges.gateway.fables-for-robots.ch e2e
+if ! k get edges.gateway.fables-for-robots.ch e2e | grep -Eq '^NAME +GATEWAY +CONNECTED +PATH +PROGRAMMED'; then
+  echo "expected the columns NAME GATEWAY CONNECTED PATH PROGRAMMED from kubectl get edges" >&2
+  exit 1
+fi
 
 step "metrics: the operator's"
 if ! retry 60 operator_metrics_complete; then

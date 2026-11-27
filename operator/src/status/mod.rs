@@ -15,7 +15,7 @@ use crate::model::{
     EdgeModel, GatewayAddress, GatewayModel, ListenerModel, MAX_GATEWAY_ADDRESSES, Model, ObjRef,
     ParentKey, Reject, RouteKind, addresses_of,
 };
-use crate::tunnel::{EdgeState, ListenerState};
+use crate::tunnel::{EdgeState, ListenerState, PathKind};
 
 /// What the engine reports about the running system.
 #[derive(Debug, Clone)]
@@ -79,6 +79,8 @@ pub struct EdgeStatusOut {
     pub key: ObjRef,
     pub generation: i64,
     pub gateway_endpoint_id: String,
+    /// The path the tunnel sends on, for a connected edge.
+    pub path: Option<PathKind>,
     pub conditions: Vec<Cond>,
     pub listeners: Vec<EdgeListenerStatus>,
 }
@@ -515,6 +517,7 @@ fn edge_status(model: &Model, e: &EdgeModel, facts: &Facts) -> EdgeStatusOut {
         key: e.key.clone(),
         generation: e.generation,
         gateway_endpoint_id: facts.operator_id.to_string(),
+        path: state.filter(|_| connected).and_then(|s| s.path),
         conditions: vec![
             from_result("Accepted", &e.accepted, "Accepted"),
             connected_cond,
@@ -736,6 +739,46 @@ mod tests {
             "AddressNotAssigned",
         );
         assert!(g.addresses.is_empty());
+    }
+
+    #[test]
+    fn a_connected_edge_reports_its_path() {
+        let m = model(
+            gateway(vec![listener("a", 80, true)], &["e", "f", "g"]),
+            vec![
+                edge("e", Ok(())),
+                edge("f", Ok(())),
+                edge("g", Ok(())),
+                edge("bad", Err(reject("Invalid", "no"))),
+            ],
+        );
+        let with_path = |state: EdgeState, path| EdgeState {
+            path: Some(path),
+            ..state
+        };
+        let f = facts(vec![
+            ("e", with_path(up(vec![]), PathKind::Relay)),
+            ("f", with_path(up(vec![]), PathKind::Direct)),
+            // Not connected: whatever the state says, no path.
+            ("g", with_path(down(None), PathKind::Direct)),
+            // Not accepted: no path either.
+            ("bad", with_path(up(vec![]), PathKind::Direct)),
+        ]);
+        let d = compute(&m, &f);
+        let paths: Vec<(&str, Option<PathKind>)> = d
+            .edges
+            .iter()
+            .map(|e| (e.key.name.as_str(), e.path))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ("bad", None),
+                ("e", Some(PathKind::Relay)),
+                ("f", Some(PathKind::Direct)),
+                ("g", None),
+            ]
+        );
     }
 
     #[test]

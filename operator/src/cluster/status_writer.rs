@@ -428,6 +428,8 @@ fn edge_patch(edge: &Edge, want: &EdgeStatusOut, now: &Time) -> Option<Value> {
     let existing = edge.status.clone().unwrap_or_default();
     let desired = EdgeStatus {
         gateway_endpoint_id: Some(want.gateway_endpoint_id.clone()),
+        // None is written as null, which removes the field in a merge patch.
+        path: want.path.map(|p| p.as_str().to_owned()),
         conditions: merge(
             &existing.conditions,
             &want.conditions,
@@ -456,6 +458,7 @@ mod tests {
     };
     use crate::model::{GatewayAddress, build};
     use crate::status::{Cond, Facts, compute};
+    use crate::tunnel::PathKind;
 
     const OTHER: &str = "example.com/other-controller";
 
@@ -867,6 +870,7 @@ mod tests {
             key: ObjRef::new("gw", "e1"),
             generation: 1,
             gateway_endpoint_id: "op".into(),
+            path: Some(PathKind::Relay),
             conditions: vec![cond("Accepted", true, "Accepted")],
             listeners: vec![EdgeListenerStatus {
                 protocol: "TCP".into(),
@@ -878,8 +882,27 @@ mod tests {
         let patch = edge_patch(&e, &want, &at(100)).unwrap();
         assert_eq!(patch["status"]["gatewayEndpointId"], "op");
         assert_eq!(patch["status"]["listeners"][0]["port"], 5432);
+        assert_eq!(patch["status"]["path"], "relay");
         e.status = Some(serde_json::from_value(patch["status"].clone()).unwrap());
         assert!(edge_patch(&e, &want, &at(200)).is_none());
+
+        // A path that changes is a change; one that goes is removed, which a merge patch does
+        // with a null.
+        let direct = EdgeStatusOut {
+            path: Some(PathKind::Direct),
+            ..want.clone()
+        };
+        let patch = edge_patch(&e, &direct, &at(300)).unwrap();
+        assert_eq!(patch["status"]["path"], "direct");
+        let gone = EdgeStatusOut { path: None, ..want };
+        let patch = edge_patch(&e, &gone, &at(300)).unwrap();
+        assert!(patch["status"]["path"].is_null(), "{patch}");
+        assert!(
+            patch["status"].as_object().unwrap().contains_key("path"),
+            "{patch}"
+        );
+        e.status = Some(serde_json::from_value(patch["status"].clone()).unwrap());
+        assert!(edge_patch(&e, &gone, &at(400)).is_none());
     }
 
     #[test]

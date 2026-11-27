@@ -778,6 +778,8 @@ Every name starts with `iroh_gateway_operator_`. Every `tunnel_*` metric has the
 |---|---|---|---|
 | `build_info` | gauge | `version` | Always 1; `version` is the operator's version. |
 | `tunnel_up` | gauge | `edge` | 1 while the edge is connected. |
+| `tunnel_path` | gauge | `edge`, `path` | 1 for the path the tunnel sends on, `direct` or `relay`, 0 for the other; both 0 while not connected. |
+| `tunnel_path_selected_total` | counter | `edge`, `path` | Times a connection to the edge selected a `direct` or a `relay` path to send on, its first path included. |
 | `tunnel_sessions_total` | counter | `edge` | Dials of the edge that connected. |
 | `tunnel_dial_failures_total` | counter | `edge` | Dials of the edge that failed. |
 | `tunnel_listeners` | gauge | `edge`, `state` (`bound`, `failed`) | The edge's listeners, bound or failed, from its last status; both 0 while it is not connected. |
@@ -1142,7 +1144,7 @@ Every condition below is also visible with `kubectl describe`. A False condition
 | | `Connected` | False with `NotConnected`; the message says why, for example that the link has not started yet or the last connection error. An edge that is not accepted is never connected. |
 | | `Programmed` | False with `NotConnected`, `Pending` (connected, but the edge has not reported a port yet) or `BindFailed` (the edge could not open a port; the message names the port and the error). |
 
-`Edge.status.listeners` lists, per port, whether the edge reports it bound. `Edge.status.gatewayEndpointId` is the operator's id.
+`Edge.status.listeners` lists, per port, whether the edge reports it bound. `Edge.status.gatewayEndpointId` is the operator's id. `Edge.status.path` is `direct` or `relay`: the path the tunnel sends on at the moment, absent while the edge is not connected; `kubectl get edge` shows it in the column `PATH`.
 
 ### Rules you will trip over
 
@@ -1163,6 +1165,8 @@ Every condition below is also visible with `kubectl describe`. A False condition
 Versions are tagged `v<X.Y.Z>`; the first is `v0.1.0`, and the [releases page](https://github.com/fables-for-robots/iroh-gateway/releases) lists them. A tag publishes both images with the tags `<X.Y.Z>` and `latest`, the chart to `oci://ghcr.io/fables-for-robots/charts`, and a GitHub release with the edge's tarballs. On every push to `main`, the release workflow also publishes both images built from `main` with the tags `edge` and `sha-<commit>` (see [The chart](#the-chart) for installing those).
 
 Changed in v0.2.0: a Gateway lists only the addresses of connected edges, where v0.1.0 listed those of every accepted `Edge`, connected or not. An edge that stays disconnected for longer than the address grace (30 s by default) now loses its address in the Gateway's status, and with external-dns's `--policy=sync` its DNS record; see [Several edges and failover](#several-edges-and-failover). The edges need no update for this. An upgrade with `helm upgrade --reuse-values` keeps working: the chart leaves `--address-grace` out when the reused values have no `addressGrace`, and the operator's default applies.
+
+Changed after v0.2.0: the `Edge` status has a field `path` and `kubectl get edge` a column `PATH`. Both are part of the `Edge` CRD, which Helm does not upgrade: apply the new CRD yourself before `helm upgrade`, as the [chart's README](charts/iroh-gateway/README.md#crd-lifecycle) shows. With the old CRD the operator works as before, but the API server drops the field and there is no column; the metrics and the log line do not depend on the CRD.
 
 ## Upgrading from the manifests in `deploy/`
 
@@ -1342,6 +1346,8 @@ The visitor address a backend sees (in `X-Forwarded-For` for HTTP and HTTPS) is 
 ## Relay mode
 
 Relay mode is off by default (`disabled`): the operator reaches the edge at the `address` you give, and nothing else is contacted, except that a DNS name in `address` is resolved through the operator's normal system resolver. Turn it on when the operator cannot reach the edge directly, for example when the edge has no stable address. Both sides must use the same value (`--relay` on the edge, `relay` in the operator config or the chart).
+
+Which way the traffic goes shows on the `Edge`: `kubectl -n iroh-gateway get edge` has a column `PATH` with `direct` or `relay`, from `status.path`. With a relay on, a tunnel usually starts on the relay and moves to the direct path when one works; the operator follows each change as it happens and logs it (`the tunnel's path changed`). To alert on an edge that stays on the relay, use the operator's metric `iroh_gateway_operator_tunnel_path{path="relay"} == 1` with a `for:` of your choice; `iroh_gateway_operator_tunnel_path_selected_total` counts the changes. With relay mode `disabled` the path is always `direct`.
 
 A relay learns the home IP, the edge's IP, and the size and timing of the relayed traffic. With `n0` it also sees address lookups from home. A relay cannot read or alter the traffic: it is encrypted end to end between the two keys.
 

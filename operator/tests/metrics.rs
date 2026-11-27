@@ -236,6 +236,44 @@ async fn a_link_reports_its_edge_up_and_its_listeners() {
     drop(held);
 }
 
+/// The first path of a tunnel that can only start through a relay is the relay. On one machine
+/// iroh soon finds a direct path as well, so which of the two the tunnel sends on a moment
+/// later is not fixed: the count of selections is what is certain, and the gauge and the state
+/// must agree on whichever it is.
+#[tokio::test]
+async fn a_tunnel_that_starts_through_a_relay_counts_its_relay_path() {
+    let echo = echo_server().await;
+    let p = free_tcp_port();
+    // The only address the operator has is one where nothing answers.
+    let nothing = format!("127.0.0.1:{}", free_udp_port()).parse().unwrap();
+    let m = Metrics::new();
+    let (rig, _relay) = relay_rig_with(&[(p, echo)], Some(nothing), |opts| {
+        opts.metrics = m.clone();
+    })
+    .await;
+    let e = rig.edge.endpoint_id().to_string();
+    let state = wait_state(&rig.link, |s| s.connected && s.path.is_some()).await;
+    let selected = |path| series("tunnel_path_selected_total", &e, &[("path", path)]);
+    wait_until(&m, &selected("relay"), |v| v >= 1.0).await;
+
+    // The gauge follows the state.
+    let now = rig.link.state().borrow().path.or(state.path).unwrap();
+    wait_for(
+        &m,
+        &series("tunnel_path", &e, &[("path", now.as_str())]),
+        1.0,
+    )
+    .await;
+    let text = m.render();
+    let gauges: f64 = ["direct", "relay"]
+        .iter()
+        .map(|path| metric(&text, &series("tunnel_path", &e, &[("path", path)])))
+        .sum();
+    assert_eq!(gauges, 1.0, "{text}");
+    rig.link.shutdown().await;
+    rig.edge.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_lost_edge_reads_down() {
     let echo = echo_server().await;
@@ -246,10 +284,23 @@ async fn a_lost_edge_reads_down() {
     .await;
     wait_state(&rig.link, |s| s.connected && s.listeners.len() == 1).await;
     assert_eq!(value(&m, &series("tunnel_up", &e, &[])), 1.0);
+    // The path of a dialled address is direct, selected once.
+    wait_for(&m, &series("tunnel_path", &e, &[("path", "direct")]), 1.0).await;
+    let selected = |path| series("tunnel_path_selected_total", &e, &[("path", path)]);
+    assert_eq!(value(&m, &selected("direct")), 1.0);
+    assert_eq!(value(&m, &selected("relay")), 0.0);
+    assert_eq!(
+        value(&m, &series("tunnel_path", &e, &[("path", "relay")])),
+        0.0
+    );
 
     rig.edge.shutdown().await;
     wait_for(&m, &series("tunnel_up", &e, &[]), 0.0).await;
     let text = m.render();
+    for path in ["direct", "relay"] {
+        let series = series("tunnel_path", &e, &[("path", path)]);
+        assert_eq!(metric(&text, &series), 0.0, "{text}");
+    }
     for state in ["bound", "failed"] {
         let listeners = series("tunnel_listeners", &e, &[("state", state)]);
         assert_eq!(metric(&text, &listeners), 0.0, "{text}");

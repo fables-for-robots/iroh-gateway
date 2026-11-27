@@ -27,6 +27,8 @@ const STATES: [&str; 2] = ["bound", "failed"];
 const REFUSALS: [&str; 3] = ["bad_header", "unknown_listener", "backend_unavailable"];
 /// The values of `direction`.
 const DIRECTIONS: [&str; 2] = ["in", "out"];
+/// The values of `path` in `tunnel_path` and `tunnel_path_selected_total`.
+const PATHS: [&str; 2] = ["direct", "relay"];
 /// The values of `reason` in `tunnel_udp_dropped_total`.
 const UDP_DROPS: [&str; 9] = [
     "bad_datagram",
@@ -60,6 +62,8 @@ impl fmt::Debug for Metrics {
 #[derive(Clone)]
 struct Tunnel {
     up: IntGaugeVec,
+    path: IntGaugeVec,
+    path_selected: IntCounterVec,
     sessions: IntCounterVec,
     dial_failures: IntCounterVec,
     listeners: IntGaugeVec,
@@ -99,6 +103,10 @@ pub(crate) struct Control {
 pub(crate) struct LinkMetrics {
     /// `EdgeState.connected`.
     pub up: IntGauge,
+    /// `EdgeState.path`.
+    pub path: Paths,
+    /// Times a connection selected a path of each kind, its first path included.
+    pub path_selected: PathsSelected,
     /// Dials that connected.
     pub sessions: IntCounter,
     pub dial_failures: IntCounter,
@@ -112,6 +120,21 @@ pub(crate) struct LinkMetrics {
     /// Bytes written to the backend (`in`) and to the tunnel stream (`out`).
     pub tcp_bytes: PerDirection,
     pub udp: UdpMetrics,
+}
+
+/// `tunnel_path` per `path`: 1 for the path the tunnel sends on, 0 for the other; both 0 while
+/// not connected.
+#[derive(Clone)]
+pub(crate) struct Paths {
+    pub direct: IntGauge,
+    pub relay: IntGauge,
+}
+
+/// `tunnel_path_selected_total` per `path`.
+#[derive(Clone)]
+pub(crate) struct PathsSelected {
+    pub direct: IntCounter,
+    pub relay: IntCounter,
 }
 
 /// `tunnel_listeners` per `state`.
@@ -260,6 +283,20 @@ impl Metrics {
         let edge = &["edge"];
         let tunnel = Tunnel {
             up: gauge_vec(&r, "tunnel_up", "1 while the edge is connected.", edge),
+            path: gauge_vec(
+                &r,
+                "tunnel_path",
+                "1 for the path the tunnel to the edge sends on, direct or relay, 0 for the \
+                 other; both 0 while not connected.",
+                &["edge", "path"],
+            ),
+            path_selected: counter_vec(
+                &r,
+                "tunnel_path_selected_total",
+                "Times a connection to the edge selected a direct or a relay path to send on, \
+                 its first path included.",
+                &["edge", "path"],
+            ),
             sessions: counter_vec(
                 &r,
                 "tunnel_sessions_total",
@@ -376,6 +413,14 @@ impl Metrics {
         let refused = |reason| t.streams_refused.with_label_values(&[e, reason]);
         let metrics = LinkMetrics {
             up: t.up.with_label_values(&[e]),
+            path: Paths {
+                direct: t.path.with_label_values(&[e, "direct"]),
+                relay: t.path.with_label_values(&[e, "relay"]),
+            },
+            path_selected: PathsSelected {
+                direct: t.path_selected.with_label_values(&[e, "direct"]),
+                relay: t.path_selected.with_label_values(&[e, "relay"]),
+            },
             sessions: t.sessions.with_label_values(&[e]),
             dial_failures: t.dial_failures.with_label_values(&[e]),
             listeners: Listeners {
@@ -430,6 +475,8 @@ impl Tunnel {
     /// Removes every series labelled with `edge`.
     fn remove(&self, edge: &str) {
         forget(&self.up, edge, &[]);
+        forget(&self.path, edge, &PATHS);
+        forget(&self.path_selected, edge, &PATHS);
         forget(&self.sessions, edge, &[]);
         forget(&self.dial_failures, edge, &[]);
         forget(&self.listeners, edge, &STATES);
@@ -514,13 +561,13 @@ mod tests {
         let one = m.link(id);
         let two = m.link(id);
         let lines = |text: &str| text.lines().filter(|l| l.contains(&edge)).count();
-        // 8 series with `edge` alone, 2 + 3 + 4 × 2 + 9 with a second label.
-        assert_eq!(lines(&m.render()), 30, "{}", m.render());
+        // 8 series with `edge` alone, 2 + 2 + 2 + 3 + 4 × 2 + 9 with a second label.
+        assert_eq!(lines(&m.render()), 34, "{}", m.render());
         assert_eq!(id.to_string().len(), 64);
         drop(one);
         assert_eq!(
             lines(&m.render()),
-            30,
+            34,
             "another link still reports on the edge"
         );
         drop(two);

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
     shortname = "edge",
     printcolumn = r#"{"name":"Gateway","type":"string","jsonPath":".spec.gatewayRef.name"}"#,
     printcolumn = r#"{"name":"Connected","type":"string","jsonPath":".status.conditions[?(@.type==\"Connected\")].status"}"#,
+    printcolumn = r#"{"name":"Path","type":"string","jsonPath":".status.path"}"#,
     printcolumn = r#"{"name":"Programmed","type":"string","jsonPath":".status.conditions[?(@.type==\"Programmed\")].status"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +45,9 @@ pub struct EdgeGatewayRef {
 pub struct EdgeStatus {
     /// The operator's public key, which the edge must trust.
     pub gateway_endpoint_id: Option<String>,
+    /// How the tunnel's traffic reaches the edge at the moment: `direct` or `relay`. Unset
+    /// while the edge is not connected.
+    pub path: Option<String>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
     #[serde(default)]
@@ -117,6 +121,7 @@ spec:
     fn status_round_trips_in_camel_case() {
         let status = EdgeStatus {
             gateway_endpoint_id: Some("op".into()),
+            path: Some("relay".into()),
             conditions: vec![],
             listeners: vec![EdgeListenerStatus {
                 protocol: "TCP".into(),
@@ -127,9 +132,21 @@ spec:
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["gatewayEndpointId"], "op");
+        assert_eq!(json["path"], "relay");
         assert_eq!(json["listeners"][0]["port"], 443);
         let back: EdgeStatus = serde_json::from_value(json).unwrap();
         assert_eq!(back, status);
+    }
+
+    #[test]
+    fn kubectl_shows_the_path_in_a_column() {
+        let crd = serde_json::to_value(Edge::crd()).unwrap();
+        let columns = crd["spec"]["versions"][0]["additionalPrinterColumns"]
+            .as_array()
+            .unwrap();
+        let path = columns.iter().find(|c| c["name"] == "Path").unwrap();
+        assert_eq!(path["jsonPath"], ".status.path");
+        assert_eq!(path["type"], "string");
     }
 
     #[test]

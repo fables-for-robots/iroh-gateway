@@ -35,6 +35,7 @@ use iroh_gateway_proto::transport::Relay;
 use k8s_openapi::ByteString;
 use k8s_openapi::NamespaceResourceScope;
 use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::api::{DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams, PostParams};
 use kube::discovery::{Scope, pinned_kind};
@@ -846,6 +847,101 @@ async fn seventeen_addresses_give_sixteen() {
         })
         .collect();
     assert_eq!(notes.len(), 1, "{conditions:?}");
+    operator.stop().await;
+    edge.shutdown().await;
+}
+
+/// The Edge's `status.path`, once the Edge has status.
+async fn edge_path(client: &Client, name: &str) -> Result<Option<String>, String> {
+    let edge: Edge = get(client, NS, name).await;
+    edge.status
+        .map(|s| s.path)
+        .ok_or_else(|| "no status".to_owned())
+}
+
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn a_connected_edge_shows_its_path_and_a_lost_one_none() {
+    let env = Envtest::start().await;
+    let operator = Operator::start(&env.client, &[NS]).await;
+    let edge = operator.edge().await;
+    env.namespace(NS).await;
+    class(&env.client).await;
+    gateway(&env.client, NS, free_tcp_port()).await;
+    edge_object_at(&env.client, "e1", &edge, &["198.51.100.1"]).await;
+    eventually("the path direct", || async {
+        match edge_path(&env.client, "e1").await? {
+            Some(path) if path == "direct" => Ok(()),
+            other => Err(format!("path {other:?}")),
+        }
+    })
+    .await;
+    // The API server keeps the field: the installed CRD has it.
+    let connected = edge_condition(&env.client, "e1", "Connected")
+        .await
+        .unwrap();
+    assert_eq!(connected.status, "True");
+
+    edge.shutdown().await;
+    eventually("no path", || async {
+        match edge_path(&env.client, "e1").await? {
+            None => Ok(()),
+            other => Err(format!("path {other:?}")),
+        }
+    })
+    .await;
+    let connected = edge_condition(&env.client, "e1", "Connected")
+        .await
+        .unwrap();
+    assert_eq!(connected.status, "False");
+    operator.stop().await;
+}
+
+/// An operator upgraded before its CRD: the cluster still has the `Edge` CRD of v0.2.0, which
+/// has no `status.path`. The status is written as before and the API server drops the field.
+#[tokio::test]
+#[ignore = "needs KUBEBUILDER_ASSETS"]
+async fn with_the_crd_of_v0_2_0_the_status_is_written_and_the_path_dropped() {
+    let env = Envtest::start().await;
+    // Take `path` out of the installed CRD, schema and column, as v0.2.0 had it.
+    let crds: Api<CustomResourceDefinition> = Api::all(env.client.clone());
+    let name = "edges.gateway.fables-for-robots.ch";
+    let mut crd = serde_json::to_value(crds.get(name).await.unwrap()).unwrap();
+    let version = &mut crd["spec"]["versions"][0];
+    let status = &mut version["schema"]["openAPIV3Schema"]["properties"]["status"];
+    assert!(
+        status["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("path")
+            .is_some()
+    );
+    let columns = version["additionalPrinterColumns"].as_array_mut().unwrap();
+    let before = columns.len();
+    columns.retain(|c| c["name"] != "Path");
+    assert_eq!(columns.len(), before - 1);
+    let old: CustomResourceDefinition = serde_json::from_value(crd).unwrap();
+    crds.replace(name, &PostParams::default(), &old)
+        .await
+        .unwrap();
+
+    let operator = Operator::start(&env.client, &[NS]).await;
+    let edge = operator.edge().await;
+    env.namespace(NS).await;
+    class(&env.client).await;
+    gateway(&env.client, NS, free_tcp_port()).await;
+    edge_object_at(&env.client, "e1", &edge, &["198.51.100.1"]).await;
+    // The whole status patch was taken: the Edge is connected and the Gateway has its address.
+    eventually("the Edge connected", || async {
+        match edge_condition(&env.client, "e1", "Connected").await? {
+            c if c.status == "True" => Ok(()),
+            c => Err(format!("{c:?}")),
+        }
+    })
+    .await;
+    lists(&env.client, &["198.51.100.1"]).await;
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(edge_path(&env.client, "e1").await.unwrap(), None);
     operator.stop().await;
     edge.shutdown().await;
 }
